@@ -1,0 +1,124 @@
+Metadata-Version: 2.4
+Name: sienna-safe-diag
+Version: 0.1.0
+Summary: Read-only 2006 Toyota Sienna diagnostic and mapping prototype
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.116.0
+Requires-Dist: uvicorn[standard]>=0.35.0
+Requires-Dist: pydantic>=2.9.0
+Requires-Dist: python-dotenv>=1.0.1
+Requires-Dist: pyserial>=3.5
+Requires-Dist: httpx>=0.28.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.3.0; extra == "dev"
+Requires-Dist: ruff>=0.6.0; extra == "dev"
+
+# Sienna Safe Diag (Read-Only Prototype)
+
+Python prototype for a **2006 Toyota Sienna** diagnostic/mapping workflow with strict read-only safety controls.
+
+## Safety scope
+
+This project intentionally supports only read-only standard OBD requests.
+
+- Allowed OBD modes: `01`, `02`, `03`, `07`, `09`
+- Blocked: clear/reset, control operations, security access, ECU programming/download/upload, write routines, replay actions
+- Adapter setup commands are limited to documented baseline commands (`ATZ`, `ATE0`, `ATL0`, `ATS0`, `ATH0`, `ATSP3`)
+- Default assumption: **DLC3 ECM diagnostics are ISO 9141-2** request/response unless source metadata clearly indicates CAN capture
+
+## Project structure
+
+- `src/sienna_diag/api/main.py`: FastAPI app, dashboard, session/event endpoints, review endpoints
+- `src/sienna_diag/obd/adapter.py`: OBDLink serial adapter wrapper (read-only)
+- `src/sienna_diag/safety_policy.py`: central command allow/block policy
+- `src/sienna_diag/preprocessing/pipeline.py`: log parsing and summary generation
+- `src/sienna_diag/review/lmstudio.py`: local Llama hook via LM Studio API
+- `src/sienna_diag/review/openai_review.py`: OpenAI second-opinion structured JSON hook
+- `.env.example`: required environment variables
+- `docs/AGENTS_WORKFLOW.md`: AGENTS.md-aware contributor workflow notes
+
+## Step-by-step run
+
+1. Create and activate a virtual environment.
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+2. Install package in editable mode.
+```bash
+pip install -e .
+```
+3. Copy env template and update values.
+```bash
+cp .env.example .env
+```
+4. Keep `ENABLE_HARDWARE=false` for safe mock mode first.
+5. Start API.
+```bash
+uvicorn sienna_diag.api.main:app --reload --host 127.0.0.1 --port 8000
+```
+6. Open dashboard.
+- [http://127.0.0.1:8000/dashboard](http://127.0.0.1:8000/dashboard)
+
+## Example API flow
+
+1. Create session.
+```bash
+curl -X POST http://127.0.0.1:8000/sessions
+```
+2. Tag event.
+```bash
+curl -X POST http://127.0.0.1:8000/sessions/<SESSION_ID>/events \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"<SESSION_ID>","tag":"baseline_idle","note":"engine warm"}'
+```
+3. Run safe read request.
+```bash
+curl -X POST http://127.0.0.1:8000/obd/read \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"<SESSION_ID>","command":"010C","source_hint":"iso9141_2"}'
+```
+4. Review with local LM Studio hook.
+```bash
+curl -X POST http://127.0.0.1:8000/review/local \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"<SESSION_ID>","summary":"Mode 01 RPM reads stable at idle"}'
+```
+5. OpenAI second-opinion structured output.
+```bash
+curl -X POST http://127.0.0.1:8000/review/openai \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"<SESSION_ID>","summary":"Mode 03 shows P0420 and no pending mode 07 DTC"}'
+```
+
+## Preprocessing pipeline usage
+
+Use a raw log file with lines in format:
+
+```text
+timestamp|command|raw_response
+```
+
+Then call in Python:
+
+```python
+from pathlib import Path
+from sienna_diag.preprocessing.pipeline import run_preprocessing
+
+result = run_preprocessing(Path("data/raw/session1.log"), Path("data/processed/session1"))
+print(result)
+```
+
+Or via API:
+
+```bash
+curl -X POST http://127.0.0.1:8000/preprocess \
+  -H 'Content-Type: application/json' \
+  -d '{"input_path":"data/raw/session1.log","output_dir":"data/processed/session1"}'
+```
+
+## Notes
+
+- This is a prototype and is intentionally conservative.
+- If you need additional commands, add them explicitly to `safety_policy.py` with documentation and justification.
