@@ -33,7 +33,7 @@ class OBDLinkAdapter:
         self.connected = False
 
     def connect(self) -> None:
-        if not settings.enable_hardware:
+        if settings.enable_phone_live_bridge or not settings.enable_hardware:
             self.connected = False
             return
         if serial is None:
@@ -54,6 +54,9 @@ class OBDLinkAdapter:
         if not decision.allowed:
             raise PermissionError(decision.reason)
 
+        if settings.enable_phone_live_bridge:
+            return AdapterResponse(command=command, raw="PHONE-LIVE:bridge-command")
+
         if not settings.enable_hardware:
             return AdapterResponse(command=command, raw="MOCK:OK")
 
@@ -67,6 +70,9 @@ class OBDLinkAdapter:
         if not decision.allowed:
             raise PermissionError(decision.reason)
 
+        if settings.enable_phone_live_bridge:
+            return AdapterResponse(command=command, raw=f"PHONE-LIVE:{command}:bridge-response-pending")
+
         if not settings.enable_hardware:
             return AdapterResponse(command=command, raw=f"MOCK:{command}:41 00 BE 3E A8 13")
 
@@ -76,9 +82,15 @@ class OBDLinkAdapter:
         return AdapterResponse(command=command, raw=raw)
 
     def mode_status(self) -> str:
-        return "hardware" if settings.enable_hardware else "mock"
+        if settings.enable_phone_live_bridge:
+            return "PHONE-LIVE"
+        if settings.enable_hardware:
+            return "LOCAL-HARDWARE"
+        return "MOCK"
 
     def connection_status(self) -> str:
+        if settings.enable_phone_live_bridge:
+            return "phone-bridge-ready"
         if not settings.enable_hardware:
             return "mock-ready"
         return "connected" if self.connected else "disconnected"

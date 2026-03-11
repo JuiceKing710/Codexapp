@@ -229,6 +229,15 @@ def list_sessions() -> dict:
     return {"active_session_id": store.active_session_id, "sessions": sessions}
 
 
+@app.post("/sessions/active/stop")
+def stop_active_session() -> dict:
+    session = store.close_active_session()
+    if session is None:
+        return {"status": "no_active_session"}
+    stop_capture()
+    return {"status": "stopped", "session_id": session.session_id}
+
+
 @app.get("/sessions/active")
 def get_active_session() -> dict:
     try:
@@ -364,6 +373,12 @@ def dashboard_state() -> dict:
         reads = [item.model_dump() for item in store.get_reads(active["session_id"])]
         events = [item.model_dump() for item in store.get_events(active["session_id"])]
 
+    report_tiers = [
+        {"id": "customer_summary", "label": "Customer Summary", "description": "Plain-language, customer-facing visit summary."},
+        {"id": "technician_detail", "label": "Technician Detail", "description": "Diagnostic details with observations and data context."},
+        {"id": "ai_training_export", "label": "AI Training Export", "description": "Structured export scaffold for model training review."},
+    ]
+
     return {
         "app_id": settings.app_id,
         "display_name": settings.app_display_name,
@@ -378,6 +393,8 @@ def dashboard_state() -> dict:
         "quick_reads": SAFE_QUICK_READS,
         "recent_reads": reads[-40:],
         "recent_events": events[-40:],
+        "last_successful_read": reads[-1] if reads else None,
+        "report_tiers": report_tiers,
     }
 
 
@@ -391,130 +408,114 @@ def dashboard() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Zeb’s OBD AI Dashboard</title>
   <style>
-    :root {
-      --bg: #f3f6fa;
-      --card: #ffffff;
-      --ink: #102235;
-      --muted: #5a6c81;
-      --line: #d7e1eb;
-      --accent: #0f6db4;
-      --accent-dark: #0b548a;
-      --danger: #b42318;
-      --ok: #117a3c;
-      --warn: #9a6a00;
-      --badge-idle: #6b7280;
-      --badge-recording: #117a3c;
-      --badge-stopped: #9a6a00;
-    }
-    body { margin: 0; font-family: "Avenir Next", "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
-    .wrap { max-width: 1280px; margin: 0 auto; padding: 24px; display: grid; gap: 16px; }
-    .row { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
-    .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
-    .title { margin: 0 0 10px; font-size: 19px; }
-    .label { color: var(--muted); font-size: 13px; margin-bottom: 6px; display: block; font-weight: 600; }
-    .kv { display: grid; grid-template-columns: 150px 1fr; gap: 6px; font-size: 14px; }
-    select, button { border-radius: 10px; border: 1px solid var(--line); padding: 12px 14px; font-size: 14px; }
-    button { background: var(--accent); color: white; border-color: var(--accent); cursor: pointer; font-weight: 700; }
-    button:hover { background: var(--accent-dark); }
-    button.danger { background: var(--danger); border-color: var(--danger); }
-    button.wide { width: 100%; }
-    .btn-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
-    .badge { display: inline-block; padding: 6px 12px; border-radius: 999px; color: white; font-weight: 700; font-size: 12px; text-transform: uppercase; }
-    .badge.idle { background: var(--badge-idle); }
-    .badge.recording { background: var(--badge-recording); }
-    .badge.stopped { background: var(--badge-stopped); }
-    .status-ok { color: var(--ok); font-weight: 700; }
-    .status-warn { color: var(--warn); font-weight: 700; }
-    pre { background: #0d1b2a; color: #dbe8f6; border-radius: 10px; padding: 12px; overflow: auto; font-size: 12px; min-height: 160px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { border-bottom: 1px solid var(--line); padding: 8px; text-align: left; vertical-align: top; }
+    :root { --bg:#edf2f7; --card:#fff; --ink:#0f172a; --muted:#475569; --line:#d4dde7; --primary:#0f766e; --primary-dark:#0b5a55; --danger:#c2410c; --warn:#b45309; --ok:#15803d; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:"Segoe UI", system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+    .wrap { max-width: 1024px; margin:0 auto; padding:14px; display:grid; gap:12px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; }
+    .row { display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
+    .title { margin:0 0 10px; font-size:1.05rem; }
+    .status-card { border-left:5px solid var(--primary); }
+    .status-label { color:var(--muted); font-size:.82rem; text-transform:uppercase; letter-spacing:.02em; }
+    .status-value { font-size:1rem; font-weight:700; margin-top:4px; word-break:break-word; }
+    .btn-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    button, select, input { width:100%; border-radius:12px; border:1px solid var(--line); padding:14px; font-size:1rem; }
+    button { background:var(--primary); border-color:var(--primary); color:#fff; font-weight:700; min-height:56px; }
+    button:active { transform:scale(0.99); }
+    button.secondary { background:#fff; color:var(--ink); border-color:var(--line); }
+    button.danger { background:var(--danger); border-color:var(--danger); }
+    .pill { display:inline-block; border-radius:999px; padding:6px 10px; font-size:.8rem; font-weight:800; color:#fff; }
+    .pill.mock { background:#64748b; } .pill.phone-live { background:#2563eb; } .pill.local-hardware { background:#15803d; }
+    .tiny { font-size:.8rem; color:var(--muted); }
+    .gauge-grid { display:grid; gap:10px; grid-template-columns:1fr; }
+    .gauge { border:1px solid var(--line); border-radius:12px; padding:10px; background:#fcfdff; }
+    .gauge h4 { margin:0 0 8px; }
+    .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    pre { margin:0; background:#0b1220; color:#dbeafe; border-radius:10px; padding:10px; overflow:auto; font-size:.78rem; max-height:220px; }
+    @media (max-width: 640px) { .btn-grid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
-      <h1 style="margin:0;">Zeb’s OBD AI</h1>
-      <div style="margin-top:4px;color:#5b6b7f;">Safe read-only diagnostics and learning capture dashboard</div>
+      <h1 style="margin:0;">Zeb’s OBD AI — Phase 1 Dashboard</h1>
+      <div class="tiny">Phone-first workflow for safe read-only diagnostics. Mock/live source is always visible.</div>
     </div>
 
-    <div class="row">
-      <div class="card">
-        <h2 class="title">Vehicles</h2>
-        <label class="label" for="vehicleSelect">Select vehicle profile</label>
-        <select id="vehicleSelect" style="width:100%;"></select>
-        <div style="margin-top:10px;"><button id="createSessionBtn" class="wide">Create Active Session</button></div>
+    <div class="row" id="statusCards"></div>
+
+    <div class="card">
+      <h2 class="title">Main Controls</h2>
+      <label class="tiny" for="vehicleSelect">Active vehicle profile</label>
+      <select id="vehicleSelect"></select>
+      <div class="btn-grid" style="margin-top:10px;">
+        <button id="connectVehicleBtn" class="secondary">Connect Vehicle</button>
+        <button id="startSessionBtn">Start Session</button>
+        <button id="stopSessionBtn" class="danger">Stop Session</button>
+        <button id="readRpmBtn">Read RPM</button>
+        <button id="readCoolantBtn">Read Coolant Temp</button>
+        <button id="startCaptureBtn">Start Capture</button>
+        <button id="stopCaptureBtn" class="danger">Stop Capture</button>
+        <button id="tagEventBtn" class="secondary">Tag Event</button>
+        <button id="reportsBtn" class="secondary">Reports</button>
       </div>
-      <div class="card">
-        <h2 class="title">Capture Presets</h2>
-        <label class="label" for="presetSelect">Choose preset</label>
-        <select id="presetSelect" style="width:100%;"></select>
+      <div class="btn-grid" style="margin-top:10px;">
+        <button id="quickRpmBtn">Quick RPM</button>
+        <button id="quickCoolantBtn">Quick Coolant Temp</button>
       </div>
-      <div class="card">
-        <h2 class="title">Capture Controls</h2>
-        <div style="display:grid;grid-template-columns:1fr;gap:10px;">
-          <button id="startLearningBtn">Start Learning Session</button>
-          <button id="stopLearningBtn" class="danger">Stop Learning Session</button>
+    </div>
+
+    <div class="card" id="gaugePage">
+      <h2 class="title">4-Gauge Presets</h2>
+      <div class="grid2">
+        <input id="presetName" placeholder="Preset name" value="Default" />
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+          <button id="savePresetBtn" class="secondary">Save Preset</button>
+          <button id="loadPresetBtn" class="secondary">Load Preset</button>
         </div>
-        <div style="margin-top:12px;">
-          <span class="label">Capture Status</span>
-          <span id="captureStatusBadge" class="badge idle">idle</span>
-        </div>
       </div>
+      <div class="tiny" style="margin-top:8px;">Each gauge supports sensor assignment, label, range, unit, warning and critical thresholds.</div>
+      <div class="gauge-grid" id="gaugeGrid" style="margin-top:10px;"></div>
     </div>
 
     <div class="card">
-      <h2 class="title">Session Status</h2>
-      <div class="kv">
-        <div>Selected Vehicle</div><div id="selectedVehicle">-</div>
-        <div>Active Session</div><div id="activeSession">-</div>
-        <div>Protocol</div><div id="protocol">-</div>
-        <div>Mode</div><div id="mode">-</div>
-        <div>Connection</div><div id="connection">-</div>
-      </div>
+      <h2 class="title">Reports Framework (Phase 1 Hooks)</h2>
+      <div id="reportHooks" class="row"></div>
     </div>
 
     <div class="card">
-      <h2 class="title">Quick Safe Reads</h2>
-      <div class="btn-grid" id="quickReadButtons"></div>
-    </div>
-
-    <div class="card">
-      <h2 class="title">Tag Event</h2>
-      <div class="btn-grid" id="eventTagButtons"></div>
-    </div>
-
-    <div class="row">
-      <div class="card">
-        <h2 class="title">Latest Response</h2>
-        <pre id="latestResponse">No reads yet.</pre>
-      </div>
-      <div class="card">
-        <h2 class="title">Recent Recorded Data</h2>
-        <table>
-          <thead><tr><th>Time (UTC)</th><th>Command</th><th>Vehicle</th><th>Raw</th></tr></thead>
-          <tbody id="historyRows"><tr><td colspan="4">No captured reads yet</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2 class="title">Recent Tagged Events</h2>
-      <table>
-        <thead><tr><th>Time (UTC)</th><th>Tag</th><th>Note</th></tr></thead>
-        <tbody id="eventRows"><tr><td colspan="3">No tagged events yet</td></tr></tbody>
-      </table>
+      <h2 class="title">Developer / Debug Panel</h2>
+      <div class="tiny">Read source classification: MOCK, PHONE-LIVE, or LOCAL-HARDWARE.</div>
+      <pre id="debugPanel">Loading...</pre>
     </div>
   </div>
 
 <script>
 let state = null;
 let selectedVehicleId = "toyota_sienna_2006";
-let selectedPreset = "cold_start_capture";
+const GAUGE_SENSORS = ["rpm", "coolant_temp", "vehicle_speed", "control_module_voltage", "vin", "stored_codes", "pending_codes"];
+let gauges = [0,1,2,3].map(i => ({slot:i+1, sensor:"rpm", label:`Gauge ${i+1}`, min:0, max:8000, unit:"", warn:4500, critical:6000}));
 
-async function fetchState() {
-  const res = await fetch('/dashboard/state');
-  state = await res.json();
-  render();
+function modeCss(mode) {
+  return String(mode || '').toLowerCase().replace(/\s+/g,'-');
+}
+
+function card(label, value) {
+  return `<div class="card status-card"><div class="status-label">${label}</div><div class="status-value">${value || '-'}</div></div>`;
+}
+
+function renderStatusCards() {
+  const mode = state.adapter_mode || 'MOCK';
+  const sourcePill = `<span class="pill ${modeCss(mode)}">${mode}</span>`;
+  const active = state.active_session;
+  const lastRead = state.last_successful_read ? `${state.last_successful_read.command} @ ${state.last_successful_read.ts}` : 'None';
+  document.getElementById('statusCards').innerHTML = [
+    card('Current mode', sourcePill),
+    card('Active vehicle', active ? active.vehicle : selectedVehicleId),
+    card('Active session', active ? active.session_id : 'None'),
+    card('Capture status', state.capture_status),
+    card('Last successful read', lastRead)
+  ].join('');
 }
 
 function renderVehicles() {
@@ -527,153 +528,131 @@ function renderVehicles() {
     if (v.vehicle_id === selectedVehicleId) opt.selected = true;
     select.appendChild(opt);
   });
-  select.onchange = (e) => { selectedVehicleId = e.target.value; renderSessionArea(); };
+  select.onchange = (e) => { selectedVehicleId = e.target.value; };
 }
 
-function renderPresets() {
-  const select = document.getElementById('presetSelect');
-  select.innerHTML = '';
-  Object.keys(state.capture_presets).forEach(key => {
-    const opt = document.createElement('option');
-    opt.value = key;
-    opt.textContent = state.capture_presets[key];
-    if (key === selectedPreset) opt.selected = true;
-    select.appendChild(opt);
+function gaugeEditor(idx, gauge) {
+  return `<div class="gauge">
+      <h4>Gauge ${idx+1}</h4>
+      <div class="grid2">
+        <select data-field="sensor" data-idx="${idx}">${GAUGE_SENSORS.map(s => `<option value="${s}" ${gauge.sensor===s?'selected':''}>${s}</option>`).join('')}</select>
+        <input data-field="label" data-idx="${idx}" value="${gauge.label}" placeholder="Label" />
+        <input data-field="min" data-idx="${idx}" type="number" value="${gauge.min}" placeholder="Min" />
+        <input data-field="max" data-idx="${idx}" type="number" value="${gauge.max}" placeholder="Max" />
+        <input data-field="unit" data-idx="${idx}" value="${gauge.unit}" placeholder="Unit" />
+        <input data-field="warn" data-idx="${idx}" type="number" value="${gauge.warn}" placeholder="Warning" />
+        <input data-field="critical" data-idx="${idx}" type="number" value="${gauge.critical}" placeholder="Critical" />
+      </div>
+    </div>`;
+}
+
+function renderGauges() {
+  const grid = document.getElementById('gaugeGrid');
+  grid.innerHTML = gauges.map((g, i) => gaugeEditor(i, g)).join('');
+  grid.querySelectorAll('input,select').forEach(el => {
+    el.onchange = (e) => {
+      const idx = Number(e.target.dataset.idx);
+      const field = e.target.dataset.field;
+      const val = e.target.type === 'number' ? Number(e.target.value) : e.target.value;
+      gauges[idx][field] = val;
+    };
   });
-  selectedPreset = state.capture_preset || selectedPreset;
-  select.value = selectedPreset;
-  select.onchange = (e) => { selectedPreset = e.target.value; };
 }
 
-function renderSessionArea() {
-  const active = state.active_session;
-  const selected = state.vehicles.find(v => v.vehicle_id === selectedVehicleId);
-  document.getElementById('selectedVehicle').textContent = selected ? `${selected.label} (${selected.protocol_hint})` : '-';
-  document.getElementById('activeSession').textContent = active ? active.session_id : 'None';
-  document.getElementById('protocol').textContent = active ? active.protocol : '-';
-  document.getElementById('mode').textContent = state.adapter_mode;
-  const conn = document.getElementById('connection');
-  conn.textContent = state.connection_status;
-  conn.className = state.connection_status.includes('connected') || state.connection_status.includes('ready') ? 'status-ok' : 'status-warn';
-
-  const badge = document.getElementById('captureStatusBadge');
-  badge.textContent = state.capture_status;
-  badge.className = `badge ${state.capture_status}`;
+function renderReports() {
+  const hooks = document.getElementById('reportHooks');
+  hooks.innerHTML = state.report_tiers.map(t => `
+    <div class="card">
+      <div style="font-weight:700;">${t.label}</div>
+      <div class="tiny" style="margin:6px 0 10px;">${t.description}</div>
+      <button class="secondary" onclick="reportHook('${t.id}')">Open ${t.label}</button>
+    </div>
+  `).join('');
 }
 
-function renderQuickButtons() {
-  const labels = {
-    rpm: 'Read RPM',
-    coolant_temp: 'Read Coolant Temp',
-    vehicle_speed: 'Read Vehicle Speed',
-    control_module_voltage: 'Read Control Module Voltage',
-    vin: 'Read VIN',
-    stored_codes: 'Read Stored Codes',
-    pending_codes: 'Read Pending Codes'
+function renderDebug() {
+  const latest = state.last_successful_read;
+  const src = state.adapter_mode;
+  const isMock = src === 'MOCK';
+  const debug = {
+    mode: src,
+    source_label: isMock ? 'MOCK DATA' : 'LIVE-CLASSIFIED DATA',
+    connection_status: state.connection_status,
+    active_session: state.active_session,
+    capture_status: state.capture_status,
+    last_successful_read: latest,
+    recent_read_count: state.recent_reads.length
   };
-  const container = document.getElementById('quickReadButtons');
-  container.innerHTML = '';
-  Object.keys(state.quick_reads).forEach(key => {
-    const btn = document.createElement('button');
-    btn.textContent = labels[key] || key;
-    btn.onclick = () => runQuickRead(key);
-    container.appendChild(btn);
-  });
+  document.getElementById('debugPanel').textContent = JSON.stringify(debug, null, 2);
 }
 
-function renderEventButtons() {
-  const container = document.getElementById('eventTagButtons');
-  container.innerHTML = '';
-  state.event_tags.forEach(tag => {
-    const btn = document.createElement('button');
-    btn.textContent = tag;
-    btn.onclick = () => tagEvent(tag);
-    container.appendChild(btn);
-  });
-}
-
-function renderHistory() {
-  const rows = document.getElementById('historyRows');
-  if (!state.recent_reads.length) {
-    rows.innerHTML = '<tr><td colspan="4">No captured reads yet</td></tr>';
-    return;
-  }
-  rows.innerHTML = state.recent_reads.slice().reverse().map(item =>
-    `<tr><td>${item.ts}</td><td>${item.command}</td><td>${item.vehicle}</td><td>${item.raw_response}</td></tr>`
-  ).join('');
-}
-
-function renderEvents() {
-  const rows = document.getElementById('eventRows');
-  if (!state.recent_events.length) {
-    rows.innerHTML = '<tr><td colspan="3">No tagged events yet</td></tr>';
-    return;
-  }
-  rows.innerHTML = state.recent_events.slice().reverse().map(item =>
-    `<tr><td>${item.ts}</td><td>${item.tag}</td><td>${item.note || ''}</td></tr>`
-  ).join('');
-}
-
-function render() {
+async function fetchState() {
+  const res = await fetch('/dashboard/state');
+  state = await res.json();
+  renderStatusCards();
   renderVehicles();
-  renderPresets();
-  renderSessionArea();
-  renderQuickButtons();
-  renderEventButtons();
-  renderHistory();
-  renderEvents();
+  renderGauges();
+  renderReports();
+  renderDebug();
 }
 
 async function createSession() {
-  const res = await fetch('/sessions', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({vehicle_id: selectedVehicleId})
-  });
-  const payload = await res.json();
-  document.getElementById('latestResponse').textContent = JSON.stringify(payload, null, 2);
+  const res = await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})});
+  await res.json();
   await fetchState();
 }
 
-async function runQuickRead(key) {
-  const res = await fetch(`/obd/read/quick/${key}`, { method: 'POST' });
-  const payload = await res.json();
-  document.getElementById('latestResponse').textContent = JSON.stringify(payload, null, 2);
+async function stopSession() {
+  await fetch('/sessions/active/stop', {method:'POST'});
   await fetchState();
 }
 
-async function startLearning() {
-  const res = await fetch('/capture/start', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({vehicle_id: selectedVehicleId, preset: selectedPreset})
-  });
-  const payload = await res.json();
-  document.getElementById('latestResponse').textContent = JSON.stringify(payload, null, 2);
+async function quickRead(key) {
+  await fetch(`/obd/read/quick/${key}`, {method:'POST'});
   await fetchState();
 }
 
-async function stopLearning() {
-  const res = await fetch('/capture/stop', { method: 'POST' });
-  const payload = await res.json();
-  document.getElementById('latestResponse').textContent = JSON.stringify(payload, null, 2);
+async function startCapture() {
+  await fetch('/capture/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId, preset:'cold_start_capture'})});
   await fetchState();
 }
 
-async function tagEvent(tag) {
-  const res = await fetch('/capture/tag', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({tag})
-  });
-  const payload = await res.json();
-  document.getElementById('latestResponse').textContent = JSON.stringify(payload, null, 2);
+async function stopCapture() {
+  await fetch('/capture/stop', {method:'POST'});
   await fetchState();
 }
 
-document.getElementById('createSessionBtn').onclick = createSession;
-document.getElementById('startLearningBtn').onclick = startLearning;
-document.getElementById('stopLearningBtn').onclick = stopLearning;
+async function tagEvent() {
+  await fetch('/capture/tag', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({tag:'idle'})});
+  await fetchState();
+}
+
+function connectVehicle() { createSession(); }
+function reportHook(id) { alert(`Phase 1 hook: ${id}`); }
+
+function savePreset() {
+  const name = document.getElementById('presetName').value || 'Default';
+  localStorage.setItem(`gaugePreset:${name}`, JSON.stringify(gauges));
+}
+function loadPreset() {
+  const name = document.getElementById('presetName').value || 'Default';
+  const raw = localStorage.getItem(`gaugePreset:${name}`);
+  if (raw) { gauges = JSON.parse(raw); renderGauges(); }
+}
+
+document.getElementById('connectVehicleBtn').onclick = connectVehicle;
+document.getElementById('startSessionBtn').onclick = createSession;
+document.getElementById('stopSessionBtn').onclick = stopSession;
+document.getElementById('readRpmBtn').onclick = () => quickRead('rpm');
+document.getElementById('readCoolantBtn').onclick = () => quickRead('coolant_temp');
+document.getElementById('startCaptureBtn').onclick = startCapture;
+document.getElementById('stopCaptureBtn').onclick = stopCapture;
+document.getElementById('tagEventBtn').onclick = tagEvent;
+document.getElementById('reportsBtn').onclick = () => document.getElementById('reportHooks').scrollIntoView({behavior:'smooth'});
+document.getElementById('quickRpmBtn').onclick = () => quickRead('rpm');
+document.getElementById('quickCoolantBtn').onclick = () => quickRead('coolant_temp');
+document.getElementById('savePresetBtn').onclick = savePreset;
+document.getElementById('loadPresetBtn').onclick = loadPreset;
 setInterval(fetchState, 1500);
 fetchState();
 </script>

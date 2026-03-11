@@ -55,6 +55,13 @@ class SessionStore:
             raise KeyError("No active session")
         return self.get_session(self.active_session_id)
 
+    def close_active_session(self) -> Session | None:
+        if self.active_session_id is None:
+            return None
+        session = self.get_session(self.active_session_id)
+        self.active_session_id = None
+        return session
+
     def add_event(self, event: EventTag) -> EventTag:
         if event.session_id not in self.sessions:
             raise KeyError(event.session_id)
