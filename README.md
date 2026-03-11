@@ -34,37 +34,38 @@ Each session is linked to the selected vehicle and inherits its protocol hint.
 - `.env.example`: app and runtime configuration
 - `docs/AGENTS_WORKFLOW.md`: AGENTS.md-aware workflow notes
 
-## Dashboard improvements
+## Dashboard improvements (Phase 1)
 
-`/dashboard` now includes:
+`/dashboard` now includes a phone-first UI for normal workflow (no manual JSON input):
 
-- Vehicles section with profile selection
-- One-click session creation that automatically sets active session
-- No manual session ID entry for normal dashboard use
-- Quick safe read-only buttons:
+- Large touch-friendly controls:
+  - Connect Vehicle
+  - Start Session
+  - Stop Session (Phase 1 UI hook)
   - Read RPM
   - Read Coolant Temp
-  - Read Vehicle Speed
-  - Read Control Module Voltage
-  - Read VIN
-  - Read Stored Codes
-  - Read Pending Codes
-- Latest response panel
-- Recent read history panel
-- Session status cards showing selected vehicle, active session, protocol, mode (mock/hardware), and connection status
-- Safe learning capture workflow:
-  - `Start Learning Session`
-  - `Stop Learning Session`
-  - `Tag Event`
-  - Capture status badge: `idle`, `recording`, `stopped`
-  - Capture presets:
-    - Cold Start Capture
-    - Warm Idle Capture
-    - Throttle Response Capture
-    - Battery/Charging Capture
-    - Code Check Capture
-  - Recent tagged events panel
-  - Recent recorded data panel
+  - Start Capture
+  - Stop Capture
+  - Tag Event
+  - Reports
+- One-tap service calls:
+  - Quick RPM
+  - Quick Coolant Temp
+- Visible status cards:
+  - Current mode (`MOCK`, `PHONE-LIVE`, `LOCAL-HARDWARE`)
+  - Active vehicle
+  - Active session
+  - Capture status
+  - Last successful read
+- 4-gauge configuration page:
+  - Four adjustable gauges
+  - Per-gauge sensor, label, min/max, unit, warning, and critical thresholds
+  - Local preset save/load and switching
+- Three-tier report framework hooks:
+  - Customer Summary
+  - Technician Detail
+  - AI Training Export
+- Developer/debug panel with explicit source classification so mock and live reads are visibly separated
 
 ## API compatibility and additions
 
@@ -84,6 +85,7 @@ New routes:
 - `GET /vehicles`
 - `GET /sessions`
 - `GET /sessions/active`
+- `POST /sessions/active/stop`
 - `GET /sessions/{session_id}/reads`
 - `POST /obd/read/quick/{read_key}`
 - `GET /dashboard/state`

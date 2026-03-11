@@ -19,6 +19,7 @@ class Settings:
 
     default_protocol: str = os.getenv("DEFAULT_PROTOCOL", "ISO_9141_2")
     enable_hardware: bool = os.getenv("ENABLE_HARDWARE", "false").lower() == "true"
+    enable_phone_live_bridge: bool = os.getenv("ENABLE_PHONE_LIVE_BRIDGE", "false").lower() == "true"
 
     obdlink_port: str = os.getenv("OBDLINK_PORT", "/dev/tty.usbserial-0001")
     obdlink_baud: int = int(os.getenv("OBDLINK_BAUD", "115200"))
