@@ -157,3 +157,35 @@ Run quick safe VIN read on active session:
 ```bash
 curl -X POST http://127.0.0.1:8000/obd/read/quick/vin
 ```
+
+
+## Phase 2 phone-live bridge notes
+
+Phase 2 adds a production-safe phone bridge contract where the phone performs Bluetooth I/O and submits structured PHONE-LIVE reads to the backend.
+
+New phone bridge routes:
+
+- `GET /phone/bridge/state`
+- `POST /phone/bridge/connect`
+- `POST /phone/bridge/disconnect`
+- `POST /phone/bridge/read`
+
+`/phone/bridge/read` accepts read metadata including command, raw response, PID key, value, unit, source mode, timestamp, latency, and backend status. Reads are session-linked and stored with explicit source labels.
+
+### Manual phone test flow (live RPM + coolant temp)
+
+1. Start the backend and open `/dashboard` on a phone browser.
+2. Tap **Connect Vehicle**. Confirm OBDLink Bluetooth state shows `connected`.
+3. If no active session is present, the dashboard auto-creates one for the selected vehicle.
+4. Start the vehicle and tap **Read RPM**.
+5. Verify debug panel updates for:
+   - `last_raw_pid_command` = `010C`
+   - `last_raw_pid_response` populated
+   - mode/source = `PHONE-LIVE`
+6. Tap **Read Coolant Temp**.
+7. Verify debug panel updates for:
+   - `last_raw_pid_command` = `0105`
+   - `last_raw_pid_response` populated
+   - mode/source = `PHONE-LIVE`
+8. Confirm gauge cards display current value, timestamp, and source label.
+9. To test disconnect handling, call `POST /phone/bridge/disconnect` and confirm dashboard shows disconnected/offline state.

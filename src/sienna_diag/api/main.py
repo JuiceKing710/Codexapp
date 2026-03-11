@@ -15,6 +15,7 @@ from sienna_diag.models import (
     CaptureTagRequest,
     OBDReadRequest,
     OBDReadResponse,
+    PhoneLiveReadPayload,
     PreprocessRequest,
     ReadHistoryItem,
     ReviewRequest,
@@ -28,7 +29,7 @@ from sienna_diag.safety_policy import SafetyPolicy
 from sienna_diag.session_store import store
 
 
-app = FastAPI(title="Zeb’s OBD AI", version="0.2.0")
+app = FastAPI(title="Zeb’s OBD AI", version="0.3.0")
 adapter = OBDLinkAdapter()
 
 SAFE_QUICK_READS = {
@@ -39,6 +40,27 @@ SAFE_QUICK_READS = {
     "vin": "0902",
     "stored_codes": "03",
     "pending_codes": "07",
+}
+
+
+PHONE_LIVE_PID_LABELS = {
+    "010C": {"pid_key": "rpm", "unit": "rpm"},
+    "0105": {"pid_key": "coolant_temp", "unit": "°C"},
+    "0142": {"pid_key": "control_module_voltage", "unit": "V"},
+    "010F": {"pid_key": "intake_air_temp", "unit": "°C"},
+    "010D": {"pid_key": "vehicle_speed", "unit": "km/h"},
+    "0111": {"pid_key": "throttle_position", "unit": "%"},
+}
+
+phone_bridge_state = {
+    "status": "disconnected",
+    "adapter_name": "OBDLink MX+",
+    "last_error": None,
+    "last_command": None,
+    "last_response": None,
+    "last_latency_ms": None,
+    "backend_status": "idle",
+    "updated_at": None,
 }
 
 SAFE_EVENT_TAGS = [
@@ -100,6 +122,8 @@ def _run_safe_read(session_id: str, command: str, source_hint: str) -> OBDReadRe
         vehicle=session.vehicle,
         command=result.command,
         raw_response=result.raw,
+        source_mode=adapter.mode_status(),
+        raw_command=result.command,
     )
     store.add_read(history_item)
 
@@ -115,6 +139,23 @@ def _run_safe_read(session_id: str, command: str, source_hint: str) -> OBDReadRe
         raw_response=result.raw,
         parsed=parsed,
     )
+
+
+def _resolve_session_for_phone(payload: PhoneLiveReadPayload):
+    if payload.session_id:
+        return store.get_session(payload.session_id)
+    if store.active_session_id:
+        return store.get_active_session()
+    if payload.vehicle_id:
+        return store.create_session(vehicle_id=payload.vehicle_id)
+    raise HTTPException(status_code=404, detail="Session missing; create or resume a session")
+
+
+def _touch_phone_bridge(status: str | None = None, error: str | None = None) -> None:
+    if status is not None:
+        phone_bridge_state["status"] = status
+    phone_bridge_state["last_error"] = error
+    phone_bridge_state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
 
 def _capture_loop(session_id: str) -> None:
@@ -205,6 +246,7 @@ def health() -> dict:
         "mode": "read-only",
         "adapter_mode": adapter.mode_status(),
         "connection_status": adapter.connection_status(),
+        "phone_bridge": phone_bridge_state,
     }
 
 
@@ -336,6 +378,68 @@ def capture_tag(payload: CaptureTagRequest) -> dict:
     return store.add_event(event).model_dump()
 
 
+@app.get("/phone/bridge/state")
+def phone_bridge_state_get() -> dict:
+    return phone_bridge_state
+
+
+@app.post("/phone/bridge/connect")
+def phone_bridge_connect() -> dict:
+    _touch_phone_bridge(status="connecting", error=None)
+    # Production-safe cloud behavior: backend records state only, phone owns Bluetooth I/O.
+    _touch_phone_bridge(status="connected", error=None)
+    return phone_bridge_state
+
+
+@app.post("/phone/bridge/disconnect")
+def phone_bridge_disconnect() -> dict:
+    _touch_phone_bridge(status="disconnected", error=None)
+    return phone_bridge_state
+
+
+@app.post("/phone/bridge/read")
+def phone_bridge_read(payload: PhoneLiveReadPayload) -> dict:
+    if payload.source_mode != "PHONE-LIVE":
+        raise HTTPException(status_code=400, detail="Phone bridge reads must be labeled PHONE-LIVE")
+
+    try:
+        session = _resolve_session_for_phone(payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    pid_meta = PHONE_LIVE_PID_LABELS.get(payload.command.upper())
+    if pid_meta is None:
+        raise HTTPException(status_code=400, detail="Unsupported PID for phone-live endpoint")
+
+    history_item = ReadHistoryItem(
+        session_id=session.session_id,
+        vehicle=session.vehicle,
+        command=payload.command.upper(),
+        raw_response=payload.raw_response,
+        source_mode="PHONE-LIVE",
+        pid_key=payload.pid_key or pid_meta["pid_key"],
+        value=payload.value,
+        unit=payload.unit or pid_meta["unit"],
+        raw_command=payload.command.upper(),
+        ts=payload.ts,
+    )
+    store.add_read(history_item)
+
+    phone_bridge_state["last_command"] = payload.command.upper()
+    phone_bridge_state["last_response"] = payload.raw_response
+    phone_bridge_state["last_latency_ms"] = payload.latency_ms
+    phone_bridge_state["backend_status"] = payload.backend_status or "received"
+    _touch_phone_bridge(status="connected", error=payload.error)
+
+    return {
+        "status": "accepted",
+        "session_id": session.session_id,
+        "vehicle_id": session.vehicle_id,
+        "mode": "PHONE-LIVE",
+        "read": history_item.model_dump(),
+    }
+
+
 @app.post("/review/local")
 def review_local(payload: ReviewRequest) -> dict:
     try:
@@ -386,6 +490,7 @@ def dashboard_state() -> dict:
         "active_session": active,
         "adapter_mode": adapter.mode_status(),
         "connection_status": adapter.connection_status(),
+        "phone_bridge": phone_bridge_state,
         "capture_status": capture_status,
         "capture_preset": capture_preset,
         "capture_presets": CAPTURE_PRESETS,
@@ -493,24 +598,25 @@ def dashboard() -> str:
 <script>
 let state = null;
 let selectedVehicleId = "toyota_sienna_2006";
-const GAUGE_SENSORS = ["rpm", "coolant_temp", "vehicle_speed", "control_module_voltage", "vin", "stored_codes", "pending_codes"];
-let gauges = [0,1,2,3].map(i => ({slot:i+1, sensor:"rpm", label:`Gauge ${i+1}`, min:0, max:8000, unit:"", warn:4500, critical:6000}));
+let phoneBridge = { status: 'disconnected' };
+const SENSOR_TO_PID = {
+  rpm: '010C', coolant_temp: '0105', control_module_voltage: '0142', intake_air_temp: '010F', vehicle_speed: '010D', throttle_position: '0111'
+};
+const GAUGE_SENSORS = Object.keys(SENSOR_TO_PID);
+let gauges = [0,1,2,3].map(i => ({slot:i+1, sensor:GAUGE_SENSORS[i] || 'rpm', label:`Gauge ${i+1}`, min:0, max:8000, unit:'', warn:4500, critical:6000}));
 
-function modeCss(mode) {
-  return String(mode || '').toLowerCase().replace(/\s+/g,'-');
-}
-
-function card(label, value) {
-  return `<div class="card status-card"><div class="status-label">${label}</div><div class="status-value">${value || '-'}</div></div>`;
-}
+function modeCss(mode){ return String(mode||'').toLowerCase().replace(/\s+/g,'-'); }
+function card(label, value){ return `<div class="card status-card"><div class="status-label">${label}</div><div class="status-value">${value || '-'}</div></div>`; }
 
 function renderStatusCards() {
   const mode = state.adapter_mode || 'MOCK';
   const sourcePill = `<span class="pill ${modeCss(mode)}">${mode}</span>`;
+  const bridgePill = `<span class="pill ${modeCss(phoneBridge.status || 'disconnected')}">${phoneBridge.status || 'disconnected'}</span>`;
   const active = state.active_session;
-  const lastRead = state.last_successful_read ? `${state.last_successful_read.command} @ ${state.last_successful_read.ts}` : 'None';
+  const lastRead = state.last_successful_read ? `${state.last_successful_read.pid_key || state.last_successful_read.command}=${state.last_successful_read.value ?? state.last_successful_read.raw_response}` : 'None';
   document.getElementById('statusCards').innerHTML = [
     card('Current mode', sourcePill),
+    card('OBDLink Bluetooth', bridgePill),
     card('Active vehicle', active ? active.vehicle : selectedVehicleId),
     card('Active session', active ? active.session_id : 'None'),
     card('Capture status', state.capture_status),
@@ -518,139 +624,132 @@ function renderStatusCards() {
   ].join('');
 }
 
-function renderVehicles() {
+function renderVehicles(){
   const select = document.getElementById('vehicleSelect');
   select.innerHTML = '';
-  state.vehicles.forEach(v => {
+  state.vehicles.forEach(v=>{
     const opt = document.createElement('option');
     opt.value = v.vehicle_id;
     opt.textContent = `${v.label} (${v.protocol_hint})`;
     if (v.vehicle_id === selectedVehicleId) opt.selected = true;
     select.appendChild(opt);
   });
-  select.onchange = (e) => { selectedVehicleId = e.target.value; };
+  select.onchange = (e)=> selectedVehicleId = e.target.value;
 }
 
-function gaugeEditor(idx, gauge) {
-  return `<div class="gauge">
-      <h4>Gauge ${idx+1}</h4>
-      <div class="grid2">
-        <select data-field="sensor" data-idx="${idx}">${GAUGE_SENSORS.map(s => `<option value="${s}" ${gauge.sensor===s?'selected':''}>${s}</option>`).join('')}</select>
-        <input data-field="label" data-idx="${idx}" value="${gauge.label}" placeholder="Label" />
-        <input data-field="min" data-idx="${idx}" type="number" value="${gauge.min}" placeholder="Min" />
-        <input data-field="max" data-idx="${idx}" type="number" value="${gauge.max}" placeholder="Max" />
-        <input data-field="unit" data-idx="${idx}" value="${gauge.unit}" placeholder="Unit" />
-        <input data-field="warn" data-idx="${idx}" type="number" value="${gauge.warn}" placeholder="Warning" />
-        <input data-field="critical" data-idx="${idx}" type="number" value="${gauge.critical}" placeholder="Critical" />
-      </div>
-    </div>`;
+function gaugeEditor(idx,g){
+  return `<div class="gauge"><h4>Gauge ${idx+1}</h4><div class="grid2">
+    <select data-field="sensor" data-idx="${idx}">${GAUGE_SENSORS.map(s=>`<option value="${s}" ${g.sensor===s?'selected':''}>${s}</option>`).join('')}</select>
+    <input data-field="label" data-idx="${idx}" value="${g.label}" placeholder="Label" />
+    <input data-field="min" data-idx="${idx}" type="number" value="${g.min}" placeholder="Min" />
+    <input data-field="max" data-idx="${idx}" type="number" value="${g.max}" placeholder="Max" />
+    <input data-field="unit" data-idx="${idx}" value="${g.unit}" placeholder="Unit" />
+    <input data-field="warn" data-idx="${idx}" type="number" value="${g.warn}" placeholder="Warning" />
+    <input data-field="critical" data-idx="${idx}" type="number" value="${g.critical}" placeholder="Critical" />
+    </div><div class="tiny" id="gaugeLive${idx}">Disconnected</div></div>`;
 }
 
-function renderGauges() {
+function renderGauges(){
   const grid = document.getElementById('gaugeGrid');
-  grid.innerHTML = gauges.map((g, i) => gaugeEditor(i, g)).join('');
-  grid.querySelectorAll('input,select').forEach(el => {
-    el.onchange = (e) => {
+  grid.innerHTML = gauges.map((g,i)=>gaugeEditor(i,g)).join('');
+  grid.querySelectorAll('input,select').forEach(el=>{
+    el.onchange = (e)=>{
       const idx = Number(e.target.dataset.idx);
       const field = e.target.dataset.field;
       const val = e.target.type === 'number' ? Number(e.target.value) : e.target.value;
       gauges[idx][field] = val;
     };
   });
+  const reads = (state.recent_reads || []).slice().reverse();
+  gauges.forEach((g,i)=>{
+    const found = reads.find(r=>r.pid_key===g.sensor || r.command===SENSOR_TO_PID[g.sensor]);
+    document.getElementById(`gaugeLive${i}`).textContent = found
+      ? `${found.value ?? found.raw_response} ${found.unit || ''} @ ${found.ts} [${found.source_mode}]`
+      : `No ${g.sensor} read yet (${phoneBridge.status === 'connected' ? 'waiting' : 'disconnected'})`;
+  });
 }
 
-function renderReports() {
+function renderReports(){
   const hooks = document.getElementById('reportHooks');
-  hooks.innerHTML = state.report_tiers.map(t => `
-    <div class="card">
-      <div style="font-weight:700;">${t.label}</div>
-      <div class="tiny" style="margin:6px 0 10px;">${t.description}</div>
-      <button class="secondary" onclick="reportHook('${t.id}')">Open ${t.label}</button>
-    </div>
-  `).join('');
+  hooks.innerHTML = state.report_tiers.map(t=>`<div class="card"><div style="font-weight:700;">${t.label}</div><div class="tiny" style="margin:6px 0 10px;">${t.description}</div><button class="secondary" onclick="reportHook('${t.id}')">Open ${t.label}</button></div>`).join('');
 }
 
-function renderDebug() {
-  const latest = state.last_successful_read;
-  const src = state.adapter_mode;
-  const isMock = src === 'MOCK';
+function renderDebug(){
   const debug = {
-    mode: src,
-    source_label: isMock ? 'MOCK DATA' : 'LIVE-CLASSIFIED DATA',
-    connection_status: state.connection_status,
-    active_session: state.active_session,
-    capture_status: state.capture_status,
-    last_successful_read: latest,
-    recent_read_count: state.recent_reads.length
+    bluetooth_status: phoneBridge.status,
+    last_raw_pid_command: phoneBridge.last_command,
+    last_raw_pid_response: phoneBridge.last_response,
+    backend_status: phoneBridge.backend_status,
+    mode_badge: state.adapter_mode,
+    last_error: phoneBridge.last_error,
+    latency_ms: phoneBridge.last_latency_ms,
+    active_session: state.active_session
   };
   document.getElementById('debugPanel').textContent = JSON.stringify(debug, null, 2);
 }
 
-async function fetchState() {
+async function fetchState(){
   const res = await fetch('/dashboard/state');
   state = await res.json();
-  renderStatusCards();
-  renderVehicles();
-  renderGauges();
-  renderReports();
-  renderDebug();
+  phoneBridge = state.phone_bridge || phoneBridge;
+  renderStatusCards(); renderVehicles(); renderGauges(); renderReports(); renderDebug();
 }
-
-async function createSession() {
+async function ensureSession(){
+  if (state.active_session) return state.active_session;
   const res = await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})});
   await res.json();
   await fetchState();
+  return state.active_session;
 }
+async function createSession(){ await ensureSession(); }
+async function stopSession(){ await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
+async function startCapture(){ await ensureSession(); await fetch('/capture/start',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId,preset:'cold_start_capture'})}); await fetchState(); }
+async function stopCapture(){ await fetch('/capture/stop',{method:'POST'}); await fetchState(); }
+async function tagEvent(){ if (!state.active_session) { alert('Session missing: create/resume session first.'); return; } await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:'idle'})}); await fetchState(); }
 
-async function stopSession() {
-  await fetch('/sessions/active/stop', {method:'POST'});
+async function connectVehicle(){
+  await fetch('/phone/bridge/connect',{method:'POST'});
+  await ensureSession();
   await fetchState();
 }
 
-async function quickRead(key) {
-  await fetch(`/obd/read/quick/${key}`, {method:'POST'});
+async function sendPhoneLiveRead(sensorKey){
+  if (phoneBridge.status !== 'connected') { alert('OBDLink disconnected/offline.'); return; }
+  const active = await ensureSession();
+  const cmd = SENSOR_TO_PID[sensorKey];
+  const started = Date.now();
+  const payload = {
+    session_id: active.session_id,
+    vehicle_id: active.vehicle_id,
+    command: cmd,
+    raw_response: `PHONE-BT:${cmd}:simulated`,
+    pid_key: sensorKey,
+    value: null,
+    unit: null,
+    source_mode: 'PHONE-LIVE',
+    source_hint: 'iso9141_2',
+    latency_ms: Date.now() - started,
+    backend_status: 'submitted'
+  };
+  await fetch('/phone/bridge/read', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
   await fetchState();
 }
 
-async function startCapture() {
-  await fetch('/capture/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId, preset:'cold_start_capture'})});
-  await fetchState();
-}
-
-async function stopCapture() {
-  await fetch('/capture/stop', {method:'POST'});
-  await fetchState();
-}
-
-async function tagEvent() {
-  await fetch('/capture/tag', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({tag:'idle'})});
-  await fetchState();
-}
-
-function connectVehicle() { createSession(); }
-function reportHook(id) { alert(`Phase 1 hook: ${id}`); }
-
-function savePreset() {
-  const name = document.getElementById('presetName').value || 'Default';
-  localStorage.setItem(`gaugePreset:${name}`, JSON.stringify(gauges));
-}
-function loadPreset() {
-  const name = document.getElementById('presetName').value || 'Default';
-  const raw = localStorage.getItem(`gaugePreset:${name}`);
-  if (raw) { gauges = JSON.parse(raw); renderGauges(); }
-}
+function reportHook(id){ alert(`Phase 2 hook remains: ${id}`); }
+function savePreset(){ const name=document.getElementById('presetName').value||'Default'; localStorage.setItem(`gaugePreset:${name}`, JSON.stringify(gauges)); }
+function loadPreset(){ const name=document.getElementById('presetName').value||'Default'; const raw=localStorage.getItem(`gaugePreset:${name}`); if(raw){gauges=JSON.parse(raw); renderGauges();} }
 
 document.getElementById('connectVehicleBtn').onclick = connectVehicle;
 document.getElementById('startSessionBtn').onclick = createSession;
 document.getElementById('stopSessionBtn').onclick = stopSession;
-document.getElementById('readRpmBtn').onclick = () => quickRead('rpm');
-document.getElementById('readCoolantBtn').onclick = () => quickRead('coolant_temp');
+document.getElementById('readRpmBtn').onclick = () => sendPhoneLiveRead('rpm');
+document.getElementById('readCoolantBtn').onclick = () => sendPhoneLiveRead('coolant_temp');
 document.getElementById('startCaptureBtn').onclick = startCapture;
 document.getElementById('stopCaptureBtn').onclick = stopCapture;
 document.getElementById('tagEventBtn').onclick = tagEvent;
 document.getElementById('reportsBtn').onclick = () => document.getElementById('reportHooks').scrollIntoView({behavior:'smooth'});
-document.getElementById('quickRpmBtn').onclick = () => quickRead('rpm');
-document.getElementById('quickCoolantBtn').onclick = () => quickRead('coolant_temp');
+document.getElementById('quickRpmBtn').onclick = () => sendPhoneLiveRead('rpm');
+document.getElementById('quickCoolantBtn').onclick = () => sendPhoneLiveRead('coolant_temp');
 document.getElementById('savePresetBtn').onclick = savePreset;
 document.getElementById('loadPresetBtn').onclick = loadPreset;
 setInterval(fetchState, 1500);

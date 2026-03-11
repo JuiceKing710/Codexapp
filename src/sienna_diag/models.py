@@ -7,6 +7,9 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 
+SourceMode = Literal["MOCK", "PHONE-LIVE", "LOCAL-HARDWARE"]
+
+
 class Session(BaseModel):
     session_id: str = Field(default_factory=lambda: str(uuid4()))
     vehicle_id: str = "toyota_sienna_2006"
@@ -54,7 +57,28 @@ class ReadHistoryItem(BaseModel):
     vehicle: str
     command: str
     raw_response: str
+    source_mode: SourceMode = "MOCK"
+    pid_key: str | None = None
+    value: float | str | None = None
+    unit: str | None = None
+    raw_command: str | None = None
     ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class PhoneLiveReadPayload(BaseModel):
+    session_id: str | None = None
+    vehicle_id: str | None = None
+    command: str
+    raw_response: str
+    pid_key: str
+    value: float | str | None = None
+    unit: str | None = None
+    source_mode: SourceMode = "PHONE-LIVE"
+    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    source_hint: Literal["iso9141_2", "can_capture"] = "iso9141_2"
+    latency_ms: int | None = None
+    backend_status: str | None = None
+    error: str | None = None
 
 
 class CaptureStartRequest(BaseModel):
