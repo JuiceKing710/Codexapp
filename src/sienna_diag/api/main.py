@@ -64,6 +64,8 @@ SAFE_QUICK_READS = {
 
 
 LIVE_POLLING_SUPPORTED_PIDS = ["010C", "0105", "012F", "0142", "010F", "010D", "0111"]
+PHONE_LIVE_SOURCE_MODES = {"PHONE-LIVE", "BROWSER-DEV"}
+DEFAULT_LIVE_GAUGE_PIDS = ["010C", "0105", "0142", "010D"]
 
 PHONE_LIVE_PID_LABELS = {
     "010C": {"pid_key": "rpm", "unit": "rpm"},
@@ -80,30 +82,40 @@ PHONE_LIVE_PID_LABELS = {
     "07": {"pid_key": "dtc_pending", "unit": None},
 }
 
-phone_bridge_state = {
-    "status": "disconnected",
-    "adapter_name": "OBDLink MX+",
-    "platform": "unknown",
-    "permission_state": "unknown",
-    "source_mode": "PHONE-LIVE",
-    "supports_native_bluetooth": True,
-    "fallback_reason": None,
-    "last_error": None,
-    "last_command": None,
-    "last_response": None,
-    "last_latency_ms": None,
-    "backend_status": "idle",
-    "last_vin_command": None,
-    "last_vin_response": None,
-    "vin_parse_status": "not-run",
-    "vin": None,
-    "updated_at": None,
-    "polling_state": "inactive",
-    "polling_interval_ms": 500,
-    "last_replayed_command": None,
-    "command_learning_status": "idle",
-    "passive_can_capture_status": "not-available",
-}
+
+def _new_phone_bridge_state() -> dict:
+    return {
+        "status": "disconnected",
+        "adapter_name": "OBDLink MX+",
+        "platform": "unknown",
+        "permission_state": "unknown",
+        "source_mode": "PHONE-LIVE",
+        "supports_native_bluetooth": True,
+        "fallback_reason": None,
+        "last_error": None,
+        "last_command": None,
+        "last_response": None,
+        "last_latency_ms": None,
+        "backend_status": "idle",
+        "last_backend_acceptance_status": "idle",
+        "last_ingest_status": "idle",
+        "last_ingest_error": None,
+        "last_vin_command": None,
+        "last_vin_response": None,
+        "vin_parse_status": "not-run",
+        "vin": None,
+        "updated_at": None,
+        "polling_state": "inactive",
+        "polling_interval_ms": 500,
+        "configured_gauge_pids": DEFAULT_LIVE_GAUGE_PIDS.copy(),
+        "live_monitoring_state": "inactive",
+        "last_replayed_command": None,
+        "command_learning_status": "idle",
+        "passive_can_capture_status": "not-available",
+    }
+
+
+phone_bridge_state = _new_phone_bridge_state()
 
 SAFE_EVENT_TAGS = [
     "engine start",
@@ -229,6 +241,107 @@ def _touch_phone_bridge(status: str | None = None, error: str | None = None) -> 
         phone_bridge_state["status"] = status
     phone_bridge_state["last_error"] = error
     phone_bridge_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _mark_ingest_failure(status: str, error: str) -> None:
+    phone_bridge_state["last_ingest_status"] = status
+    phone_bridge_state["last_ingest_error"] = error
+    phone_bridge_state["last_backend_acceptance_status"] = "rejected"
+    phone_bridge_state["backend_status"] = "rejected"
+    _touch_phone_bridge(error=error)
+
+
+def _latest_phone_live_read(reads: list[dict]) -> dict | None:
+    for item in reversed(reads):
+        if item.get("source_mode") in PHONE_LIVE_SOURCE_MODES:
+            return item
+    return None
+
+
+def _mock_mode_reason() -> str:
+    return "Mock mode is active only because phone-live and local hardware are both disabled."
+
+
+def _derive_current_mode(reads: list[dict]) -> tuple[str, str | None]:
+    latest_live = _latest_phone_live_read(reads)
+    if latest_live:
+        return str(latest_live["source_mode"]), "Derived from the latest accepted phone-live read."
+    if phone_bridge_state.get("status") == "connected":
+        return "CONNECTED_WAITING_LIVE_READ", "Bluetooth is connected and polling has started, but the first live PID read has not been accepted yet."
+    requested_mode = phone_bridge_state.get("source_mode")
+    if requested_mode in PHONE_LIVE_SOURCE_MODES:
+        return str(requested_mode), f"Phone-live transport is selected while Bluetooth is {phone_bridge_state.get('status', 'disconnected')}."
+    adapter_mode = adapter.mode_status()
+    if adapter_mode == "MOCK":
+        return "MOCK", _mock_mode_reason()
+    return adapter_mode, None
+
+
+def _timeline_event_exists(session_id: str, event_type: str) -> bool:
+    return any(item.event_type == event_type for item in store.get_timeline_events(session_id))
+
+
+def _build_phone_bridge_snapshot(active: dict | None = None, reads: list[dict] | None = None) -> dict:
+    resolved_active = active
+    if resolved_active is None and store.active_session_id:
+        resolved_active = store.get_session(store.active_session_id).model_dump()
+
+    resolved_reads = reads
+    if resolved_reads is None:
+        resolved_reads = [item.model_dump() for item in store.get_reads(resolved_active["session_id"])] if resolved_active else []
+
+    latest_live_read = _latest_phone_live_read(resolved_reads)
+    current_mode, current_mode_reason = _derive_current_mode(resolved_reads)
+    polling_state = phone_bridge_state.get("polling_state") or "inactive"
+    polling_active = phone_bridge_state.get("status") == "connected" and polling_state in {"starting", "active"}
+    ai_monitoring_active = (
+        phone_bridge_state.get("status") == "connected"
+        and phone_bridge_state.get("live_monitoring_state") == "active"
+        and latest_live_read is not None
+    )
+
+    snapshot = dict(phone_bridge_state)
+    snapshot.update({
+        "bluetooth_connected": phone_bridge_state.get("status") == "connected",
+        "polling_active": polling_active,
+        "first_live_read_received": latest_live_read is not None,
+        "current_mode": current_mode,
+        "current_mode_reason": current_mode_reason,
+        "current_source_mode": latest_live_read.get("source_mode") if latest_live_read else phone_bridge_state.get("source_mode"),
+        "last_live_pid_command": phone_bridge_state.get("last_command"),
+        "last_live_pid_response": phone_bridge_state.get("last_response"),
+        "backend_acceptance_status": phone_bridge_state.get("last_backend_acceptance_status"),
+        "mock_reason": _mock_mode_reason() if current_mode == "MOCK" else None,
+        "last_successful_live_read": latest_live_read,
+        "ai_monitoring_active": ai_monitoring_active,
+    })
+    return snapshot
+
+
+def _build_ai_monitoring_snapshot(bridge_snapshot: dict, alerts: list[dict]) -> dict:
+    if bridge_snapshot.get("ai_monitoring_active"):
+        if alerts:
+            return {
+                "active": True,
+                "status": "alerts_active",
+                "message": f"{len(alerts)} proactive alert(s) active.",
+            }
+        return {
+            "active": True,
+            "status": "active_no_alerts",
+            "message": "Live monitoring active, no alerts detected",
+        }
+    if bridge_snapshot.get("status") == "connected" and not bridge_snapshot.get("first_live_read_received"):
+        return {
+            "active": False,
+            "status": "waiting_for_first_live_read",
+            "message": "Waiting for first live PID read.",
+        }
+    return {
+        "active": False,
+        "status": "waiting",
+        "message": "Waiting for live monitoring.",
+    }
 
 
 def _decode_mode09_vin(raw_response: str) -> str | None:
@@ -391,14 +504,16 @@ def stop_capture() -> dict:
 
 @app.get("/health")
 def health() -> dict:
+    bridge_snapshot = _build_phone_bridge_snapshot()
     return {
         "ok": True,
         "app_id": settings.app_id,
         "display_name": settings.app_display_name,
         "mode": "read-only",
         "adapter_mode": adapter.mode_status(),
+        "current_mode": bridge_snapshot["current_mode"],
         "connection_status": adapter.connection_status(),
-        "phone_bridge": phone_bridge_state,
+        "phone_bridge": bridge_snapshot,
     }
 
 
@@ -532,11 +647,18 @@ def capture_tag(payload: CaptureTagRequest) -> dict:
 
 @app.get("/phone/bridge/state")
 def phone_bridge_state_get() -> dict:
-    return phone_bridge_state
+    return _build_phone_bridge_snapshot()
 
 
 @app.post("/phone/bridge/connect")
 def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
+    previous_status = phone_bridge_state.get("status")
+    previous_polling_state = phone_bridge_state.get("polling_state")
+    reads: list[dict] = []
+    if store.active_session_id:
+        reads = [item.model_dump() for item in store.get_reads(store.active_session_id)]
+    has_live_read = _latest_phone_live_read(reads) is not None
+
     _touch_phone_bridge(status=payload.status, error=None)
     phone_bridge_state["platform"] = payload.platform
     phone_bridge_state["adapter_name"] = payload.adapter_name
@@ -544,24 +666,39 @@ def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
     phone_bridge_state["source_mode"] = payload.source_mode
     phone_bridge_state["supports_native_bluetooth"] = payload.supports_native_bluetooth
     phone_bridge_state["fallback_reason"] = payload.fallback_reason
-    phone_bridge_state["backend_status"] = "phone-managed"
-    phone_bridge_state["polling_state"] = "active" if payload.status == "connected" else "inactive"
+    phone_bridge_state["backend_status"] = "awaiting-live-read" if payload.status == "connected" and not has_live_read else "phone-managed"
+    phone_bridge_state["polling_state"] = "starting" if payload.status == "connected" else "inactive"
+    phone_bridge_state["last_backend_acceptance_status"] = "pending" if payload.status == "connected" and not has_live_read else phone_bridge_state.get("last_backend_acceptance_status")
+    phone_bridge_state["last_ingest_status"] = "idle" if payload.status == "connected" else phone_bridge_state.get("last_ingest_status")
+    phone_bridge_state["last_ingest_error"] = None if payload.status == "connected" else phone_bridge_state.get("last_ingest_error")
+    phone_bridge_state["live_monitoring_state"] = "active" if payload.status == "connected" and has_live_read else ("waiting_for_first_live_read" if payload.status == "connected" else "inactive")
     phone_bridge_state["command_learning_status"] = "active" if payload.status == "connected" else "idle"
     if store.active_session_id and payload.status == "connected":
-        store.add_timeline_event(DiagnosticTimelineEvent(
-            session_id=store.active_session_id,
-            event_type="vehicle_connected",
-            title="Vehicle connected",
-            detail=f"{payload.adapter_name} connected through hybrid mobile app.",
-        ))
-    return phone_bridge_state
+        if previous_status != "connected":
+            store.add_timeline_event(DiagnosticTimelineEvent(
+                session_id=store.active_session_id,
+                event_type="vehicle_connected",
+                title="Vehicle connected",
+                detail=f"{payload.adapter_name} connected through hybrid mobile app.",
+            ))
+        if previous_polling_state == "inactive":
+            store.add_timeline_event(DiagnosticTimelineEvent(
+                session_id=store.active_session_id,
+                event_type="polling_started",
+                title="Polling started",
+                detail=f"Phone-live polling armed for {len(phone_bridge_state['configured_gauge_pids'])} gauges at {phone_bridge_state['polling_interval_ms']} ms.",
+                metadata={"polling_interval_ms": phone_bridge_state["polling_interval_ms"], "gauge_pids": phone_bridge_state["configured_gauge_pids"]},
+            ))
+    return _build_phone_bridge_snapshot()
 
 
 @app.post("/phone/bridge/disconnect")
 def phone_bridge_disconnect() -> dict:
     _touch_phone_bridge(status="disconnected", error=None)
-    phone_bridge_state["backend_status"] = "phone-managed"
+    phone_bridge_state["backend_status"] = "disconnected"
     phone_bridge_state["polling_state"] = "inactive"
+    phone_bridge_state["live_monitoring_state"] = "inactive"
+    phone_bridge_state["command_learning_status"] = "idle"
     if store.active_session_id:
         store.add_timeline_event(DiagnosticTimelineEvent(
             session_id=store.active_session_id,
@@ -569,22 +706,31 @@ def phone_bridge_disconnect() -> dict:
             title="Vehicle disconnected",
             detail="Phone-managed Bluetooth disconnected.",
         ))
-    return phone_bridge_state
+    return _build_phone_bridge_snapshot()
 
 
 @app.post("/phone/bridge/read")
 def phone_bridge_read(payload: PhoneLiveReadPayload) -> dict:
-    if payload.source_mode not in {"PHONE-LIVE", "BROWSER-DEV"}:
-        raise HTTPException(status_code=400, detail="Phone bridge reads must be labeled PHONE-LIVE or BROWSER-DEV")
+    if payload.source_mode not in PHONE_LIVE_SOURCE_MODES:
+        detail = "Phone bridge reads must be labeled PHONE-LIVE or BROWSER-DEV"
+        _mark_ingest_failure("invalid-source-mode", detail)
+        raise HTTPException(status_code=400, detail=detail)
 
     try:
         session = _resolve_session_for_phone(payload)
     except KeyError:
-        raise HTTPException(status_code=404, detail="Session not found")
+        detail = "Session not found"
+        _mark_ingest_failure("session-missing", detail)
+        raise HTTPException(status_code=404, detail=detail)
+
+    prior_reads = [item.model_dump() for item in store.get_reads(session.session_id)]
+    had_live_read = _latest_phone_live_read(prior_reads) is not None
 
     pid_meta = PHONE_LIVE_PID_LABELS.get(payload.command.upper())
     if pid_meta is None:
-        raise HTTPException(status_code=400, detail="Unsupported PID for phone-live endpoint")
+        detail = "Unsupported PID for phone-live endpoint"
+        _mark_ingest_failure("unsupported-pid", detail)
+        raise HTTPException(status_code=400, detail=detail)
 
     mode_label = "PHONE-LIVE" if payload.source_mode == "PHONE-LIVE" else "BROWSER-DEV"
 
@@ -608,7 +754,13 @@ def phone_bridge_read(payload: PhoneLiveReadPayload) -> dict:
     phone_bridge_state["last_command"] = payload.command.upper()
     phone_bridge_state["last_response"] = payload.raw_response
     phone_bridge_state["last_latency_ms"] = payload.latency_ms
-    phone_bridge_state["backend_status"] = payload.backend_status or "received"
+    phone_bridge_state["source_mode"] = mode_label
+    phone_bridge_state["backend_status"] = payload.backend_status or "accepted"
+    phone_bridge_state["last_backend_acceptance_status"] = "accepted"
+    phone_bridge_state["last_ingest_status"] = "accepted"
+    phone_bridge_state["last_ingest_error"] = payload.error
+    phone_bridge_state["polling_state"] = "active" if payload.polling else phone_bridge_state.get("polling_state", "inactive")
+    phone_bridge_state["live_monitoring_state"] = "active"
     if payload.command.upper() == "0902":
         phone_bridge_state["last_vin_command"] = payload.command.upper()
         phone_bridge_state["last_vin_response"] = payload.raw_response
@@ -634,6 +786,21 @@ def phone_bridge_read(payload: PhoneLiveReadPayload) -> dict:
                 detail="VIN parse failed; manual vehicle selection required.",
             ))
     _touch_phone_bridge(status="connected", error=payload.error)
+    if not had_live_read:
+        store.add_timeline_event(DiagnosticTimelineEvent(
+            session_id=session.session_id,
+            event_type="first_live_read_received",
+            title="First live read received",
+            detail=f"{payload.command.upper()} was accepted from the phone-live bridge and attached to the active vehicle check.",
+            metadata={"pid": payload.command.upper(), "polling": payload.polling},
+        ))
+        if not _timeline_event_exists(session.session_id, "live_monitoring_active"):
+            store.add_timeline_event(DiagnosticTimelineEvent(
+                session_id=session.session_id,
+                event_type="live_monitoring_active",
+                title="Live monitoring active",
+                detail="AI live monitoring activated after the first successful phone-live read.",
+            ))
     _record_learning(
         session_id=session.session_id,
         vehicle_id=session.vehicle_id,
@@ -647,12 +814,30 @@ def phone_bridge_read(payload: PhoneLiveReadPayload) -> dict:
         notes="polling" if payload.polling else "manual",
     )
 
+    current_reads = [item.model_dump() for item in store.get_reads(session.session_id)]
+    current_events = [item.model_dump() for item in store.get_events(session.session_id)]
+    bridge_snapshot = _build_phone_bridge_snapshot(active=session.model_dump(), reads=current_reads)
+    context = _build_ai_context(
+        active=session.model_dump(),
+        reads=current_reads,
+        events=current_events,
+        memory=store.get_vehicle_memory(session.vehicle_id),
+        bridge_snapshot=bridge_snapshot,
+    )
+    proactive_alerts = _run_proactive_monitoring(session.session_id, session.vehicle_id, context)
+
     return {
         "status": "accepted",
         "session_id": session.session_id,
         "vehicle_id": session.vehicle_id,
         "mode": mode_label,
         "read": history_item.model_dump(),
+        "backend_acceptance_status": phone_bridge_state["last_backend_acceptance_status"],
+        "current_mode": bridge_snapshot["current_mode"],
+        "first_live_read_received": bridge_snapshot["first_live_read_received"],
+        "live_monitoring_active": bridge_snapshot["ai_monitoring_active"],
+        "ai_alerts_generated": proactive_alerts,
+        "bridge_state": bridge_snapshot,
     }
 
 
@@ -825,7 +1010,14 @@ def _compute_vehicle_health_score(reads: list[dict], alerts: list[dict]) -> dict
     return {"score": score, "status": status, "factors": factors}
 
 
-def _vehicle_intelligence_core_snapshot(active: dict | None, reads: list[dict], events: list[dict], alerts: list[dict]) -> dict:
+def _vehicle_intelligence_core_snapshot(
+    active: dict | None,
+    reads: list[dict],
+    events: list[dict],
+    alerts: list[dict],
+    bridge_snapshot: dict,
+    ai_monitoring: dict,
+) -> dict:
     latest = _latest_values(reads, ["rpm", "coolant_temp", "fuel_level", "control_module_voltage", "vehicle_speed", "throttle_position", "intake_air_temp"])
     dtc_stored = [r for r in reads if r.get("command") == "03" or r.get("pid_key") == "dtc_stored"][-10:]
     dtc_pending = [r for r in reads if r.get("command") == "07" or r.get("pid_key") == "dtc_pending"][-10:]
@@ -843,7 +1035,15 @@ def _vehicle_intelligence_core_snapshot(active: dict | None, reads: list[dict], 
             "polling_interval_ms": 500,
             "current_values": latest,
             "rolling_sensor_history": reads[-120:],
-            "reconnect_state": phone_bridge_state.get("status"),
+            "reconnect_state": bridge_snapshot.get("status"),
+            "current_mode": bridge_snapshot.get("current_mode"),
+            "polling_state": bridge_snapshot.get("polling_state"),
+            "polling_active": bridge_snapshot.get("polling_active"),
+            "first_live_read_received": bridge_snapshot.get("first_live_read_received"),
+            "last_live_pid_command": bridge_snapshot.get("last_live_pid_command"),
+            "last_live_pid_response": bridge_snapshot.get("last_live_pid_response"),
+            "backend_acceptance_status": bridge_snapshot.get("backend_acceptance_status"),
+            "ai_monitoring": ai_monitoring,
         },
         "diagnostic_state_engine": {
             "stored_dtcs": dtc_stored,
@@ -925,7 +1125,9 @@ def dashboard_state() -> dict:
 
     learning_records = [item.model_dump() for item in store.get_learning_records(active["session_id"])] if active else []
     alerts = [item.model_dump() for item in store.get_ai_alerts(active["session_id"])] if active else []
-    core_snapshot = _vehicle_intelligence_core_snapshot(active, reads, events, alerts)
+    bridge_snapshot = _build_phone_bridge_snapshot(active=active, reads=reads)
+    ai_monitoring = _build_ai_monitoring_snapshot(bridge_snapshot, alerts)
+    core_snapshot = _vehicle_intelligence_core_snapshot(active, reads, events, alerts, bridge_snapshot, ai_monitoring)
 
     return {
         "app_id": settings.app_id,
@@ -933,8 +1135,10 @@ def dashboard_state() -> dict:
         "vehicles": [item.model_dump() for item in store.list_vehicles()],
         "active_session": active,
         "adapter_mode": adapter.mode_status(),
+        "current_mode": bridge_snapshot["current_mode"],
+        "current_mode_reason": bridge_snapshot["current_mode_reason"],
         "connection_status": adapter.connection_status(),
-        "phone_bridge": phone_bridge_state,
+        "phone_bridge": bridge_snapshot,
         "capture_status": capture_status,
         "capture_preset": capture_preset,
         "capture_presets": CAPTURE_PRESETS,
@@ -949,6 +1153,7 @@ def dashboard_state() -> dict:
         "learning_library": store.command_library,
         "vehicle_image": _resolve_vehicle_image(active.get("vehicle_id") if active else None),
         "ai_alerts": alerts,
+        "ai_monitoring": ai_monitoring,
         "vehicle_visualization": {"component_groups": VEHICLE_COMPONENT_GROUPS, "highlight": vehicle_visualization_state},
         "ai_alerts": [item.model_dump() for item in store.get_ai_alerts(active["session_id"])] if active else [],
         "diagnostic_timeline": [item.model_dump() for item in store.get_timeline_events(active["session_id"])] if active else [],
@@ -1001,7 +1206,7 @@ def _latest_values(reads: list[dict], keys: list[str]) -> dict:
     return result
 
 
-def _build_ai_context(active: dict | None, reads: list[dict], events: list[dict], memory: dict) -> dict:
+def _build_ai_context(active: dict | None, reads: list[dict], events: list[dict], memory: dict, bridge_snapshot: dict) -> dict:
     live_keys = ["rpm", "coolant_temp", "fuel_level", "control_module_voltage", "vehicle_speed", "throttle_position", "intake_air_temp"]
     latest_values = _latest_values(reads, live_keys)
     recent_live = [
@@ -1019,7 +1224,7 @@ def _build_ai_context(active: dict | None, reads: list[dict], events: list[dict]
         "vehicle_id": active.get("vehicle_id") if active else "toyota_sienna_2006",
         "vin": active.get("vin") if active else None,
         "vehicle_assignment_source": active.get("assignment_source") if active else "manual",
-        "current_mode": phone_bridge_state.get("source_mode"),
+        "current_mode": bridge_snapshot.get("current_mode"),
         "active_vehicle_check": active.get("session_id") if active else None,
         "stored_dtcs": dtc_stored,
         "pending_dtcs": dtc_pending,
@@ -1070,6 +1275,10 @@ def _resolve_visualization_request(payload: AIMechanicQuestionRequest) -> dict |
 def _run_proactive_monitoring(session_id: str, vehicle_id: str, context: dict) -> list[dict]:
     alerts: list[AIAlertRecord] = []
     gauge = context.get("current_4_gauge_values", {})
+    existing_alert_keys = {
+        (item.title, item.trigger_reason)
+        for item in store.get_ai_alerts(session_id)
+    }
 
     coolant = gauge.get("coolant_temp", {}).get("value")
     rpm = gauge.get("rpm", {}).get("value")
@@ -1113,7 +1322,12 @@ def _run_proactive_monitoring(session_id: str, vehicle_id: str, context: dict) -
             related_sensors=["control_module_voltage"],
         ))
 
+    new_alerts: list[dict] = []
     for alert in alerts:
+        alert_key = (alert.title, alert.trigger_reason)
+        if alert_key in existing_alert_keys:
+            continue
+        existing_alert_keys.add(alert_key)
         store.add_ai_alert(alert)
         timeline_event = store.add_timeline_event(DiagnosticTimelineEvent(
             session_id=session_id,
@@ -1127,7 +1341,8 @@ def _run_proactive_monitoring(session_id: str, vehicle_id: str, context: dict) -
             metadata={"confidence": alert.confidence, "proactive": True},
         ))
         _ = timeline_event
-    return [a.model_dump() for a in alerts]
+        new_alerts.append(alert.model_dump())
+    return new_alerts
 
 
 @app.post("/ai/guided-diagnosis/run")
@@ -1241,7 +1456,8 @@ def ai_mechanic(payload: AIMechanicQuestionRequest) -> dict:
     if memory_updates:
         memory = store.update_vehicle_memory(vehicle_id, memory_updates)
 
-    context = _build_ai_context(active=active, reads=reads, events=events, memory=memory)
+    bridge_snapshot = _build_phone_bridge_snapshot(active=active, reads=reads)
+    context = _build_ai_context(active=active, reads=reads, events=events, memory=memory, bridge_snapshot=bridge_snapshot)
     proactive_alerts = _run_proactive_monitoring(active["session_id"], vehicle_id, context)
 
     response_basis = "live_data" if context.get("recent_live_sensor_readings") else ("stored_history" if memory.get("prior_vehicle_checks") else "general_knowledge")
@@ -1384,6 +1600,7 @@ def dashboard() -> str:
       <h2 class="title">OBDLINK BLUETOOTH</h2>
       <div class="status-value" id="btStatusText">Disconnected</div>
       <div class="tiny" id="btError">None</div>
+      <div class="tiny" id="btDebug" style="margin-top:8px;display:grid;gap:4px"></div>
     </div>
 
     <div class="card">
@@ -1417,6 +1634,10 @@ let selectedVehicleId = 'toyota_sienna_2006';
 let phoneBridge = { status: 'disconnected', source_mode: 'PHONE-LIVE' };
 let vehicleRenderer = null;
 let selectedMesh = null;
+let livePollingHandle = null;
+let livePollingInFlight = false;
+const SENSOR_TO_PID = { rpm:'010C', coolant_temp:'0105', control_module_voltage:'0142', vehicle_speed:'010D' };
+const LIVE_SENSOR_ORDER = ['rpm', 'coolant_temp', 'control_module_voltage', 'vehicle_speed'];
 
 function card(label, value){ return `<div class="card status-card"><div class="status-label">${label}</div><div class="status-value">${value || '-'}</div></div>`; }
 function webglAvailable(){ try { const c=document.createElement('canvas'); return !!window.WebGLRenderingContext && !!(c.getContext('webgl') || c.getContext('experimental-webgl')); } catch { return false; } }
@@ -1472,22 +1693,26 @@ async function fetchState(){
   const res = await fetch('/dashboard/state');
   state = await res.json();
   phoneBridge = { ...phoneBridge, ...state.phone_bridge };
-  renderStatusCards(); renderVehicles(); renderBluetoothCard(); renderAiAlerts(); renderTimeline();
+  renderStatusCards(); renderVehicles(); renderBluetoothCard(); renderAiAlerts(); renderTimeline(); syncLivePolling();
   if(vehicleRenderer && state.vehicle_visualization?.highlight){ const h=state.vehicle_visualization.highlight; vehicleRenderer.applyHighlight(h.action,h.component,h.system); }
 }
-function renderStatusCards(){ const active = state.active_session; document.getElementById('statusCards').innerHTML = [card('Current mode', state.adapter_mode || 'MOCK'),card('Bluetooth state', phoneBridge.status || 'disconnected'),card('Active vehicle', active ? active.vehicle : selectedVehicleId),card('Active Vehicle Check', active ? active.session_id : 'None'),card('AI Alerts', (state.ai_alerts||[]).length ? `${state.ai_alerts.length} active` : 'None')].join(''); }
+function renderStatusCards(){ const active = state.active_session; document.getElementById('statusCards').innerHTML = [card('Current mode', state.current_mode || state.adapter_mode || 'MOCK'),card('Bluetooth state', phoneBridge.status || 'disconnected'),card('Active vehicle', active ? active.vehicle : selectedVehicleId),card('Active Vehicle Check', active ? active.session_id : 'None'),card('AI Alerts', (state.ai_alerts||[]).length ? `${state.ai_alerts.length} active` : 'None')].join(''); }
 function renderVehicles(){ const select = document.getElementById('vehicleSelect'); select.innerHTML=''; state.vehicles.forEach(v => { const opt=document.createElement('option'); opt.value=v.vehicle_id; opt.textContent=`${v.label} (${v.protocol_hint})`; if (v.vehicle_id===selectedVehicleId) opt.selected=true; select.appendChild(opt); }); select.onchange=async (e)=>{ selectedVehicleId=e.target.value; await updateVehicleImage(); }; updateVehicleImage(); }
 async function updateVehicleImage(){ const res = await fetch(`/vehicle-image/current?manual_vehicle_id=${encodeURIComponent(selectedVehicleId)}`); const image = await res.json(); const trim = image.trim ? ` ${image.trim}` : ''; const label = `${image.year || ''} ${image.make} ${image.model}${trim}`.replace(/\s+/g,' ').trim(); document.getElementById('vehicleImageLabel').textContent = label || 'Generic vehicle'; const sourceMap = {auto_vin: 'Auto VIN detection result',manual_selection: 'Manual vehicle selection fallback',active_session_vehicle: 'Active session vehicle fallback',closest_supported: 'Closest supported vehicle image fallback',generic_placeholder: 'Generic placeholder image'}; const img = document.getElementById('vehicleImageAsset'); img.src = image.image_asset_path || image.fallback_image_asset_path; img.onerror = () => { img.src = image.fallback_image_asset_path; }; if(!vehicleRenderer){ buildGenericVehicleViewer(); } if(!vehicleRenderer){ showFallbackImage((sourceMap[image.resolved_from] || image.resolved_from)+' — WebGL fallback image'); } else { document.getElementById('vehicleImageSource').textContent='3D view active · tap a component to inspect'; } }
-function renderBluetoothCard(){ const status = phoneBridge.status || 'disconnected'; document.getElementById('btStatusText').textContent = status.charAt(0).toUpperCase() + status.slice(1); document.getElementById('btError').textContent = phoneBridge.last_error || 'No Bluetooth errors'; }
-function renderAiAlerts(){ const alerts=state.ai_alerts||[]; document.getElementById('aiAlertSummary').textContent=alerts.length?`${alerts.length} proactive alert(s) linked to this vehicle check.`:'No active alerts.'; document.getElementById('aiAlertList').innerHTML=alerts.slice(-5).reverse().map(a=>`<div><b>${a.title}</b> (${a.confidence}) — ${a.explanation}. Next: ${a.suggested_next_step}</div>`).join('') || '<div>Waiting for live monitoring.</div>'; }
+function renderBluetoothCard(){ const status = phoneBridge.status || 'disconnected'; document.getElementById('btStatusText').textContent = status.charAt(0).toUpperCase() + status.slice(1); document.getElementById('btError').textContent = phoneBridge.last_error || 'No Bluetooth errors'; const debugLines = [`Bluetooth connected: ${phoneBridge.bluetooth_connected ? 'true' : 'false'}`,`Polling active: ${phoneBridge.polling_active ? 'true' : 'false'} (${phoneBridge.polling_state || 'inactive'})`,`First live read received: ${phoneBridge.first_live_read_received ? 'true' : 'false'}`,`Current source_mode: ${phoneBridge.current_source_mode || phoneBridge.source_mode || 'unknown'}`,`Last live PID command: ${phoneBridge.last_live_pid_command || 'None'}`,`Last live PID response: ${phoneBridge.last_live_pid_response || 'None'}`,`Last ingest status: ${phoneBridge.last_ingest_status || 'idle'}`,`Backend acceptance: ${phoneBridge.backend_acceptance_status || 'idle'}`,`Last ingest error: ${phoneBridge.last_ingest_error || 'None'}`]; if((state.current_mode || phoneBridge.current_mode) === 'MOCK'){ debugLines.push(`MOCK reason: ${phoneBridge.mock_reason || state.current_mode_reason || 'Unknown'}`); } document.getElementById('btDebug').innerHTML = debugLines.map(line => `<div>${line}</div>`).join(''); }
+function renderAiAlerts(){ const alerts=state.ai_alerts||[]; const monitoring=state.ai_monitoring||{active:false,message:'Waiting for live monitoring.'}; document.getElementById('aiAlertSummary').textContent=alerts.length?`${alerts.length} proactive alert(s) linked to this vehicle check.`:(monitoring.active?'Live monitoring active.':'No active alerts.'); document.getElementById('aiAlertList').innerHTML=alerts.slice(-5).reverse().map(a=>`<div><b>${a.title}</b> (${a.confidence}) — ${a.explanation}. Next: ${a.suggested_next_step}</div>`).join('') || `<div>${monitoring.message}</div>`; }
 function renderTimeline(){ const timeline=state.diagnostic_timeline||[]; document.getElementById('timelineList').innerHTML=timeline.slice(-8).reverse().map(t=>`<div>${new Date(t.ts).toLocaleTimeString()} — ${t.title}${t.linked_ai_response_id?` <a href="/dashboard/ai" style="color:#0f766e">AI explanation</a>`:''}</div>`).join('') || '<div>No timeline events yet.</div>'; }
 async function ensureSession(){ if (state && state.active_session) return state.active_session; await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})}); await fetchState(); return state.active_session; }
 async function createSession(){ await ensureSession(); }
-async function stopSession(){ await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
+async function pollLiveSensorsOnce(){ if(livePollingInFlight){return;} if((phoneBridge.status||'disconnected')!=='connected'){stopLivePolling();return;} const active=await ensureSession(); livePollingInFlight=true; try { const jobs=LIVE_SENSOR_ORDER.map(sensor=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,command:SENSOR_TO_PID[sensor],pid_key:sensor,source_mode:'PHONE-LIVE',source_hint:'iso9141_2',polling:true,raw_response:'PHONE-NATIVE'})})); await Promise.allSettled(jobs); } finally { livePollingInFlight=false; await fetchState(); } }
+function startLivePolling(){ if(livePollingHandle){return;} pollLiveSensorsOnce(); livePollingHandle=setInterval(()=>{pollLiveSensorsOnce();},500); }
+function stopLivePolling(){ if(livePollingHandle){ clearInterval(livePollingHandle); livePollingHandle=null; } }
+function syncLivePolling(){ if((phoneBridge.status||'disconnected')==='connected' && state?.active_session && (phoneBridge.polling_state||'inactive')!=='inactive'){ startLivePolling(); return; } stopLivePolling(); }
+async function stopSession(){ stopLivePolling(); await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
 async function startCapture(){ await ensureSession(); await fetch('/capture/start',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId,preset:'cold_start_capture'})}); await fetchState(); }
 async function stopCapture(){ await fetch('/capture/stop',{method:'POST'}); await fetchState(); }
 async function tagEvent(){ if (!state.active_session) { alert('Vehicle Check missing: start Vehicle Check first.'); return; } await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:'idle'})}); await fetchState(); }
-async function connectVehicle(){ await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ platform:'unknown', adapter_name:'OBDLink MX+', status:'connected', source_mode:'PHONE-LIVE', supports_native_bluetooth:true }) }); await fetchState(); }
+async function connectVehicle(){ await ensureSession(); await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ platform:'unknown', adapter_name:'OBDLink MX+', status:'connected', source_mode:'PHONE-LIVE', supports_native_bluetooth:true }) }); await fetchState(); startLivePolling(); }
 async function syncHighlight(action,component,system,source='user'){ await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,component,system,source})}); }
 async function explainSelected(){ const comp=document.getElementById('componentExplainBtn').dataset.component; if(!comp){return;} const res=await fetch(`/vehicle-visualization/explain?component=${encodeURIComponent(comp)}`); const data=await res.json(); alert(`${data.component.replace(/_/g,' ')}: ${data.explanation}`); }
 function openAiWithPrompt(prompt){ window.location.href = `/dashboard/ai?prompt=${encodeURIComponent(prompt || '')}`; }
@@ -1520,18 +1745,19 @@ body{margin:0;font-family:Segoe UI,system-ui,sans-serif;background:#edf2f7;color
 <div class="card"><div class="grid2"><button id="startPollingBtn">Start Live Polling</button><button id="stopPollingBtn" class="secondary">Stop Live Polling</button></div><button id="backBtn" class="secondary" style="margin-top:8px;">Back to Main Dashboard</button></div>
 </div>
 <script>
-let state=null; let pollingHandle=null; let phoneBridge={status:'disconnected'};
+let state=null; let pollingHandle=null; let pollingInFlight=false; let phoneBridge={status:'disconnected'};
 const SENSOR_TO_PID={rpm:'010C',coolant_temp:'0105',control_module_voltage:'0142',intake_air_temp:'010F',vehicle_speed:'010D',throttle_position:'0111'};
 const GAUGE_SENSORS=['rpm','coolant_temp','control_module_voltage','vehicle_speed','throttle_position','intake_air_temp'];
 let gauges=[0,1,2,3].map(i=>({slot:i+1,sensor:GAUGE_SENSORS[i]||'rpm',label:`Gauge ${i+1}`,min:0,max:8000,unit:'',warn:4500,critical:6000}));
 function gaugeEditor(idx,g){return `<div class="gauge"><h4>${g.label}</h4><div class="grid2"><select data-field="sensor" data-idx="${idx}">${GAUGE_SENSORS.map(s=>`<option value="${s}" ${g.sensor===s?'selected':''}>${s}</option>`).join('')}</select><input data-field="label" data-idx="${idx}" value="${g.label}" placeholder="Label" /><input data-field="unit" data-idx="${idx}" value="${g.unit}" placeholder="Unit" /><input data-field="warn" data-idx="${idx}" type="number" value="${g.warn}" placeholder="Warn" /><input data-field="critical" data-idx="${idx}" type="number" value="${g.critical}" placeholder="Critical" /></div><div class="tiny" id="gaugeLive${idx}">Disconnected</div></div>`;}
 function renderGauges(){const grid=document.getElementById('gaugeGrid');grid.innerHTML=gauges.map((g,i)=>gaugeEditor(i,g)).join('');grid.querySelectorAll('input,select').forEach(el=>el.onchange=(e)=>{const i=Number(e.target.dataset.idx);const f=e.target.dataset.field;gauges[i][f]=e.target.type==='number'?Number(e.target.value):e.target.value;});const reads=(state&&state.recent_reads?state.recent_reads:[]).slice().reverse();gauges.forEach((g,i)=>{const found=reads.find(r=>r.pid_key===g.sensor||r.command===SENSOR_TO_PID[g.sensor]);document.getElementById(`gaugeLive${i}`).textContent=found?`${g.label}: ${found.value ?? found.raw_response} ${g.unit || found.unit || ''} [${found.source_mode}]`:`${g.label}: ${(phoneBridge.status==='connected')?'Waiting for 500ms polling':'Disconnected'}`;});}
-async function fetchState(){const res=await fetch('/dashboard/state');state=await res.json();phoneBridge={...phoneBridge,...state.phone_bridge};renderGauges();}
+async function fetchState(){const res=await fetch('/dashboard/state');state=await res.json();phoneBridge={...phoneBridge,...state.phone_bridge};renderGauges();syncGaugePolling();}
 
 function renderAiAlerts(){
   const alerts=state.ai_alerts||[];
-  document.getElementById('aiAlertSummary').textContent=alerts.length?`${alerts.length} proactive alert(s) linked to this vehicle check.`:'No active alerts.';
-  document.getElementById('aiAlertList').innerHTML=alerts.slice(-5).reverse().map(a=>`<div><b>${a.title}</b> (${a.confidence}) — ${a.explanation}. Next: ${a.suggested_next_step}</div>`).join('') || '<div>Waiting for live monitoring.</div>';
+  const monitoring=state.ai_monitoring||{active:false,message:'Waiting for live monitoring.'};
+  document.getElementById('aiAlertSummary').textContent=alerts.length?`${alerts.length} proactive alert(s) linked to this vehicle check.`:(monitoring.active?'Live monitoring active.':'No active alerts.');
+  document.getElementById('aiAlertList').innerHTML=alerts.slice(-5).reverse().map(a=>`<div><b>${a.title}</b> (${a.confidence}) — ${a.explanation}. Next: ${a.suggested_next_step}</div>`).join('') || `<div>${monitoring.message}</div>`;
 }
 function renderTimeline(){
   const timeline=state.diagnostic_timeline||[];
@@ -1539,8 +1765,9 @@ function renderTimeline(){
 }
 
 async function ensureSession(){if(state&&state.active_session)return state.active_session;await fetch('/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vehicle_id:'toyota_sienna_2006'})});await fetchState();return state.active_session;}
-async function pollAllGaugesOnce(){if((phoneBridge.status||'disconnected')!=='connected'){stopGaugePolling();return;}const active=await ensureSession();const jobs=gauges.map(g=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,command:SENSOR_TO_PID[g.sensor],pid_key:g.sensor,source_mode:'PHONE-LIVE',source_hint:'iso9141_2',polling:true,raw_response:'PHONE-NATIVE'})}));await Promise.allSettled(jobs);await fetchState();}
-function startGaugePolling(){if(pollingHandle)return;pollingHandle=setInterval(()=>{pollAllGaugesOnce();},500);} function stopGaugePolling(){if(pollingHandle){clearInterval(pollingHandle);pollingHandle=null;}}
+async function pollAllGaugesOnce(){if(pollingInFlight){return;}if((phoneBridge.status||'disconnected')!=='connected'){stopGaugePolling();return;}const active=await ensureSession();pollingInFlight=true;try{const jobs=gauges.map(g=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,command:SENSOR_TO_PID[g.sensor],pid_key:g.sensor,source_mode:'PHONE-LIVE',source_hint:'iso9141_2',polling:true,raw_response:'PHONE-NATIVE'})}));await Promise.allSettled(jobs);}finally{pollingInFlight=false;await fetchState();}}
+function startGaugePolling(){if(pollingHandle)return;pollAllGaugesOnce();pollingHandle=setInterval(()=>{pollAllGaugesOnce();},500);} function stopGaugePolling(){if(pollingHandle){clearInterval(pollingHandle);pollingHandle=null;}}
+function syncGaugePolling(){if((phoneBridge.status||'disconnected')==='connected'&&state?.active_session&&(phoneBridge.polling_state||'inactive')!=='inactive'){startGaugePolling();return;}stopGaugePolling();}
 function savePreset(){const name=document.getElementById('presetName').value||'Default';localStorage.setItem(`gaugePreset:${name}`,JSON.stringify(gauges));}
 function loadPreset(){const name=document.getElementById('presetName').value||'Default';const raw=localStorage.getItem(`gaugePreset:${name}`);if(raw){gauges=JSON.parse(raw);renderGauges();}}
 document.getElementById('startPollingBtn').onclick=startGaugePolling; document.getElementById('stopPollingBtn').onclick=stopGaugePolling; document.getElementById('savePresetBtn').onclick=savePreset; document.getElementById('loadPresetBtn').onclick=loadPreset; document.getElementById('backBtn').onclick=()=>window.location.href='/dashboard';
