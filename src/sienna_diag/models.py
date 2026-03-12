@@ -251,3 +251,15 @@ class AIMechanicQuestionRequest(BaseModel):
     question: str = ""
     memory_updates: dict[str, Any] = Field(default_factory=dict)
     source: Literal["user", "system"] = "user"
+
+
+class GuidedDiagnosisRunRequest(BaseModel):
+    session_id: str | None = None
+    symptom: str | None = None
+
+
+class GuidedDiagnosisResultSubmitRequest(BaseModel):
+    session_id: str
+    step_id: str
+    observed_result: str
+    notes: str | None = None

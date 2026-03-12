@@ -14,6 +14,8 @@ def _reset_state() -> None:
     store.ai_alerts_by_session.clear()
     store.ai_responses_by_session.clear()
     store.timeline_by_session.clear()
+    store.guided_diagnosis_plans_by_session.clear()
+    store.guided_diagnosis_results_by_session.clear()
     store.active_session_id = None
     store.last_ai_request = None
     store.last_ai_response_timestamp = None
@@ -76,3 +78,36 @@ def test_proactive_alerts_generated_from_live_data() -> None:
     timeline = client.get(f"/diagnostic-timeline/{session.session_id}")
     assert timeline.status_code == 200
     assert any(item["event_type"] == "ai_alert_created" for item in timeline.json()["timeline"])
+
+
+def test_guided_diagnosis_plan_and_result_are_logged() -> None:
+    _reset_state()
+    session = store.create_session(vehicle_id="toyota_sienna_2006")
+
+    run_response = client.post(
+        "/ai/guided-diagnosis/run",
+        json={"session_id": session.session_id, "symptom": "rough idle"},
+    )
+
+    assert run_response.status_code == 200
+    plan = run_response.json()["plan"]
+    assert plan["recommended_tests"]
+
+    result_response = client.post(
+        "/ai/guided-diagnosis/result",
+        json={"session_id": session.session_id, "step_id": "gd-1", "observed_result": "RPM stable at 780"},
+    )
+    assert result_response.status_code == 200
+    assert result_response.json()["updated_plan"]["dynamic_tree_state"] == "updated_after_result"
+
+
+def test_dashboard_state_includes_vehicle_intelligence_core_snapshot() -> None:
+    _reset_state()
+    store.create_session(vehicle_id="toyota_sienna_2006")
+
+    response = client.get("/dashboard/state")
+    assert response.status_code == 200
+    data = response.json()
+    assert "vehicle_intelligence_core" in data
+    assert "diagnostic_state_engine" in data["vehicle_intelligence_core"]
+    assert "vehicle_health_score" in data
