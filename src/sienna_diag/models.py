@@ -199,6 +199,9 @@ class VehicleVisualizationExplainRequest(BaseModel):
 TimelineEventType = Literal[
     "vehicle_connected",
     "vehicle_disconnected",
+    "polling_started",
+    "first_live_read_received",
+    "live_monitoring_active",
     "vin_detected",
     "manual_vehicle_selected",
     "vehicle_check_started",
