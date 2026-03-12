@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from sienna_diag.models import EventTag, ReadHistoryItem, Session, VehicleProfile
+from sienna_diag.models import CommandLearningRecord, EventTag, ReadHistoryItem, Session, VehicleProfile
 
 
 class SessionStore:
@@ -11,6 +11,9 @@ class SessionStore:
         self.events_by_session: dict[str, list[EventTag]] = defaultdict(list)
         self.reads_by_session: dict[str, list[ReadHistoryItem]] = defaultdict(list)
         self.active_session_id: str | None = None
+        self.learning_records_by_session: dict[str, list[CommandLearningRecord]] = defaultdict(list)
+        self.command_library: dict[str, dict] = {}
+        self.replay_approvals: dict[tuple[str, str], dict] = {}
         self.vehicles: dict[str, VehicleProfile] = {
             "toyota_sienna_2006": VehicleProfile(
                 vehicle_id="toyota_sienna_2006",
@@ -45,6 +48,13 @@ class SessionStore:
         self.active_session_id = session.session_id
         return session
 
+    def assign_session_vin(self, session_id: str, vin: str | None, assignment_source: str) -> Session:
+        session = self.get_session(session_id)
+        session.vin = vin
+        session.assignment_source = assignment_source
+        self.sessions[session_id] = session
+        return session
+
     def get_session(self, session_id: str) -> Session:
         if session_id not in self.sessions:
             raise KeyError(session_id)
@@ -76,11 +86,65 @@ class SessionStore:
             raise KeyError(item.session_id)
         history = self.reads_by_session[item.session_id]
         history.append(item)
-        self.reads_by_session[item.session_id] = history[-20:]
+        self.reads_by_session[item.session_id] = history[-200:]
         return item
 
     def get_reads(self, session_id: str) -> list[ReadHistoryItem]:
         return self.reads_by_session.get(session_id, [])
+
+    def add_learning_record(self, item: CommandLearningRecord) -> CommandLearningRecord:
+        if item.session_id not in self.sessions:
+            raise KeyError(item.session_id)
+        history = self.learning_records_by_session[item.session_id]
+        history.append(item)
+        self.learning_records_by_session[item.session_id] = history[-300:]
+
+        key = item.raw_command.upper()
+        existing = self.command_library.get(
+            key,
+            {
+                "command_identity": key,
+                "observed_behavior": [],
+                "affected_module": None,
+                "associated_dtcs": [],
+                "observed_state_changes": [],
+                "confidence_score": None,
+                "approval_status": "manual-required",
+                "replay_history": [],
+                "notes": [],
+            },
+        )
+        if item.notes:
+            existing["notes"].append(item.notes)
+        if item.parsed_response is not None:
+            existing["observed_behavior"].append(item.parsed_response)
+        if item.after_state_snapshot:
+            existing["observed_state_changes"].append(item.after_state_snapshot)
+        if item.confidence_score is not None:
+            existing["confidence_score"] = item.confidence_score
+        if item.manually_approved_for_replay:
+            existing["approval_status"] = "approved"
+        if item.source_type == "replay":
+            existing["replay_history"].append(
+                {
+                    "timestamp": item.timestamp.isoformat(),
+                    "succeeded": item.replay_succeeded,
+                    "session_id": item.session_id,
+                }
+            )
+        self.command_library[key] = existing
+        return item
+
+    def get_learning_records(self, session_id: str) -> list[CommandLearningRecord]:
+        return self.learning_records_by_session.get(session_id, [])
+
+    def set_replay_approval(self, session_id: str, raw_command: str, approved: bool, notes: str | None = None) -> dict:
+        key = (session_id, raw_command.upper())
+        self.replay_approvals[key] = {"approved": approved, "notes": notes}
+        return self.replay_approvals[key]
+
+    def get_replay_approval(self, session_id: str, raw_command: str) -> dict | None:
+        return self.replay_approvals.get((session_id, raw_command.upper()))
 
 
 store = SessionStore()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -17,6 +17,8 @@ class Session(BaseModel):
     protocol: str = "ISO_9141_2"
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     status: Literal["active", "closed"] = "active"
+    assignment_source: Literal["auto_vin", "manual"] = "manual"
+    vin: str | None = None
 
 
 class SessionCreateRequest(BaseModel):
@@ -62,6 +64,9 @@ class ReadHistoryItem(BaseModel):
     value: float | str | None = None
     unit: str | None = None
     raw_command: str | None = None
+    vehicle_id: str | None = None
+    parsed_value: float | str | None = None
+    polling: bool = False
     ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -79,6 +84,7 @@ class PhoneLiveReadPayload(BaseModel):
     latency_ms: int | None = None
     backend_status: str | None = None
     error: str | None = None
+    polling: bool = False
 
 
 class PhoneBridgeConnectPayload(BaseModel):
@@ -116,3 +122,64 @@ class OpenAISecondOpinion(BaseModel):
     key_findings: list[str]
     recommended_next_read_only_steps: list[str]
     prohibited_actions_confirmed: list[str]
+
+
+RiskClassification = Literal["safe", "unknown", "risky", "confirmed"]
+CommandSourceType = Literal["can_passive", "obd_request_response", "replay"]
+
+
+class CommandLearningRecord(BaseModel):
+    record_id: str = Field(default_factory=lambda: str(uuid4()))
+    session_id: str
+    vehicle_id: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    source_type: CommandSourceType
+    raw_command: str
+    raw_response: str | None = None
+    parsed_response: dict[str, Any] | None = None
+    protocol: str | None = None
+    mode: SourceMode
+    before_state_snapshot: dict[str, Any] = Field(default_factory=dict)
+    after_state_snapshot: dict[str, Any] = Field(default_factory=dict)
+    tags: list[str] = Field(default_factory=list)
+    confidence_score: float | None = None
+    risk_classification: RiskClassification = "unknown"
+    manually_approved_for_replay: bool = False
+    replay_succeeded: bool | None = None
+    notes: str | None = None
+
+
+class CommandLearningIngestRequest(BaseModel):
+    session_id: str | None = None
+    vehicle_id: str | None = None
+    source_type: CommandSourceType
+    raw_command: str
+    raw_response: str | None = None
+    parsed_response: dict[str, Any] | None = None
+    protocol: str | None = None
+    mode: SourceMode = "PHONE-LIVE"
+    before_state_snapshot: dict[str, Any] = Field(default_factory=dict)
+    after_state_snapshot: dict[str, Any] = Field(default_factory=dict)
+    tags: list[str] = Field(default_factory=list)
+    confidence_score: float | None = None
+    risk_classification: RiskClassification = "unknown"
+    manually_approved_for_replay: bool = False
+    replay_succeeded: bool | None = None
+    notes: str | None = None
+
+
+class ReplayApprovalRequest(BaseModel):
+    session_id: str
+    raw_command: str
+    approve: bool
+    notes: str | None = None
+
+
+class ReplayExecuteRequest(BaseModel):
+    session_id: str
+    raw_command: str
+    confirm_risky: bool = False
+    before_state_snapshot: dict[str, Any] = Field(default_factory=dict)
+    after_state_snapshot: dict[str, Any] = Field(default_factory=dict)
+    tags: list[str] = Field(default_factory=list)
+    notes: str | None = None
