@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timezone
 
 from sienna_diag.models import CommandLearningRecord, EventTag, ReadHistoryItem, Session, VehicleProfile
 
@@ -14,6 +15,34 @@ class SessionStore:
         self.learning_records_by_session: dict[str, list[CommandLearningRecord]] = defaultdict(list)
         self.command_library: dict[str, dict] = {}
         self.replay_approvals: dict[tuple[str, str], dict] = {}
+        self.ai_memory_by_vehicle: dict[str, dict] = defaultdict(dict)
+        self.knowledge_library: dict[str, dict] = {
+            "dtc_definitions": {
+                "P0300": "Random/multiple cylinder misfire detected.",
+                "P0420": "Catalyst system efficiency below threshold (bank 1).",
+                "P0171": "System too lean (bank 1).",
+            },
+            "pid_definitions": {
+                "010C": "Engine RPM",
+                "0105": "Engine coolant temperature",
+                "010D": "Vehicle speed",
+                "0111": "Throttle position",
+                "0142": "Control module voltage",
+                "010F": "Intake air temperature",
+            },
+            "vehicle_specific_notes": {
+                "toyota_sienna_2006": [
+                    "Default DLC3/ECM diagnostics should start as ISO 9141-2 request/response.",
+                ]
+            },
+            "component_mappings": {
+                "coolant_temp": "ECT sensor and thermostat behavior",
+                "control_module_voltage": "Battery, alternator, and charging circuit",
+            },
+            "successful_diagnosis_paths": [],
+            "repair_observations": [],
+            "training_export_knowledge": [],
+        }
         self.vehicles: dict[str, VehicleProfile] = {
             "toyota_sienna_2006": VehicleProfile(
                 vehicle_id="toyota_sienna_2006",
@@ -145,6 +174,39 @@ class SessionStore:
 
     def get_replay_approval(self, session_id: str, raw_command: str) -> dict | None:
         return self.replay_approvals.get((session_id, raw_command.upper()))
+
+    def get_vehicle_memory(self, vehicle_id: str) -> dict:
+        memory = self.ai_memory_by_vehicle.get(vehicle_id)
+        if memory:
+            return memory
+        return {
+            "vehicle_profile": self.vehicles.get(vehicle_id).model_dump() if vehicle_id in self.vehicles else None,
+            "vin": None,
+            "prior_vehicle_checks": [],
+            "dtc_history": [],
+            "sensor_patterns": [],
+            "user_symptoms": [],
+            "notes": [],
+            "repair_outcomes": [],
+            "unresolved_issues": [],
+            "false_positives": [],
+            "confidence_tags": [],
+            "last_updated": None,
+        }
+
+    def update_vehicle_memory(self, vehicle_id: str, updates: dict) -> dict:
+        memory = self.get_vehicle_memory(vehicle_id)
+        for key, value in updates.items():
+            if value is None:
+                continue
+            if isinstance(memory.get(key), list) and isinstance(value, list):
+                memory[key].extend(value)
+                memory[key] = memory[key][-100:]
+            else:
+                memory[key] = value
+        memory["last_updated"] = datetime.now(timezone.utc).isoformat()
+        self.ai_memory_by_vehicle[vehicle_id] = memory
+        return memory
 
 
 store = SessionStore()

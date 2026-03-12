@@ -40,24 +40,34 @@ adapter = OBDLinkAdapter()
 SAFE_QUICK_READS = {
     "rpm": "010C",
     "coolant_temp": "0105",
+    "fuel_level": "012F",
     "vehicle_speed": "010D",
+    "throttle_position": "0111",
+    "intake_air_temp": "010F",
     "control_module_voltage": "0142",
+    "readiness_status": "0101",
+    "freeze_frame": "020C",
     "vin": "0902",
     "stored_codes": "03",
     "pending_codes": "07",
 }
 
 
-LIVE_POLLING_SUPPORTED_PIDS = ["010C", "0105", "0142", "010F", "010D", "0111"]
+LIVE_POLLING_SUPPORTED_PIDS = ["010C", "0105", "012F", "0142", "010F", "010D", "0111"]
 
 PHONE_LIVE_PID_LABELS = {
     "010C": {"pid_key": "rpm", "unit": "rpm"},
     "0105": {"pid_key": "coolant_temp", "unit": "°C"},
+    "012F": {"pid_key": "fuel_level", "unit": "%"},
     "0142": {"pid_key": "control_module_voltage", "unit": "V"},
     "010F": {"pid_key": "intake_air_temp", "unit": "°C"},
     "010D": {"pid_key": "vehicle_speed", "unit": "km/h"},
     "0111": {"pid_key": "throttle_position", "unit": "%"},
+    "0101": {"pid_key": "readiness_status", "unit": None},
+    "020C": {"pid_key": "freeze_frame", "unit": "rpm"},
     "0902": {"pid_key": "vin", "unit": None},
+    "03": {"pid_key": "dtc_stored", "unit": None},
+    "07": {"pid_key": "dtc_pending", "unit": None},
 }
 
 phone_bridge_state = {
@@ -635,36 +645,11 @@ def replay_approve(payload: ReplayApprovalRequest) -> dict:
 
 @app.post("/learning/replay/execute")
 def replay_execute(payload: ReplayExecuteRequest) -> dict:
-    session = store.get_session(payload.session_id)
-    approval = store.get_replay_approval(payload.session_id, payload.raw_command)
-    if not approval or not approval.get("approved"):
-        raise HTTPException(status_code=403, detail="Command replay requires manual approval")
-
-    library_item = store.command_library.get(payload.raw_command.upper(), {})
-    risk = library_item.get("approval_status", "manual-required")
-    if risk == "manual-required" and not payload.confirm_risky:
-        raise HTTPException(status_code=400, detail="Risky/unknown replay needs confirm_risky=true")
-
-    replay_success = True
-    record = _record_learning(
-        session_id=session.session_id,
-        vehicle_id=session.vehicle_id,
-        source_type="replay",
-        raw_command=payload.raw_command,
-        raw_response="REPLAY-LOGGED-NO-ACTUATION",
-        parsed_response={"note": "controlled replay log-only in read-only safety mode"},
-        protocol=session.protocol,
-        mode=phone_bridge_state.get("source_mode", "PHONE-LIVE"),
-        before_state_snapshot=payload.before_state_snapshot,
-        after_state_snapshot=payload.after_state_snapshot,
-        tags=payload.tags,
-        risk_classification="confirmed" if payload.confirm_risky else "safe",
-        manually_approved_for_replay=True,
-        replay_succeeded=replay_success,
-        notes=payload.notes,
+    _ = payload
+    raise HTTPException(
+        status_code=403,
+        detail="Replay execution is permanently blocked in AI Mechanic read-only safety mode",
     )
-    phone_bridge_state["last_replayed_command"] = payload.raw_command.upper()
-    return {"status": "replay_logged", "record": record.model_dump()}
 
 @app.post("/review/local")
 def review_local(payload: ReviewRequest) -> dict:
@@ -734,35 +719,104 @@ def dashboard_state() -> dict:
     }
 
 
+
+
+@app.get("/ai/memory/{vehicle_id}")
+def ai_memory(vehicle_id: str) -> dict:
+    return {"vehicle_id": vehicle_id, "memory": store.get_vehicle_memory(vehicle_id)}
+
+
+@app.post("/ai/memory/{vehicle_id}")
+def ai_memory_update(vehicle_id: str, payload: dict) -> dict:
+    memory = store.update_vehicle_memory(vehicle_id, payload)
+    return {"status": "updated", "vehicle_id": vehicle_id, "memory": memory}
+
+
+@app.get("/ai/knowledge")
+def ai_knowledge() -> dict:
+    return {"knowledge_library": store.knowledge_library}
+
+
 @app.post("/ai/mechanic")
 def ai_mechanic(payload: dict) -> dict:
     question = str(payload.get("question") or "").strip()
+    memory_updates = payload.get("memory_updates") or {}
+
     active = store.get_session(store.active_session_id).model_dump() if store.active_session_id else None
     reads = [item.model_dump() for item in store.get_reads(active["session_id"])] if active else []
     events = [item.model_dump() for item in store.get_events(active["session_id"])] if active else []
-    latest_live_data = reads[-5:]
+
+    safe_live_keys = {
+        "rpm",
+        "coolant_temp",
+        "fuel_level",
+        "control_module_voltage",
+        "intake_air_temp",
+        "vehicle_speed",
+        "throttle_position",
+        "dtc_stored",
+        "dtc_pending",
+        "readiness_status",
+        "freeze_frame",
+        "vin",
+    }
+    live_data = [r for r in reads if (r.get("pid_key") in safe_live_keys or r.get("command") in {"03", "07", "0902"})][-12:]
+
+    vehicle_id = active.get("vehicle_id") if active else "toyota_sienna_2006"
+    memory = store.get_vehicle_memory(vehicle_id)
+    if active and active.get("vin"):
+        memory_updates.setdefault("vin", active["vin"])
+    if memory_updates:
+        memory = store.update_vehicle_memory(vehicle_id, memory_updates)
+
+    dtcs = [r for r in reads if r.get("command") in {"03", "07"} or "dtc" in str(r.get("pid_key", "")).lower()][-8:]
     context = {
         "current_vehicle": active.get("vehicle") if active else None,
+        "active_vehicle_id": vehicle_id,
         "vin": active.get("vin") if active else None,
         "current_mode": phone_bridge_state.get("source_mode"),
+        "mode_badge": "READ-ONLY ADVISORY",
         "active_vehicle_check": active.get("session_id") if active else None,
-        "dtcs": [r for r in reads if str(r.get("pid_key", "")).lower().startswith("dtc")],
-        "latest_live_data": latest_live_data,
-        "captured_events": events[-10:],
-        "reports": ["Customer Summary", "Technician Detail", "AI Training Export"],
+        "live_data": live_data,
+        "active_dtcs": dtcs,
+        "recent_events": events[-10:],
+        "reports_and_summaries": ["Customer Summary", "Technician Detail", "AI Training Export"],
+        "memory": memory,
+        "knowledge_library": store.knowledge_library,
+        "safety_guardrails": {
+            "blocked": [
+                "bi-directional controls",
+                "actuator testing",
+                "command replay execution",
+                "code clearing",
+                "risky write/control functions",
+            ]
+        },
     }
+
     if not question:
-        answer = "Please ask a question about your vehicle, active vehicle check, codes, live data, or next steps."
+        answer = "Ask a question by voice or text. I will answer with safe live data, stored history, and knowledge library context only."
     else:
+        source_note = "general knowledge"
+        if live_data:
+            source_note = "live data"
+        elif memory.get("prior_vehicle_checks") or memory.get("dtc_history"):
+            source_note = "stored history"
+
         answer = (
-            f"For '{question}', I reviewed the current vehicle context. "
-            f"Vehicle: {context['current_vehicle'] or 'Not selected yet'}. "
-            f"VIN: {context['vin'] or 'Not available yet'}. "
-            f"Active Vehicle Check: {context['active_vehicle_check'] or 'None'}. "
-            f"I can help explain DTC meaning in plain English, safety-to-drive guidance, and recommended next tests "
-            f"using live data and captured events from this check."
+            f"Read-only AI Mechanic response ({source_note}). "
+            f"Vehicle: {context['current_vehicle'] or 'Not selected'}. "
+            f"VIN: {context['vin'] or 'Unavailable'}. "
+            "I can explain DTCs, current behavior, and next safe tests, but I cannot run controls, actuators, replay commands, or clear codes. "
+            f"Question: {question}"
         )
-    return {"answer": answer, "context": context}
+
+    return {
+        "answer": answer,
+        "context": context,
+        "response_basis": "live_data" if live_data else ("stored_history" if memory.get("prior_vehicle_checks") else "general_knowledge"),
+        "read_only_enforced": True,
+    }
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -802,7 +856,7 @@ def dashboard() -> str:
   <div class="wrap">
     <div class="card">
       <h1 style="margin:0;">Zeb’s OBD AI — Vehicle Dashboard</h1>
-      <div class="tiny">Simple phone-first workflow for safe read-only diagnostics.</div>
+      <div class="tiny">Simple phone-first workflow for safe read-only diagnostics. AI Mechanic is advisory only: no control commands, no actuations, no code clearing.</div>
     </div>
 
     <div class="row" id="statusCards"></div>
@@ -820,7 +874,7 @@ def dashboard() -> str:
         <button id="tagEventBtn" class="secondary">Tag Event</button>
         <button id="reportsBtn" class="secondary">Reports</button>
         <button id="liveGaugesBtn" class="secondary">Live Gauges</button>
-        <button id="askAiBtn">Ask AI Mechanic</button>
+        <button id="askAiBtn">Open AI Mechanic (Voice + Text)</button>
       </div>
     </div>
 
@@ -846,6 +900,10 @@ def dashboard() -> str:
         <button class="secondary" onclick="openAiWithPrompt('Is it safe to drive?')">Is it safe to drive?</button>
         <button class="secondary" onclick="openAiWithPrompt('What should I test next?')">What should I test next?</button>
         <button class="secondary" onclick="openAiWithPrompt('Explain this in simple language')">Explain this in simple language</button>
+        <button class="secondary" onclick="openAiWithPrompt('What is my coolant temp?')">What is my coolant temp?</button>
+        <button class="secondary" onclick="openAiWithPrompt('What is my RPM right now?')">What is my RPM right now?</button>
+        <button class="secondary" onclick="openAiWithPrompt('How much fuel is left?')">How much fuel is left?</button>
+        <button class="secondary" onclick="openAiWithPrompt('Summarize this vehicle check')">Summarize this vehicle check</button>
       </div>
     </div>
   </div>
@@ -944,17 +1002,91 @@ setInterval(fetchState,1200); fetchState();
 @app.get('/dashboard/ai', response_class=HTMLResponse)
 def ai_dashboard() -> str:
     return """
-<!doctype html><html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Ask AI Mechanic</title>
-<style>body{margin:0;font-family:Segoe UI,system-ui,sans-serif;background:#edf2f7;color:#0f172a}.wrap{max-width:900px;margin:0 auto;padding:14px;display:grid;gap:12px}.card{background:#fff;border:1px solid #d4dde7;border-radius:14px;padding:14px}textarea,input,button{width:100%;border-radius:12px;border:1px solid #d4dde7;padding:12px}button{background:#0f766e;color:#fff;font-weight:700}.secondary{background:#fff;color:#0f172a}.quick{display:flex;flex-wrap:wrap;gap:8px}.quick button{width:auto}</style>
-</head><body><div class="wrap"><div class="card"><h1 style="margin:0">Ask AI Mechanic</h1><div id="ctx" style="font-size:.85rem;color:#475569;margin-top:8px">Loading current vehicle context...</div></div>
-<div class="card"><input id="question" placeholder="Ask about your current vehicle, DTCs, live data, or next steps" /><button id="sendBtn" style="margin-top:8px">Send</button><div class="quick" style="margin-top:8px"><button class="secondary" onclick="setPrompt('What does this code mean?')">What does this code mean?</button><button class="secondary" onclick="setPrompt('Is it safe to drive?')">Is it safe to drive?</button><button class="secondary" onclick="setPrompt('What should I test next?')">What should I test next?</button><button class="secondary" onclick="setPrompt('Explain this in simple language')">Explain this in simple language</button></div></div>
-<div class="card"><h3 style="margin-top:0">AI Mechanic Answer</h3><div id="answer">Ask a question to get a context-aware answer.</div></div>
-<div class="card"><button class="secondary" id="backBtn">Back to Main Dashboard</button></div></div>
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI Mechanic</title>
+<style>
+body{margin:0;font-family:Segoe UI,system-ui,sans-serif;background:#edf2f7;color:#0f172a}
+.wrap{max-width:980px;margin:0 auto;padding:14px;display:grid;gap:12px}
+.card{background:#fff;border:1px solid #d4dde7;border-radius:14px;padding:14px}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+input,button{width:100%;border-radius:12px;border:1px solid #d4dde7;padding:12px}
+button{background:#0f766e;color:#fff;font-weight:700}
+button.secondary{background:#fff;color:#0f172a}
+.quick{display:flex;flex-wrap:wrap;gap:8px}
+.quick button{width:auto}
+.chat{max-height:330px;overflow:auto;display:grid;gap:8px}
+.bubble{border:1px solid #d4dde7;border-radius:12px;padding:10px;background:#f8fafc}
+.badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#fee2e2;color:#991b1b;font-size:.75rem;font-weight:700}
+.tiny{font-size:.85rem;color:#475569}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1 style="margin:0">AI Mechanic</h1>
+    <div class="badge">READ-ONLY DIAGNOSTIC / ADVISORY</div>
+    <div class="tiny" style="margin-top:8px">Voice-enabled assistant for safe live reads, DTC explanations, and memory-supported guidance. Unsafe controls are permanently blocked.</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="micBtn">🎤 Start Listening</button>
+      <button id="stopMicBtn" class="secondary">Stop Listening</button>
+      <button id="speakBtn">🔊 Play Response</button>
+      <button id="stopSpeakBtn" class="secondary">Stop Audio</button>
+    </div>
+    <div class="tiny" id="voiceState" style="margin-top:8px">Voice state: idle</div>
+    <div class="tiny" id="transcriptPreview">Transcript preview: (none)</div>
+  </div>
+
+  <div class="card">
+    <input id="question" placeholder="Speak or type your question" />
+    <button id="sendBtn" style="margin-top:8px">Send</button>
+    <div class="quick" style="margin-top:10px">
+      <button class="secondary" onclick="setPrompt('What is my coolant temp?')">What is my coolant temp?</button>
+      <button class="secondary" onclick="setPrompt('What is my RPM right now?')">What is my RPM right now?</button>
+      <button class="secondary" onclick="setPrompt('How much fuel is left?')">How much fuel is left?</button>
+      <button class="secondary" onclick="setPrompt('What does this code mean?')">What does this code mean?</button>
+      <button class="secondary" onclick="setPrompt('Is it safe to drive?')">Is it safe to drive?</button>
+      <button class="secondary" onclick="setPrompt('What should I test next?')">What should I test next?</button>
+      <button class="secondary" onclick="setPrompt('Explain this in simple language')">Explain this in simple language</button>
+      <button class="secondary" onclick="setPrompt('Summarize this vehicle check')">Summarize this vehicle check</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Conversation</h3>
+    <div id="chat" class="chat"></div>
+  </div>
+
+  <div class="card"><button class="secondary" id="backBtn">Back to Main Dashboard</button></div>
+</div>
 <script>
-function setPrompt(v){document.getElementById('question').value=v;}
-async function loadContext(){const res=await fetch('/dashboard/state');const state=await res.json();const active=state.active_session;document.getElementById('ctx').textContent=`Vehicle: ${active?active.vehicle:'Not selected'} | VIN: ${active&&active.vin?active.vin:'Not available'} | Mode: ${state.adapter_mode || 'MOCK'} | Active Vehicle Check: ${active?active.session_id:'None'}`;}
-async function ask(){const q=document.getElementById('question').value;const res=await fetch('/ai/mechanic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});const data=await res.json();document.getElementById('answer').textContent=data.answer;}
-const params=new URLSearchParams(window.location.search);const prompt=params.get('prompt');if(prompt){setPrompt(prompt);}
-document.getElementById('sendBtn').onclick=ask;document.getElementById('backBtn').onclick=()=>window.location.href='/dashboard';loadContext();
-</script></body></html>
+let lastAnswer='';
+let recog=null;
+const synth=window.speechSynthesis;
+function pushMsg(role,text){const el=document.createElement('div');el.className='bubble';el.innerHTML=`<b>${role}:</b> ${text}`;document.getElementById('chat').prepend(el);}
+function setPrompt(v){document.getElementById('question').value=v;document.getElementById('transcriptPreview').textContent='Transcript preview: '+v;}
+async function ask(){const q=document.getElementById('question').value.trim();if(!q){return;}pushMsg('You',q);const res=await fetch('/ai/mechanic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});const data=await res.json();lastAnswer=data.answer;pushMsg('AI Mechanic',data.answer+` [source: ${data.response_basis}]`);} 
+function speechAvailable(){return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;}
+function initSpeech(){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){document.getElementById('voiceState').textContent='Voice state: unavailable, text fallback active';return;}recog=new SR();recog.lang='en-US';recog.interimResults=true;recog.onstart=()=>document.getElementById('voiceState').textContent='Voice state: listening';recog.onerror=()=>document.getElementById('voiceState').textContent='Voice state: transcription failed, retry or type';recog.onend=()=>document.getElementById('voiceState').textContent='Voice state: idle';recog.onresult=(e)=>{let t='';for(let i=e.resultIndex;i<e.results.length;i++){t+=e.results[i][0].transcript;}document.getElementById('question').value=t.trim();document.getElementById('transcriptPreview').textContent='Transcript preview: '+(t.trim()||'(none)');};}
+function startListening(){if(!recog){initSpeech();}if(recog){recog.start();}}
+function stopListening(){if(recog){recog.stop();}}
+function playAnswer(){if(!lastAnswer){return;}if(!synth){pushMsg('System','Voice output unavailable, using text transcript only.');return;}const u=new SpeechSynthesisUtterance(lastAnswer);synth.speak(u);} 
+function stopAnswer(){if(synth){synth.cancel();}}
+
+document.getElementById('sendBtn').onclick=ask;
+document.getElementById('micBtn').onclick=startListening;
+document.getElementById('stopMicBtn').onclick=stopListening;
+document.getElementById('speakBtn').onclick=playAnswer;
+document.getElementById('stopSpeakBtn').onclick=stopAnswer;
+document.getElementById('backBtn').onclick=()=>window.location.href='/dashboard';
+initSpeech();
+</script>
+</body>
+</html>
     """
