@@ -183,3 +183,71 @@ class ReplayExecuteRequest(BaseModel):
     after_state_snapshot: dict[str, Any] = Field(default_factory=dict)
     tags: list[str] = Field(default_factory=list)
     notes: str | None = None
+
+
+TimelineEventType = Literal[
+    "vehicle_connected",
+    "vehicle_disconnected",
+    "vin_detected",
+    "manual_vehicle_selected",
+    "vehicle_check_started",
+    "vehicle_check_stopped",
+    "capture_started",
+    "capture_stopped",
+    "dtc_detected",
+    "user_tag_event",
+    "sensor_change",
+    "ai_alert_created",
+    "ai_advice_generated",
+    "replay_approval_action",
+    "connection_issue",
+]
+
+
+class DiagnosticTimelineEvent(BaseModel):
+    timeline_event_id: str = Field(default_factory=lambda: str(uuid4()))
+    session_id: str
+    event_type: TimelineEventType
+    title: str
+    detail: str
+    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    source: Literal["system", "user", "ai"] = "system"
+    related_codes: list[str] = Field(default_factory=list)
+    related_sensors: list[str] = Field(default_factory=list)
+    linked_ai_response_id: str | None = None
+    linked_ai_alert_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AIAlertRecord(BaseModel):
+    alert_id: str = Field(default_factory=lambda: str(uuid4()))
+    session_id: str
+    vehicle_id: str
+    title: str
+    explanation: str
+    trigger_reason: str
+    confidence: Literal["monitor only", "suspected", "likely", "high confidence"]
+    suggested_next_step: str
+    related_sensors: list[str] = Field(default_factory=list)
+    related_codes: list[str] = Field(default_factory=list)
+    proactive: bool = True
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class AIResponseRecord(BaseModel):
+    response_id: str = Field(default_factory=lambda: str(uuid4()))
+    session_id: str
+    vehicle_id: str
+    question: str
+    answer: str
+    response_basis: Literal["live_data", "stored_history", "general_knowledge"]
+    used_live_data: bool = False
+    proactive: bool = False
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    context_summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class AIMechanicQuestionRequest(BaseModel):
+    question: str = ""
+    memory_updates: dict[str, Any] = Field(default_factory=dict)
+    source: Literal["user", "system"] = "user"

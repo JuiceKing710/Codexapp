@@ -11,8 +11,12 @@ from fastapi.staticfiles import StaticFiles
 
 from sienna_diag.config import settings
 from sienna_diag.models import (
+    AIAlertRecord,
+    AIMechanicQuestionRequest,
+    AIResponseRecord,
     CommandLearningIngestRequest,
     CommandLearningRecord,
+    DiagnosticTimelineEvent,
     EventTag,
     CaptureStartRequest,
     CaptureTagRequest,
@@ -317,6 +321,12 @@ def start_capture(vehicle_id: str | None, preset: str) -> dict:
         capture_thread.start()
         capture_status = "recording"
         capture_preset = preset
+        store.add_timeline_event(DiagnosticTimelineEvent(
+            session_id=session.session_id,
+            event_type="capture_started",
+            title="Capture started",
+            detail=f"Capture preset: {CAPTURE_PRESETS[preset]}",
+        ))
         return {
             "status": capture_status,
             "session_id": session.session_id,
@@ -338,6 +348,13 @@ def stop_capture() -> dict:
             capture_thread.join(timeout=1.5)
         capture_thread = None
         capture_status = "stopped"
+        if store.active_session_id:
+            store.add_timeline_event(DiagnosticTimelineEvent(
+                session_id=store.active_session_id,
+                event_type="capture_stopped",
+                title="Capture stopped",
+                detail="Capture polling stopped.",
+            ))
         return {"status": capture_status}
 
 
@@ -499,6 +516,13 @@ def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
     phone_bridge_state["backend_status"] = "phone-managed"
     phone_bridge_state["polling_state"] = "active" if payload.status == "connected" else "inactive"
     phone_bridge_state["command_learning_status"] = "active" if payload.status == "connected" else "idle"
+    if store.active_session_id and payload.status == "connected":
+        store.add_timeline_event(DiagnosticTimelineEvent(
+            session_id=store.active_session_id,
+            event_type="vehicle_connected",
+            title="Vehicle connected",
+            detail=f"{payload.adapter_name} connected through hybrid mobile app.",
+        ))
     return phone_bridge_state
 
 
@@ -507,6 +531,13 @@ def phone_bridge_disconnect() -> dict:
     _touch_phone_bridge(status="disconnected", error=None)
     phone_bridge_state["backend_status"] = "phone-managed"
     phone_bridge_state["polling_state"] = "inactive"
+    if store.active_session_id:
+        store.add_timeline_event(DiagnosticTimelineEvent(
+            session_id=store.active_session_id,
+            event_type="vehicle_disconnected",
+            title="Vehicle disconnected",
+            detail="Phone-managed Bluetooth disconnected.",
+        ))
     return phone_bridge_state
 
 
@@ -555,9 +586,22 @@ def phone_bridge_read(payload: PhoneLiveReadPayload) -> dict:
             phone_bridge_state["vin_parse_status"] = "parsed"
             phone_bridge_state["vin"] = parsed_vin
             store.assign_session_vin(session.session_id, parsed_vin, "auto_vin")
+            store.add_timeline_event(DiagnosticTimelineEvent(
+                session_id=session.session_id,
+                event_type="vin_detected",
+                title="VIN detected",
+                detail=f"VIN detected automatically: {parsed_vin}",
+                metadata={"source": "auto_vin"},
+            ))
         else:
             phone_bridge_state["vin_parse_status"] = "failed-manual-selection-required"
             store.assign_session_vin(session.session_id, None, "manual")
+            store.add_timeline_event(DiagnosticTimelineEvent(
+                session_id=session.session_id,
+                event_type="connection_issue",
+                title="VIN parse issue",
+                detail="VIN parse failed; manual vehicle selection required.",
+            ))
     _touch_phone_bridge(status="connected", error=payload.error)
     _record_learning(
         session_id=session.session_id,
@@ -592,6 +636,13 @@ def phone_vehicle_assign(payload: SessionCreateRequest) -> dict:
         if payload.vehicle_id and payload.vehicle_id != session.vehicle_id:
             session = store.create_session(vehicle_id=payload.vehicle_id)
     session = store.assign_session_vin(session.session_id, session.vin, "manual")
+    store.add_timeline_event(DiagnosticTimelineEvent(
+        session_id=session.session_id,
+        event_type="manual_vehicle_selected",
+        title="Manual vehicle selected",
+        detail=f"Manual vehicle assignment: {session.vehicle}",
+        source="user",
+    ))
     phone_bridge_state["vin_parse_status"] = "manual-selection"
     return session.model_dump()
 
@@ -748,6 +799,19 @@ def dashboard_state() -> dict:
         "learning_records": learning_records[-40:],
         "learning_library": store.command_library,
         "vehicle_image": _resolve_vehicle_image(active.get("vehicle_id") if active else None),
+        "ai_alerts": [item.model_dump() for item in store.get_ai_alerts(active["session_id"])] if active else [],
+        "diagnostic_timeline": [item.model_dump() for item in store.get_timeline_events(active["session_id"])] if active else [],
+        "ai_response_history": [item.model_dump() for item in store.get_ai_responses(active["session_id"])] if active else [],
+        "ai_debug": {
+            "last_ai_request": store.last_ai_request,
+            "last_ai_response_timestamp": store.last_ai_response_timestamp,
+        },
+        "report_integration_hooks": {
+            "ai_summary": True,
+            "notable_live_data_alerts": True,
+            "timeline_highlights": True,
+            "plain_english_recommendations": True,
+        },
     }
 
 
@@ -769,85 +833,230 @@ def ai_knowledge() -> dict:
     return {"knowledge_library": store.knowledge_library}
 
 
+def _latest_values(reads: list[dict], keys: list[str]) -> dict:
+    result = {}
+    for key in keys:
+        for item in reversed(reads):
+            if item.get("pid_key") == key:
+                result[key] = {
+                    "value": item.get("value"),
+                    "unit": item.get("unit"),
+                    "source_mode": item.get("source_mode"),
+                    "ts": item.get("ts"),
+                }
+                break
+    return result
+
+
+def _build_ai_context(active: dict | None, reads: list[dict], events: list[dict], memory: dict) -> dict:
+    live_keys = ["rpm", "coolant_temp", "fuel_level", "control_module_voltage", "vehicle_speed", "throttle_position", "intake_air_temp"]
+    latest_values = _latest_values(reads, live_keys)
+    recent_live = [
+        r
+        for r in reads
+        if r.get("pid_key") in set(live_keys + ["dtc_stored", "dtc_pending", "readiness_status", "freeze_frame", "vin"])
+    ][-25:]
+    dtc_stored = [r for r in reads if r.get("command") == "03" or r.get("pid_key") == "dtc_stored"][-8:]
+    dtc_pending = [r for r in reads if r.get("command") == "07" or r.get("pid_key") == "dtc_pending"][-8:]
+    freeze_frames = [r for r in reads if r.get("pid_key") == "freeze_frame" or r.get("command") == "020C"][-5:]
+    readiness = [r for r in reads if r.get("pid_key") == "readiness_status" or r.get("command") == "0101"][-5:]
+
+    return {
+        "current_vehicle": active.get("vehicle") if active else None,
+        "vehicle_id": active.get("vehicle_id") if active else "toyota_sienna_2006",
+        "vin": active.get("vin") if active else None,
+        "vehicle_assignment_source": active.get("assignment_source") if active else "manual",
+        "current_mode": phone_bridge_state.get("source_mode"),
+        "active_vehicle_check": active.get("session_id") if active else None,
+        "stored_dtcs": dtc_stored,
+        "pending_dtcs": dtc_pending,
+        "freeze_frame_data": freeze_frames,
+        "readiness_monitor_status": readiness,
+        "recent_live_sensor_readings": recent_live,
+        "current_4_gauge_values": latest_values,
+        "event_tags": events[-15:],
+        "prior_vehicle_history": memory.get("prior_vehicle_checks", []),
+        "technician_notes": memory.get("notes", []),
+        "report_summaries": memory.get("report_summaries", []),
+        "confidence_tags": memory.get("confidence_tags", []),
+        "unresolved_issues": memory.get("unresolved_issues", []),
+        "false_positives": memory.get("false_positives", []),
+        "safety_guardrails": {
+            "read_only": True,
+            "blocked": [
+                "actuator commands",
+                "replay execution",
+                "code clearing",
+                "vehicle control actions",
+            ],
+        },
+    }
+
+
+def _run_proactive_monitoring(session_id: str, vehicle_id: str, context: dict) -> list[dict]:
+    alerts: list[AIAlertRecord] = []
+    gauge = context.get("current_4_gauge_values", {})
+
+    coolant = gauge.get("coolant_temp", {}).get("value")
+    rpm = gauge.get("rpm", {}).get("value")
+    voltage = gauge.get("control_module_voltage", {}).get("value")
+
+    if isinstance(coolant, (int, float)) and coolant >= 108:
+        alerts.append(AIAlertRecord(
+            session_id=session_id,
+            vehicle_id=vehicle_id,
+            title="Coolant temperature is rising unusually",
+            explanation="Engine coolant temperature is above expected warm range.",
+            trigger_reason=f"coolant_temp={coolant}°C",
+            confidence="likely",
+            suggested_next_step="Monitor fan operation and check coolant level before further driving.",
+            related_sensors=["coolant_temp"],
+        ))
+
+    if isinstance(rpm, (int, float)) and 550 <= rpm <= 1100:
+        recent = [r.get("value") for r in context.get("recent_live_sensor_readings", []) if r.get("pid_key") == "rpm" and isinstance(r.get("value"), (int, float))][-8:]
+        if len(recent) >= 4 and (max(recent) - min(recent)) > 220:
+            alerts.append(AIAlertRecord(
+                session_id=session_id,
+                vehicle_id=vehicle_id,
+                title="RPM appears unstable at idle",
+                explanation="RPM variability in recent idle samples is wider than expected.",
+                trigger_reason=f"idle rpm spread={max(recent)-min(recent):.1f}",
+                confidence="suspected",
+                suggested_next_step="Check for vacuum leaks and review fuel trim behavior.",
+                related_sensors=["rpm"],
+            ))
+
+    if isinstance(voltage, (int, float)) and (voltage < 12.2 or voltage > 15.1):
+        alerts.append(AIAlertRecord(
+            session_id=session_id,
+            vehicle_id=vehicle_id,
+            title="Control module voltage outside expected range",
+            explanation="Battery/charging voltage is outside normal operating window.",
+            trigger_reason=f"control_module_voltage={voltage}V",
+            confidence="likely",
+            suggested_next_step="Inspect battery terminals and charging system output.",
+            related_sensors=["control_module_voltage"],
+        ))
+
+    for alert in alerts:
+        store.add_ai_alert(alert)
+        timeline_event = store.add_timeline_event(DiagnosticTimelineEvent(
+            session_id=session_id,
+            event_type="ai_alert_created",
+            title=alert.title,
+            detail=alert.explanation,
+            source="ai",
+            related_sensors=alert.related_sensors,
+            related_codes=alert.related_codes,
+            linked_ai_alert_id=alert.alert_id,
+            metadata={"confidence": alert.confidence, "proactive": True},
+        ))
+        _ = timeline_event
+    return [a.model_dump() for a in alerts]
+
+
+@app.get("/diagnostic-timeline/{session_id}")
+def diagnostic_timeline(session_id: str) -> dict:
+    store.get_session(session_id)
+    return {"session_id": session_id, "timeline": [item.model_dump() for item in store.get_timeline_events(session_id)]}
+
+
+@app.get("/ai/alerts/{session_id}")
+def ai_alerts(session_id: str) -> dict:
+    store.get_session(session_id)
+    return {"session_id": session_id, "alerts": [item.model_dump() for item in store.get_ai_alerts(session_id)]}
+
+
 @app.post("/ai/mechanic")
-def ai_mechanic(payload: dict) -> dict:
-    question = str(payload.get("question") or "").strip()
-    memory_updates = payload.get("memory_updates") or {}
+def ai_mechanic(payload: AIMechanicQuestionRequest) -> dict:
+    question = payload.question.strip()
+    memory_updates = payload.memory_updates or {}
 
     active = store.get_session(store.active_session_id).model_dump() if store.active_session_id else None
-    reads = [item.model_dump() for item in store.get_reads(active["session_id"])] if active else []
-    events = [item.model_dump() for item in store.get_events(active["session_id"])] if active else []
+    if not active:
+        return {
+            "answer": "Start a vehicle check first so AI Mechanic can use live context.",
+            "context": {},
+            "response_basis": "general_knowledge",
+            "read_only_enforced": True,
+        }
 
-    safe_live_keys = {
-        "rpm",
-        "coolant_temp",
-        "fuel_level",
-        "control_module_voltage",
-        "intake_air_temp",
-        "vehicle_speed",
-        "throttle_position",
-        "dtc_stored",
-        "dtc_pending",
-        "readiness_status",
-        "freeze_frame",
-        "vin",
-    }
-    live_data = [r for r in reads if (r.get("pid_key") in safe_live_keys or r.get("command") in {"03", "07", "0902"})][-12:]
+    reads = [item.model_dump() for item in store.get_reads(active["session_id"])]
+    events = [item.model_dump() for item in store.get_events(active["session_id"])]
 
-    vehicle_id = active.get("vehicle_id") if active else "toyota_sienna_2006"
+    vehicle_id = active.get("vehicle_id")
     memory = store.get_vehicle_memory(vehicle_id)
-    if active and active.get("vin"):
+    if active.get("vin"):
         memory_updates.setdefault("vin", active["vin"])
     if memory_updates:
         memory = store.update_vehicle_memory(vehicle_id, memory_updates)
 
-    dtcs = [r for r in reads if r.get("command") in {"03", "07"} or "dtc" in str(r.get("pid_key", "")).lower()][-8:]
-    context = {
-        "current_vehicle": active.get("vehicle") if active else None,
-        "active_vehicle_id": vehicle_id,
-        "vin": active.get("vin") if active else None,
-        "current_mode": phone_bridge_state.get("source_mode"),
-        "mode_badge": "READ-ONLY ADVISORY",
-        "active_vehicle_check": active.get("session_id") if active else None,
-        "live_data": live_data,
-        "active_dtcs": dtcs,
-        "recent_events": events[-10:],
-        "reports_and_summaries": ["Customer Summary", "Technician Detail", "AI Training Export"],
-        "memory": memory,
-        "knowledge_library": store.knowledge_library,
-        "safety_guardrails": {
-            "blocked": [
-                "bi-directional controls",
-                "actuator testing",
-                "command replay execution",
-                "code clearing",
-                "risky write/control functions",
-            ]
-        },
-    }
+    context = _build_ai_context(active=active, reads=reads, events=events, memory=memory)
+    proactive_alerts = _run_proactive_monitoring(active["session_id"], vehicle_id, context)
 
+    response_basis = "live_data" if context.get("recent_live_sensor_readings") else ("stored_history" if memory.get("prior_vehicle_checks") else "general_knowledge")
     if not question:
-        answer = "Ask a question by voice or text. I will answer with safe live data, stored history, and knowledge library context only."
+        answer = "Ask your question by text or microphone. I can proactively monitor live data and provide read-only diagnostic advice."
     else:
-        source_note = "general knowledge"
-        if live_data:
-            source_note = "live data"
-        elif memory.get("prior_vehicle_checks") or memory.get("dtc_history"):
-            source_note = "stored history"
-
         answer = (
-            f"Read-only AI Mechanic response ({source_note}). "
-            f"Vehicle: {context['current_vehicle'] or 'Not selected'}. "
-            f"VIN: {context['vin'] or 'Unavailable'}. "
-            "I can explain DTCs, current behavior, and next safe tests, but I cannot run controls, actuators, replay commands, or clear codes. "
-            f"Question: {question}"
+            f"Confirmed facts: active vehicle is {context.get('current_vehicle') or 'not selected'}, "
+            f"VIN is {context.get('vin') or 'not available'}, and mode is {context.get('current_mode')}. "
+            "Likely causes: based on DTCs + live data patterns in this check only. "
+            "Suggested next checks: I will recommend safe read-only tests and observations. "
+            "Uncertainty: any conclusion with limited evidence will be labeled suspected/likely/monitor only. "
+            f"Question received: {question}"
         )
+
+    request_record = {
+        "question": question,
+        "session_id": active["session_id"],
+        "vehicle_id": vehicle_id,
+        "used_live_data": bool(context.get("recent_live_sensor_readings")),
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+    }
+    store.last_ai_request = request_record
+
+    response_record = store.add_ai_response(AIResponseRecord(
+        session_id=active["session_id"],
+        vehicle_id=vehicle_id,
+        question=question,
+        answer=answer,
+        response_basis=response_basis,
+        used_live_data=bool(context.get("recent_live_sensor_readings")),
+        proactive=False,
+        context_summary={
+            "stored_dtcs": len(context.get("stored_dtcs", [])),
+            "pending_dtcs": len(context.get("pending_dtcs", [])),
+            "recent_live_points": len(context.get("recent_live_sensor_readings", [])),
+        },
+    ))
+
+    timeline = store.add_timeline_event(DiagnosticTimelineEvent(
+        session_id=active["session_id"],
+        event_type="ai_advice_generated",
+        title="AI advice generated",
+        detail=f"AI Mechanic answered: {question or 'quick-open'}",
+        source="ai",
+        linked_ai_response_id=response_record.response_id,
+        metadata={"response_basis": response_basis, "used_live_data": bool(context.get("recent_live_sensor_readings"))},
+    ))
 
     return {
         "answer": answer,
         "context": context,
-        "response_basis": "live_data" if live_data else ("stored_history" if memory.get("prior_vehicle_checks") else "general_knowledge"),
+        "response_basis": response_basis,
         "read_only_enforced": True,
+        "conversation_history": [r.model_dump() for r in store.get_ai_responses(active["session_id"])][-20:],
+        "proactive_alerts": proactive_alerts,
+        "timeline_event_id": timeline.timeline_event_id,
+        "debug": {
+            "last_ai_request": store.last_ai_request,
+            "last_ai_response_timestamp": store.last_ai_response_timestamp,
+            "used_live_data": bool(context.get("recent_live_sensor_readings")),
+            "request_kind": "user-requested" if payload.source == "user" else "proactive",
+            "linked_timeline_event_id": timeline.timeline_event_id,
+        },
     }
 
 
@@ -911,7 +1120,7 @@ def dashboard() -> str:
         <button id="tagEventBtn" class="secondary">Tag Event</button>
         <button id="reportsBtn" class="secondary">Reports</button>
         <button id="liveGaugesBtn" class="secondary">Live Gauges</button>
-        <button id="askAiBtn">Open AI Mechanic (Voice + Text)</button>
+        <button id="askAiBtn">Ask AI Mechanic</button>
       </div>
     </div>
 
@@ -922,16 +1131,25 @@ def dashboard() -> str:
     </div>
 
     <div class="card">
+      <h2 class="title">AI Alerts (Proactive)</h2>
+      <div class="tiny" id="aiAlertSummary">No active alerts.</div>
+      <div id="aiAlertList" class="tiny" style="margin-top:8px;display:grid;gap:6px"></div>
+    </div>
+
+    <div class="card">
+      <h2 class="title">Diagnostic Timeline</h2>
+      <div id="timelineList" class="tiny" style="display:grid;gap:6px"></div>
+    </div>
+
+    <div class="card">
       <h2 class="title">AI Mechanic Quick Prompts</h2>
       <div class="ai-quick">
         <button class="secondary" onclick="openAiWithPrompt('What does this code mean?')">What does this code mean?</button>
         <button class="secondary" onclick="openAiWithPrompt('Is it safe to drive?')">Is it safe to drive?</button>
         <button class="secondary" onclick="openAiWithPrompt('What should I test next?')">What should I test next?</button>
         <button class="secondary" onclick="openAiWithPrompt('Explain this in simple language')">Explain this in simple language</button>
-        <button class="secondary" onclick="openAiWithPrompt('What is my coolant temp?')">What is my coolant temp?</button>
-        <button class="secondary" onclick="openAiWithPrompt('What is my RPM right now?')">What is my RPM right now?</button>
-        <button class="secondary" onclick="openAiWithPrompt('How much fuel is left?')">How much fuel is left?</button>
-        <button class="secondary" onclick="openAiWithPrompt('Summarize this vehicle check')">Summarize this vehicle check</button>
+        <button class="secondary" onclick="openAiWithPrompt('What changed in live data?')">What changed in live data?</button>
+        <button class="secondary" onclick="openAiWithPrompt('What should I watch right now?')">What should I watch right now?</button>
       </div>
     </div>
   </div>
@@ -944,7 +1162,7 @@ async function fetchState(){
   const res = await fetch('/dashboard/state');
   state = await res.json();
   phoneBridge = { ...phoneBridge, ...state.phone_bridge };
-  renderStatusCards(); renderVehicles(); renderBluetoothCard();
+  renderStatusCards(); renderVehicles(); renderBluetoothCard(); renderAiAlerts(); renderTimeline();
 }
 function renderStatusCards(){
   const active = state.active_session;
@@ -952,7 +1170,8 @@ function renderStatusCards(){
     card('Current mode', state.adapter_mode || 'MOCK'),
     card('Bluetooth state', phoneBridge.status || 'disconnected'),
     card('Active vehicle', active ? active.vehicle : selectedVehicleId),
-    card('Active Vehicle Check', active ? active.session_id : 'None')
+    card('Active Vehicle Check', active ? active.session_id : 'None'),
+    card('AI Alerts', (state.ai_alerts||[]).length ? `${state.ai_alerts.length} active` : 'None')
   ].join('');
 }
 function renderVehicles(){
@@ -987,6 +1206,17 @@ function renderBluetoothCard(){
   document.getElementById('btStatusText').textContent = status.charAt(0).toUpperCase() + status.slice(1);
   document.getElementById('btError').textContent = phoneBridge.last_error || 'No Bluetooth errors';
 }
+
+function renderAiAlerts(){
+  const alerts=state.ai_alerts||[];
+  document.getElementById('aiAlertSummary').textContent=alerts.length?`${alerts.length} proactive alert(s) linked to this vehicle check.`:'No active alerts.';
+  document.getElementById('aiAlertList').innerHTML=alerts.slice(-5).reverse().map(a=>`<div><b>${a.title}</b> (${a.confidence}) — ${a.explanation}. Next: ${a.suggested_next_step}</div>`).join('') || '<div>Waiting for live monitoring.</div>';
+}
+function renderTimeline(){
+  const timeline=state.diagnostic_timeline||[];
+  document.getElementById('timelineList').innerHTML=timeline.slice(-8).reverse().map(t=>`<div>${new Date(t.ts).toLocaleTimeString()} — ${t.title}${t.linked_ai_response_id?` <a href="/dashboard/ai" style="color:#0f766e">AI explanation</a>`:''}</div>`).join('') || '<div>No timeline events yet.</div>';
+}
+
 async function ensureSession(){ if (state && state.active_session) return state.active_session; await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})}); await fetchState(); return state.active_session; }
 async function createSession(){ await ensureSession(); }
 async function stopSession(){ await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
@@ -1030,6 +1260,17 @@ let gauges=[0,1,2,3].map(i=>({slot:i+1,sensor:GAUGE_SENSORS[i]||'rpm',label:`Gau
 function gaugeEditor(idx,g){return `<div class="gauge"><h4>${g.label}</h4><div class="grid2"><select data-field="sensor" data-idx="${idx}">${GAUGE_SENSORS.map(s=>`<option value="${s}" ${g.sensor===s?'selected':''}>${s}</option>`).join('')}</select><input data-field="label" data-idx="${idx}" value="${g.label}" placeholder="Label" /><input data-field="unit" data-idx="${idx}" value="${g.unit}" placeholder="Unit" /><input data-field="warn" data-idx="${idx}" type="number" value="${g.warn}" placeholder="Warn" /><input data-field="critical" data-idx="${idx}" type="number" value="${g.critical}" placeholder="Critical" /></div><div class="tiny" id="gaugeLive${idx}">Disconnected</div></div>`;}
 function renderGauges(){const grid=document.getElementById('gaugeGrid');grid.innerHTML=gauges.map((g,i)=>gaugeEditor(i,g)).join('');grid.querySelectorAll('input,select').forEach(el=>el.onchange=(e)=>{const i=Number(e.target.dataset.idx);const f=e.target.dataset.field;gauges[i][f]=e.target.type==='number'?Number(e.target.value):e.target.value;});const reads=(state&&state.recent_reads?state.recent_reads:[]).slice().reverse();gauges.forEach((g,i)=>{const found=reads.find(r=>r.pid_key===g.sensor||r.command===SENSOR_TO_PID[g.sensor]);document.getElementById(`gaugeLive${i}`).textContent=found?`${g.label}: ${found.value ?? found.raw_response} ${g.unit || found.unit || ''} [${found.source_mode}]`:`${g.label}: ${(phoneBridge.status==='connected')?'Waiting for 500ms polling':'Disconnected'}`;});}
 async function fetchState(){const res=await fetch('/dashboard/state');state=await res.json();phoneBridge={...phoneBridge,...state.phone_bridge};renderGauges();}
+
+function renderAiAlerts(){
+  const alerts=state.ai_alerts||[];
+  document.getElementById('aiAlertSummary').textContent=alerts.length?`${alerts.length} proactive alert(s) linked to this vehicle check.`:'No active alerts.';
+  document.getElementById('aiAlertList').innerHTML=alerts.slice(-5).reverse().map(a=>`<div><b>${a.title}</b> (${a.confidence}) — ${a.explanation}. Next: ${a.suggested_next_step}</div>`).join('') || '<div>Waiting for live monitoring.</div>';
+}
+function renderTimeline(){
+  const timeline=state.diagnostic_timeline||[];
+  document.getElementById('timelineList').innerHTML=timeline.slice(-8).reverse().map(t=>`<div>${new Date(t.ts).toLocaleTimeString()} — ${t.title}${t.linked_ai_response_id?` <a href="/dashboard/ai" style="color:#0f766e">AI explanation</a>`:''}</div>`).join('') || '<div>No timeline events yet.</div>';
+}
+
 async function ensureSession(){if(state&&state.active_session)return state.active_session;await fetch('/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vehicle_id:'toyota_sienna_2006'})});await fetchState();return state.active_session;}
 async function pollAllGaugesOnce(){if((phoneBridge.status||'disconnected')!=='connected'){stopGaugePolling();return;}const active=await ensureSession();const jobs=gauges.map(g=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,command:SENSOR_TO_PID[g.sensor],pid_key:g.sensor,source_mode:'PHONE-LIVE',source_hint:'iso9141_2',polling:true,raw_response:'PHONE-NATIVE'})}));await Promise.allSettled(jobs);await fetchState();}
 function startGaugePolling(){if(pollingHandle)return;pollingHandle=setInterval(()=>{pollAllGaugesOnce();},500);} function stopGaugePolling(){if(pollingHandle){clearInterval(pollingHandle);pollingHandle=null;}}
@@ -1089,20 +1330,18 @@ button.secondary{background:#fff;color:#0f172a}
     <input id="question" placeholder="Speak or type your question" />
     <button id="sendBtn" style="margin-top:8px">Send</button>
     <div class="quick" style="margin-top:10px">
-      <button class="secondary" onclick="setPrompt('What is my coolant temp?')">What is my coolant temp?</button>
-      <button class="secondary" onclick="setPrompt('What is my RPM right now?')">What is my RPM right now?</button>
-      <button class="secondary" onclick="setPrompt('How much fuel is left?')">How much fuel is left?</button>
       <button class="secondary" onclick="setPrompt('What does this code mean?')">What does this code mean?</button>
       <button class="secondary" onclick="setPrompt('Is it safe to drive?')">Is it safe to drive?</button>
       <button class="secondary" onclick="setPrompt('What should I test next?')">What should I test next?</button>
       <button class="secondary" onclick="setPrompt('Explain this in simple language')">Explain this in simple language</button>
-      <button class="secondary" onclick="setPrompt('Summarize this vehicle check')">Summarize this vehicle check</button>
+      <button class="secondary" onclick="setPrompt('What changed in live data?')">What changed in live data?</button>
+      <button class="secondary" onclick="setPrompt('What should I watch right now?')">What should I watch right now?</button>
     </div>
   </div>
 
   <div class="card">
     <h3 style="margin-top:0">Conversation</h3>
-    <div id="chat" class="chat"></div>
+    <div class="tiny" id="aiLoading">AI status: idle</div><div id="aiResponse" class="bubble" style="margin-top:8px">Response will appear here.</div><div id="chat" class="chat" style="margin-top:8px"></div>
   </div>
 
   <div class="card"><button class="secondary" id="backBtn">Back to Main Dashboard</button></div>
@@ -1113,10 +1352,10 @@ let recog=null;
 const synth=window.speechSynthesis;
 function pushMsg(role,text){const el=document.createElement('div');el.className='bubble';el.innerHTML=`<b>${role}:</b> ${text}`;document.getElementById('chat').prepend(el);}
 function setPrompt(v){document.getElementById('question').value=v;document.getElementById('transcriptPreview').textContent='Transcript preview: '+v;}
-async function ask(){const q=document.getElementById('question').value.trim();if(!q){return;}pushMsg('You',q);const res=await fetch('/ai/mechanic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});const data=await res.json();lastAnswer=data.answer;pushMsg('AI Mechanic',data.answer+` [source: ${data.response_basis}]`);} 
+async function ask(){const q=document.getElementById('question').value.trim();if(!q){return;}document.getElementById('aiLoading').textContent='AI status: thinking...';pushMsg('You',q);const res=await fetch('/ai/mechanic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,source:'user'})});const data=await res.json();lastAnswer=data.answer;document.getElementById('aiResponse').textContent=data.answer;document.getElementById('aiLoading').textContent='AI status: response ready';pushMsg('AI Mechanic',data.answer+` [source: ${data.response_basis}]`);}
 function speechAvailable(){return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;}
 function initSpeech(){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){document.getElementById('voiceState').textContent='Voice state: unavailable, text fallback active';return;}recog=new SR();recog.lang='en-US';recog.interimResults=true;recog.onstart=()=>document.getElementById('voiceState').textContent='Voice state: listening';recog.onerror=()=>document.getElementById('voiceState').textContent='Voice state: transcription failed, retry or type';recog.onend=()=>document.getElementById('voiceState').textContent='Voice state: idle';recog.onresult=(e)=>{let t='';for(let i=e.resultIndex;i<e.results.length;i++){t+=e.results[i][0].transcript;}document.getElementById('question').value=t.trim();document.getElementById('transcriptPreview').textContent='Transcript preview: '+(t.trim()||'(none)');};}
-function startListening(){if(!recog){initSpeech();}if(recog){recog.start();}}
+function startListening(){if(!recog){const qp=new URLSearchParams(window.location.search).get('prompt'); if(qp){setPrompt(qp);} initSpeech();}if(recog){recog.start();}}
 function stopListening(){if(recog){recog.stop();}}
 function playAnswer(){if(!lastAnswer){return;}if(!synth){pushMsg('System','Voice output unavailable, using text transcript only.');return;}const u=new SpeechSynthesisUtterance(lastAnswer);synth.speak(u);} 
 function stopAnswer(){if(synth){synth.cancel();}}
@@ -1127,7 +1366,7 @@ document.getElementById('stopMicBtn').onclick=stopListening;
 document.getElementById('speakBtn').onclick=playAnswer;
 document.getElementById('stopSpeakBtn').onclick=stopAnswer;
 document.getElementById('backBtn').onclick=()=>window.location.href='/dashboard';
-initSpeech();
+const qp=new URLSearchParams(window.location.search).get('prompt'); if(qp){setPrompt(qp);} initSpeech();
 </script>
 </body>
 </html>

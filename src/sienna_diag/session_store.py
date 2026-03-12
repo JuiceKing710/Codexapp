@@ -3,7 +3,16 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 
-from sienna_diag.models import CommandLearningRecord, EventTag, ReadHistoryItem, Session, VehicleProfile
+from sienna_diag.models import (
+    AIAlertRecord,
+    AIResponseRecord,
+    CommandLearningRecord,
+    DiagnosticTimelineEvent,
+    EventTag,
+    ReadHistoryItem,
+    Session,
+    VehicleProfile,
+)
 
 
 class SessionStore:
@@ -16,6 +25,11 @@ class SessionStore:
         self.command_library: dict[str, dict] = {}
         self.replay_approvals: dict[tuple[str, str], dict] = {}
         self.ai_memory_by_vehicle: dict[str, dict] = defaultdict(dict)
+        self.ai_alerts_by_session: dict[str, list[AIAlertRecord]] = defaultdict(list)
+        self.ai_responses_by_session: dict[str, list[AIResponseRecord]] = defaultdict(list)
+        self.timeline_by_session: dict[str, list[DiagnosticTimelineEvent]] = defaultdict(list)
+        self.last_ai_request: dict | None = None
+        self.last_ai_response_timestamp: str | None = None
         self.knowledge_library: dict[str, dict] = {
             "dtc_definitions": {
                 "P0300": "Random/multiple cylinder misfire detected.",
@@ -75,6 +89,14 @@ class SessionStore:
         session = Session(vehicle_id=profile.vehicle_id, vehicle=profile.label, protocol=profile.protocol_hint)
         self.sessions[session.session_id] = session
         self.active_session_id = session.session_id
+        self.add_timeline_event(
+            DiagnosticTimelineEvent(
+                session_id=session.session_id,
+                event_type="vehicle_check_started",
+                title="Vehicle check started",
+                detail=f"Vehicle check started for {session.vehicle}.",
+            )
+        )
         return session
 
     def assign_session_vin(self, session_id: str, vin: str | None, assignment_source: str) -> Session:
@@ -98,6 +120,14 @@ class SessionStore:
         if self.active_session_id is None:
             return None
         session = self.get_session(self.active_session_id)
+        self.add_timeline_event(
+            DiagnosticTimelineEvent(
+                session_id=session.session_id,
+                event_type="vehicle_check_stopped",
+                title="Vehicle check stopped",
+                detail=f"Vehicle check stopped for {session.vehicle}.",
+            )
+        )
         self.active_session_id = None
         return session
 
@@ -105,6 +135,16 @@ class SessionStore:
         if event.session_id not in self.sessions:
             raise KeyError(event.session_id)
         self.events_by_session[event.session_id].append(event)
+        self.add_timeline_event(
+            DiagnosticTimelineEvent(
+                session_id=event.session_id,
+                event_type="user_tag_event",
+                title="User tag added",
+                detail=f"Tag: {event.tag}. {event.note or ''}".strip(),
+                source="user",
+                metadata={"event_id": event.event_id},
+            )
+        )
         return event
 
     def get_events(self, session_id: str) -> list[EventTag]:
@@ -116,6 +156,18 @@ class SessionStore:
         history = self.reads_by_session[item.session_id]
         history.append(item)
         self.reads_by_session[item.session_id] = history[-200:]
+
+        if item.command in {"03", "07"}:
+            self.add_timeline_event(
+                DiagnosticTimelineEvent(
+                    session_id=item.session_id,
+                    event_type="dtc_detected",
+                    title="DTC data updated",
+                    detail=f"{item.command} returned {item.raw_response}",
+                    related_codes=[str(item.value)] if item.value else [],
+                    metadata={"read_id": item.read_id},
+                )
+            )
         return item
 
     def get_reads(self, session_id: str) -> list[ReadHistoryItem]:
@@ -207,6 +259,40 @@ class SessionStore:
         memory["last_updated"] = datetime.now(timezone.utc).isoformat()
         self.ai_memory_by_vehicle[vehicle_id] = memory
         return memory
+
+    def add_ai_alert(self, item: AIAlertRecord) -> AIAlertRecord:
+        if item.session_id not in self.sessions:
+            raise KeyError(item.session_id)
+        history = self.ai_alerts_by_session[item.session_id]
+        history.append(item)
+        self.ai_alerts_by_session[item.session_id] = history[-200:]
+        return item
+
+    def get_ai_alerts(self, session_id: str) -> list[AIAlertRecord]:
+        return self.ai_alerts_by_session.get(session_id, [])
+
+    def add_ai_response(self, item: AIResponseRecord) -> AIResponseRecord:
+        if item.session_id not in self.sessions:
+            raise KeyError(item.session_id)
+        history = self.ai_responses_by_session[item.session_id]
+        history.append(item)
+        self.ai_responses_by_session[item.session_id] = history[-300:]
+        self.last_ai_response_timestamp = item.created_at.isoformat()
+        return item
+
+    def get_ai_responses(self, session_id: str) -> list[AIResponseRecord]:
+        return self.ai_responses_by_session.get(session_id, [])
+
+    def add_timeline_event(self, item: DiagnosticTimelineEvent) -> DiagnosticTimelineEvent:
+        if item.session_id not in self.sessions:
+            raise KeyError(item.session_id)
+        history = self.timeline_by_session[item.session_id]
+        history.append(item)
+        self.timeline_by_session[item.session_id] = history[-400:]
+        return item
+
+    def get_timeline_events(self, session_id: str) -> list[DiagnosticTimelineEvent]:
+        return self.timeline_by_session.get(session_id, [])
 
 
 store = SessionStore()
