@@ -11,6 +11,8 @@ SAFE_MODES = {
     "09",  # vehicle info
 }
 
+HEX_CHARS = set("0123456789ABCDEF")
+
 BLOCKED_MODES = {
     "04",  # clear DTCs/reset
     "05",  # oxygen sensor monitoring test results (legacy write-risk contexts)
@@ -46,10 +48,18 @@ class SafetyDecision:
 
 class SafetyPolicy:
     @staticmethod
+    def normalize_obd_command(command: str) -> str:
+        return command.strip().replace(" ", "").upper()
+
+    @staticmethod
     def validate_obd_command(command: str) -> SafetyDecision:
-        normalized = command.strip().replace(" ", "").upper()
+        normalized = SafetyPolicy.normalize_obd_command(command)
         if len(normalized) < 2:
             return SafetyDecision(False, "Command too short")
+        if len(normalized) % 2 != 0:
+            return SafetyDecision(False, "OBD command must be full bytes (even number of hex chars)")
+        if not set(normalized).issubset(HEX_CHARS):
+            return SafetyDecision(False, "OBD command must use hexadecimal characters only")
 
         mode = normalized[:2]
         if mode in BLOCKED_MODES:
