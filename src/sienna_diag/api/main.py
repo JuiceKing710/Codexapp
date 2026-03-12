@@ -527,10 +527,20 @@ def dashboard() -> str:
     button, select, input { width:100%; border-radius:12px; border:1px solid var(--line); padding:14px; font-size:1rem; }
     button { background:var(--primary); border-color:var(--primary); color:#fff; font-weight:700; min-height:56px; }
     button:active { transform:scale(0.99); }
+    button:disabled { opacity:0.5; cursor:not-allowed; transform:none; }
     button.secondary { background:#fff; color:var(--ink); border-color:var(--line); }
     button.danger { background:var(--danger); border-color:var(--danger); }
     .pill { display:inline-block; border-radius:999px; padding:6px 10px; font-size:.8rem; font-weight:800; color:#fff; }
     .pill.mock { background:#64748b; } .pill.phone-live { background:#2563eb; } .pill.local-hardware { background:#15803d; }
+    .pill.connected { background:var(--ok); }
+    .pill.connecting { background:#2563eb; }
+    .pill.failed { background:var(--danger); }
+    .pill.disconnected { background:#64748b; }
+    .pill.idle { background:#64748b; }
+    .spinner { display:inline-block; width:14px; height:14px; border:2px solid rgba(255,255,255,0.5); border-top-color:#fff; border-radius:50%; animation:spin 0.8s linear infinite; margin-right:8px; vertical-align:-2px; }
+    .spinner.dark { border-color:rgba(15,23,42,0.2); border-top-color:#0f172a; }
+    .connection-meta { display:grid; gap:6px; margin-top:10px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
     .tiny { font-size:.8rem; color:var(--muted); }
     .gauge-grid { display:grid; gap:10px; grid-template-columns:1fr; }
     .gauge { border:1px solid var(--line); border-radius:12px; padding:10px; background:#fcfdff; }
@@ -570,6 +580,16 @@ def dashboard() -> str:
       </div>
     </div>
 
+    <div class="card" id="bluetoothCard">
+      <h2 class="title">OBDLINK BLUETOOTH</h2>
+      <div class="status-value" id="btStatusText">Disconnected</div>
+      <div class="connection-meta tiny">
+        <div><strong>Adapter:</strong> <span id="btAdapterName">-</span></div>
+        <div><strong>Last attempt:</strong> <span id="btLastAttempt">None</span></div>
+        <div><strong>Error:</strong> <span id="btError">None</span></div>
+      </div>
+    </div>
+
     <div class="card" id="gaugePage">
       <h2 class="title">4-Gauge Presets</h2>
       <div class="grid2">
@@ -598,7 +618,8 @@ def dashboard() -> str:
 <script>
 let state = null;
 let selectedVehicleId = "toyota_sienna_2006";
-let phoneBridge = { status: 'disconnected' };
+let phoneBridge = { status: 'idle', adapter_name: 'OBDLink MX+', last_error: null, backend_status: 'idle', last_attempt_result: 'Not started' };
+let bluetoothDevice = null;
 const SENSOR_TO_PID = {
   rpm: '010C', coolant_temp: '0105', control_module_voltage: '0142', intake_air_temp: '010F', vehicle_speed: '010D', throttle_position: '0111'
 };
@@ -622,6 +643,35 @@ function renderStatusCards() {
     card('Capture status', state.capture_status),
     card('Last successful read', lastRead)
   ].join('');
+}
+
+function setReadButtonsEnabled(enabled){
+  ['readRpmBtn','readCoolantBtn','quickRpmBtn','quickCoolantBtn'].forEach(id => {
+    const btn = document.getElementById(id);
+    if (btn) btn.disabled = !enabled;
+  });
+}
+
+function renderBluetoothCard(){
+  const status = phoneBridge.status || 'disconnected';
+  const statusText = status === 'connecting'
+    ? `<span class="spinner dark"></span>Connecting to OBDLink MX+...`
+    : status.charAt(0).toUpperCase() + status.slice(1);
+  document.getElementById('btStatusText').innerHTML = statusText;
+  document.getElementById('btAdapterName').textContent = phoneBridge.adapter_name || 'Not found';
+  document.getElementById('btLastAttempt').textContent = phoneBridge.last_attempt_result || 'None';
+  document.getElementById('btError').textContent = phoneBridge.last_error || 'None';
+  setReadButtonsEnabled(status === 'connected');
+
+  const connectBtn = document.getElementById('connectVehicleBtn');
+  connectBtn.disabled = status === 'connecting';
+  if (status === 'connecting') {
+    connectBtn.innerHTML = '<span class="spinner"></span>Connecting...';
+  } else if (status === 'connected') {
+    connectBtn.textContent = 'Reconnect Vehicle';
+  } else {
+    connectBtn.textContent = 'Connect Vehicle';
+  }
 }
 
 function renderVehicles(){
@@ -680,7 +730,7 @@ function renderDebug(){
     last_raw_pid_command: phoneBridge.last_command,
     last_raw_pid_response: phoneBridge.last_response,
     backend_status: phoneBridge.backend_status,
-    mode_badge: state.adapter_mode,
+    mode_badge: phoneBridge.status === 'connected' ? 'PHONE-LIVE READY' : state.adapter_mode,
     last_error: phoneBridge.last_error,
     latency_ms: phoneBridge.last_latency_ms,
     active_session: state.active_session
@@ -691,8 +741,12 @@ function renderDebug(){
 async function fetchState(){
   const res = await fetch('/dashboard/state');
   state = await res.json();
-  phoneBridge = state.phone_bridge || phoneBridge;
-  renderStatusCards(); renderVehicles(); renderGauges(); renderReports(); renderDebug();
+  phoneBridge = {
+    ...state.phone_bridge,
+    ...phoneBridge,
+    status: phoneBridge.status || state.phone_bridge?.status || 'idle',
+  };
+  renderStatusCards(); renderVehicles(); renderBluetoothCard(); renderGauges(); renderReports(); renderDebug();
 }
 async function ensureSession(){
   if (state.active_session) return state.active_session;
@@ -708,9 +762,61 @@ async function stopCapture(){ await fetch('/capture/stop',{method:'POST'}); awai
 async function tagEvent(){ if (!state.active_session) { alert('Session missing: create/resume session first.'); return; } await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:'idle'})}); await fetchState(); }
 
 async function connectVehicle(){
-  await fetch('/phone/bridge/connect',{method:'POST'});
-  await ensureSession();
-  await fetchState();
+  phoneBridge.status = 'connecting';
+  phoneBridge.last_error = null;
+  phoneBridge.backend_status = 'connecting';
+  phoneBridge.last_attempt_result = `Attempt started @ ${new Date().toLocaleTimeString()}`;
+  renderStatusCards(); renderBluetoothCard(); renderDebug();
+
+  if (!('bluetooth' in navigator)) {
+    phoneBridge.status = 'failed';
+    phoneBridge.last_error = 'Bluetooth unavailable in this browser. Use Chrome on Android and enable Bluetooth.';
+    phoneBridge.backend_status = 'unavailable';
+    phoneBridge.last_attempt_result = 'Failed: Bluetooth unavailable';
+    renderStatusCards(); renderBluetoothCard(); renderDebug();
+    return;
+  }
+
+  try {
+    bluetoothDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ name: 'OBDLink MX+' }, { namePrefix: 'OBDLink' }],
+      optionalServices: []
+    });
+
+    phoneBridge.adapter_name = bluetoothDevice.name || 'OBDLink adapter';
+    if (bluetoothDevice.gatt) {
+      await bluetoothDevice.gatt.connect();
+    }
+
+    bluetoothDevice.addEventListener('gattserverdisconnected', () => {
+      phoneBridge.status = 'disconnected';
+      phoneBridge.backend_status = 'disconnected';
+      phoneBridge.last_attempt_result = `Disconnected @ ${new Date().toLocaleTimeString()}`;
+      renderStatusCards(); renderBluetoothCard(); renderDebug();
+    });
+
+    phoneBridge.status = 'connected';
+    phoneBridge.last_error = null;
+    phoneBridge.backend_status = 'connected';
+    phoneBridge.last_attempt_result = `Connected to ${phoneBridge.adapter_name} @ ${new Date().toLocaleTimeString()}`;
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    const missingPermission = err && (err.name === 'NotAllowedError' || err.name === 'SecurityError');
+    phoneBridge.status = 'failed';
+    phoneBridge.backend_status = 'failed';
+    if (missingPermission) {
+      phoneBridge.last_error = `Bluetooth permission denied. Enable Bluetooth permissions and location, then retry. (${message})`;
+      phoneBridge.last_attempt_result = 'Failed: permission missing';
+    } else if (err && err.name === 'NotFoundError') {
+      phoneBridge.last_error = 'OBDLink MX+ not found. Power the adapter and keep it in pairing range.';
+      phoneBridge.last_attempt_result = 'Failed: adapter not found';
+    } else {
+      phoneBridge.last_error = message;
+      phoneBridge.last_attempt_result = 'Failed: unexpected connection error';
+    }
+  }
+
+  renderStatusCards(); renderBluetoothCard(); renderDebug();
 }
 
 async function sendPhoneLiveRead(sensorKey){
@@ -752,6 +858,7 @@ document.getElementById('quickRpmBtn').onclick = () => sendPhoneLiveRead('rpm');
 document.getElementById('quickCoolantBtn').onclick = () => sendPhoneLiveRead('coolant_temp');
 document.getElementById('savePresetBtn').onclick = savePreset;
 document.getElementById('loadPresetBtn').onclick = loadPreset;
+setReadButtonsEnabled(false);
 setInterval(fetchState, 1500);
 fetchState();
 </script>
