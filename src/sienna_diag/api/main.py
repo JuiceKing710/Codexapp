@@ -659,14 +659,18 @@ def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
         reads = [item.model_dump() for item in store.get_reads(store.active_session_id)]
     has_live_read = _latest_phone_live_read(reads) is not None
 
-    _touch_phone_bridge(status=payload.status, error=None)
+    _touch_phone_bridge(status=payload.status, error=payload.fallback_reason if payload.status == "failed" else None)
     phone_bridge_state["platform"] = payload.platform
     phone_bridge_state["adapter_name"] = payload.adapter_name
     phone_bridge_state["permission_state"] = payload.permission_state or "unknown"
     phone_bridge_state["source_mode"] = payload.source_mode
     phone_bridge_state["supports_native_bluetooth"] = payload.supports_native_bluetooth
     phone_bridge_state["fallback_reason"] = payload.fallback_reason
-    phone_bridge_state["backend_status"] = "awaiting-live-read" if payload.status == "connected" and not has_live_read else "phone-managed"
+    phone_bridge_state["backend_status"] = (
+        "connection-failed"
+        if payload.status == "failed"
+        else ("awaiting-live-read" if payload.status == "connected" and not has_live_read else "phone-managed")
+    )
     phone_bridge_state["polling_state"] = "starting" if payload.status == "connected" else "inactive"
     phone_bridge_state["last_backend_acceptance_status"] = "pending" if payload.status == "connected" and not has_live_read else phone_bridge_state.get("last_backend_acceptance_status")
     phone_bridge_state["last_ingest_status"] = "idle" if payload.status == "connected" else phone_bridge_state.get("last_ingest_status")
@@ -1152,7 +1156,6 @@ def dashboard_state() -> dict:
         "learning_records": learning_records[-40:],
         "learning_library": store.command_library,
         "vehicle_image": _resolve_vehicle_image(active.get("vehicle_id") if active else None),
-        "ai_alerts": alerts,
         "ai_monitoring": ai_monitoring,
         "vehicle_visualization": {"component_groups": VEHICLE_COMPONENT_GROUPS, "highlight": vehicle_visualization_state},
         "ai_alerts": [item.model_dump() for item in store.get_ai_alerts(active["session_id"])] if active else [],
@@ -1638,6 +1641,46 @@ let livePollingHandle = null;
 let livePollingInFlight = false;
 const SENSOR_TO_PID = { rpm:'010C', coolant_temp:'0105', control_module_voltage:'0142', vehicle_speed:'010D' };
 const LIVE_SENSOR_ORDER = ['rpm', 'coolant_temp', 'control_module_voltage', 'vehicle_speed'];
+function getMobileBluetoothService(){ return window.MobileBluetoothService || null; }
+function normalizeConnectPayload(payload){
+  const serviceAvailable = Boolean(getMobileBluetoothService());
+  return {
+    platform: payload?.platform || 'unknown',
+    adapter_name: payload?.adapter_name || payload?.adapterName || 'OBDLink MX+',
+    status: payload?.status || (serviceAvailable ? 'connected' : 'failed'),
+    permission_state: payload?.permission_state || payload?.permissionState || null,
+    source_mode: payload?.source_mode || payload?.sourceMode || 'PHONE-LIVE',
+    supports_native_bluetooth: payload?.supports_native_bluetooth ?? payload?.supportsNativeBluetooth ?? serviceAvailable,
+    fallback_reason: payload?.fallback_reason || payload?.fallbackReason || (serviceAvailable ? null : 'native-service-unavailable'),
+  };
+}
+async function readNativePid(sensor){
+  const service = getMobileBluetoothService();
+  if(!service || typeof service.readPid !== 'function'){ return null; }
+  try {
+    const nativeRead = await service.readPid(SENSOR_TO_PID[sensor]);
+    if(!nativeRead){ return null; }
+    const rawResponse = nativeRead.raw_response || nativeRead.rawResponse || null;
+    if(!rawResponse){ return null; }
+    return {
+      command: SENSOR_TO_PID[sensor],
+      pid_key: sensor,
+      source_mode: nativeRead.source_mode || nativeRead.sourceMode || 'PHONE-LIVE',
+      source_hint: nativeRead.source_hint || nativeRead.sourceHint || 'iso9141_2',
+      raw_response: rawResponse,
+      value: nativeRead.value ?? null,
+      unit: nativeRead.unit ?? null,
+      latency_ms: nativeRead.latency_ms ?? nativeRead.latencyMs ?? null,
+      error: nativeRead.error ?? null,
+      backend_status: nativeRead.backend_status || nativeRead.backendStatus || undefined,
+      ts: nativeRead.ts || nativeRead.timestamp || undefined,
+    };
+  } catch (error) {
+    phoneBridge = { ...phoneBridge, last_error: error?.message || 'native-read-failed' };
+    renderBluetoothCard();
+    return null;
+  }
+}
 
 function card(label, value){ return `<div class="card status-card"><div class="status-label">${label}</div><div class="status-value">${value || '-'}</div></div>`; }
 function webglAvailable(){ try { const c=document.createElement('canvas'); return !!window.WebGLRenderingContext && !!(c.getContext('webgl') || c.getContext('experimental-webgl')); } catch { return false; } }
@@ -1698,13 +1741,13 @@ async function fetchState(){
 }
 function renderStatusCards(){ const active = state.active_session; document.getElementById('statusCards').innerHTML = [card('Current mode', state.current_mode || state.adapter_mode || 'MOCK'),card('Bluetooth state', phoneBridge.status || 'disconnected'),card('Active vehicle', active ? active.vehicle : selectedVehicleId),card('Active Vehicle Check', active ? active.session_id : 'None'),card('AI Alerts', (state.ai_alerts||[]).length ? `${state.ai_alerts.length} active` : 'None')].join(''); }
 function renderVehicles(){ const select = document.getElementById('vehicleSelect'); select.innerHTML=''; state.vehicles.forEach(v => { const opt=document.createElement('option'); opt.value=v.vehicle_id; opt.textContent=`${v.label} (${v.protocol_hint})`; if (v.vehicle_id===selectedVehicleId) opt.selected=true; select.appendChild(opt); }); select.onchange=async (e)=>{ selectedVehicleId=e.target.value; await updateVehicleImage(); }; updateVehicleImage(); }
-async function updateVehicleImage(){ const res = await fetch(`/vehicle-image/current?manual_vehicle_id=${encodeURIComponent(selectedVehicleId)}`); const image = await res.json(); const trim = image.trim ? ` ${image.trim}` : ''; const label = `${image.year || ''} ${image.make} ${image.model}${trim}`.replace(/\s+/g,' ').trim(); document.getElementById('vehicleImageLabel').textContent = label || 'Generic vehicle'; const sourceMap = {auto_vin: 'Auto VIN detection result',manual_selection: 'Manual vehicle selection fallback',active_session_vehicle: 'Active session vehicle fallback',closest_supported: 'Closest supported vehicle image fallback',generic_placeholder: 'Generic placeholder image'}; const img = document.getElementById('vehicleImageAsset'); img.src = image.image_asset_path || image.fallback_image_asset_path; img.onerror = () => { img.src = image.fallback_image_asset_path; }; if(!vehicleRenderer){ buildGenericVehicleViewer(); } if(!vehicleRenderer){ showFallbackImage((sourceMap[image.resolved_from] || image.resolved_from)+' — WebGL fallback image'); } else { document.getElementById('vehicleImageSource').textContent='3D view active · tap a component to inspect'; } }
-function renderBluetoothCard(){ const status = phoneBridge.status || 'disconnected'; document.getElementById('btStatusText').textContent = status.charAt(0).toUpperCase() + status.slice(1); document.getElementById('btError').textContent = phoneBridge.last_error || 'No Bluetooth errors'; const debugLines = [`Bluetooth connected: ${phoneBridge.bluetooth_connected ? 'true' : 'false'}`,`Polling active: ${phoneBridge.polling_active ? 'true' : 'false'} (${phoneBridge.polling_state || 'inactive'})`,`First live read received: ${phoneBridge.first_live_read_received ? 'true' : 'false'}`,`Current source_mode: ${phoneBridge.current_source_mode || phoneBridge.source_mode || 'unknown'}`,`Last live PID command: ${phoneBridge.last_live_pid_command || 'None'}`,`Last live PID response: ${phoneBridge.last_live_pid_response || 'None'}`,`Last ingest status: ${phoneBridge.last_ingest_status || 'idle'}`,`Backend acceptance: ${phoneBridge.backend_acceptance_status || 'idle'}`,`Last ingest error: ${phoneBridge.last_ingest_error || 'None'}`]; if((state.current_mode || phoneBridge.current_mode) === 'MOCK'){ debugLines.push(`MOCK reason: ${phoneBridge.mock_reason || state.current_mode_reason || 'Unknown'}`); } document.getElementById('btDebug').innerHTML = debugLines.map(line => `<div>${line}</div>`).join(''); }
+async function updateVehicleImage(){ const res = await fetch(`/vehicle-image/current?manual_vehicle_id=${encodeURIComponent(selectedVehicleId)}`); const image = await res.json(); const trim = image.trim ? ` ${image.trim}` : ''; const label = `${image.year || ''} ${image.make} ${image.model}${trim}`.replace(/\\s+/g,' ').trim(); document.getElementById('vehicleImageLabel').textContent = label || 'Generic vehicle'; const sourceMap = {auto_vin: 'Auto VIN detection result',manual_selection: 'Manual vehicle selection fallback',active_session_vehicle: 'Active session vehicle fallback',closest_supported: 'Closest supported vehicle image fallback',generic_placeholder: 'Generic placeholder image'}; const img = document.getElementById('vehicleImageAsset'); img.src = image.image_asset_path || image.fallback_image_asset_path; img.onerror = () => { img.src = image.fallback_image_asset_path; }; if(!vehicleRenderer){ buildGenericVehicleViewer(); } if(!vehicleRenderer){ showFallbackImage((sourceMap[image.resolved_from] || image.resolved_from)+' — WebGL fallback image'); } else { document.getElementById('vehicleImageSource').textContent='3D view active · tap a component to inspect'; } }
+function renderBluetoothCard(){ const status = phoneBridge.status || 'disconnected'; document.getElementById('btStatusText').textContent = status.charAt(0).toUpperCase() + status.slice(1); document.getElementById('btError').textContent = phoneBridge.last_error || 'No Bluetooth errors'; const debugLines = [`Bluetooth connected: ${phoneBridge.bluetooth_connected ? 'true' : 'false'}`,`Polling active: ${phoneBridge.polling_active ? 'true' : 'false'} (${phoneBridge.polling_state || 'inactive'})`,`First live read received: ${phoneBridge.first_live_read_received ? 'true' : 'false'}`,`Current source_mode: ${phoneBridge.current_source_mode || phoneBridge.source_mode || 'unknown'}`,`Last live PID command: ${phoneBridge.last_live_pid_command || 'None'}`,`Last live PID response: ${phoneBridge.last_live_pid_response || 'None'}`,`Last ingest status: ${phoneBridge.last_ingest_status || 'idle'}`,`Backend acceptance: ${phoneBridge.backend_acceptance_status || 'idle'}`,`Last ingest error: ${phoneBridge.last_ingest_error || 'None'}`]; if(phoneBridge.fallback_reason){ debugLines.push(`Fallback reason: ${phoneBridge.fallback_reason}`); } if((state.current_mode || phoneBridge.current_mode) === 'MOCK'){ debugLines.push(`MOCK reason: ${phoneBridge.mock_reason || state.current_mode_reason || 'Unknown'}`); } document.getElementById('btDebug').innerHTML = debugLines.map(line => `<div>${line}</div>`).join(''); }
 function renderAiAlerts(){ const alerts=state.ai_alerts||[]; const monitoring=state.ai_monitoring||{active:false,message:'Waiting for live monitoring.'}; document.getElementById('aiAlertSummary').textContent=alerts.length?`${alerts.length} proactive alert(s) linked to this vehicle check.`:(monitoring.active?'Live monitoring active.':'No active alerts.'); document.getElementById('aiAlertList').innerHTML=alerts.slice(-5).reverse().map(a=>`<div><b>${a.title}</b> (${a.confidence}) — ${a.explanation}. Next: ${a.suggested_next_step}</div>`).join('') || `<div>${monitoring.message}</div>`; }
 function renderTimeline(){ const timeline=state.diagnostic_timeline||[]; document.getElementById('timelineList').innerHTML=timeline.slice(-8).reverse().map(t=>`<div>${new Date(t.ts).toLocaleTimeString()} — ${t.title}${t.linked_ai_response_id?` <a href="/dashboard/ai" style="color:#0f766e">AI explanation</a>`:''}</div>`).join('') || '<div>No timeline events yet.</div>'; }
 async function ensureSession(){ if (state && state.active_session) return state.active_session; await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})}); await fetchState(); return state.active_session; }
 async function createSession(){ await ensureSession(); }
-async function pollLiveSensorsOnce(){ if(livePollingInFlight){return;} if((phoneBridge.status||'disconnected')!=='connected'){stopLivePolling();return;} const active=await ensureSession(); livePollingInFlight=true; try { const jobs=LIVE_SENSOR_ORDER.map(sensor=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,command:SENSOR_TO_PID[sensor],pid_key:sensor,source_mode:'PHONE-LIVE',source_hint:'iso9141_2',polling:true,raw_response:'PHONE-NATIVE'})})); await Promise.allSettled(jobs); } finally { livePollingInFlight=false; await fetchState(); } }
+async function pollLiveSensorsOnce(){ if(livePollingInFlight){return;} if((phoneBridge.status||'disconnected')!=='connected'){stopLivePolling();return;} const service=getMobileBluetoothService(); if(!service || typeof service.readPid !== 'function'){ await fetchState(); return; } const active=await ensureSession(); livePollingInFlight=true; try { const nativeReads=await Promise.allSettled(LIVE_SENSOR_ORDER.map(sensor=>readNativePid(sensor))); const ingestJobs=nativeReads.filter(result=>result.status==='fulfilled'&&result.value).map(result=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,...result.value,polling:true})})); if(ingestJobs.length){ await Promise.allSettled(ingestJobs); } } finally { livePollingInFlight=false; await fetchState(); } }
 function startLivePolling(){ if(livePollingHandle){return;} pollLiveSensorsOnce(); livePollingHandle=setInterval(()=>{pollLiveSensorsOnce();},500); }
 function stopLivePolling(){ if(livePollingHandle){ clearInterval(livePollingHandle); livePollingHandle=null; } }
 function syncLivePolling(){ if((phoneBridge.status||'disconnected')==='connected' && state?.active_session && (phoneBridge.polling_state||'inactive')!=='inactive'){ startLivePolling(); return; } stopLivePolling(); }
@@ -1712,7 +1755,7 @@ async function stopSession(){ stopLivePolling(); await fetch('/sessions/active/s
 async function startCapture(){ await ensureSession(); await fetch('/capture/start',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId,preset:'cold_start_capture'})}); await fetchState(); }
 async function stopCapture(){ await fetch('/capture/stop',{method:'POST'}); await fetchState(); }
 async function tagEvent(){ if (!state.active_session) { alert('Vehicle Check missing: start Vehicle Check first.'); return; } await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:'idle'})}); await fetchState(); }
-async function connectVehicle(){ await ensureSession(); await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ platform:'unknown', adapter_name:'OBDLink MX+', status:'connected', source_mode:'PHONE-LIVE', supports_native_bluetooth:true }) }); await fetchState(); startLivePolling(); }
+async function connectVehicle(){ const service=getMobileBluetoothService(); let connectPayload; try { connectPayload = normalizeConnectPayload(service && typeof service.connectToAdapter==='function' ? await service.connectToAdapter() : null); } catch (error) { connectPayload = normalizeConnectPayload({status:'failed',fallback_reason:error?.message || 'native-connect-failed'}); } await ensureSession(); await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(connectPayload) }); await fetchState(); if(connectPayload.status==='connected'){ startLivePolling(); } }
 async function syncHighlight(action,component,system,source='user'){ await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,component,system,source})}); }
 async function explainSelected(){ const comp=document.getElementById('componentExplainBtn').dataset.component; if(!comp){return;} const res=await fetch(`/vehicle-visualization/explain?component=${encodeURIComponent(comp)}`); const data=await res.json(); alert(`${data.component.replace(/_/g,' ')}: ${data.explanation}`); }
 function openAiWithPrompt(prompt){ window.location.href = `/dashboard/ai?prompt=${encodeURIComponent(prompt || '')}`; }
@@ -1749,6 +1792,33 @@ let state=null; let pollingHandle=null; let pollingInFlight=false; let phoneBrid
 const SENSOR_TO_PID={rpm:'010C',coolant_temp:'0105',control_module_voltage:'0142',intake_air_temp:'010F',vehicle_speed:'010D',throttle_position:'0111'};
 const GAUGE_SENSORS=['rpm','coolant_temp','control_module_voltage','vehicle_speed','throttle_position','intake_air_temp'];
 let gauges=[0,1,2,3].map(i=>({slot:i+1,sensor:GAUGE_SENSORS[i]||'rpm',label:`Gauge ${i+1}`,min:0,max:8000,unit:'',warn:4500,critical:6000}));
+function getMobileBluetoothService(){ return window.MobileBluetoothService || null; }
+async function readNativePid(sensor){
+  const service = getMobileBluetoothService();
+  if(!service || typeof service.readPid !== 'function'){ return null; }
+  try {
+    const nativeRead = await service.readPid(SENSOR_TO_PID[sensor]);
+    if(!nativeRead){ return null; }
+    const rawResponse = nativeRead.raw_response || nativeRead.rawResponse || null;
+    if(!rawResponse){ return null; }
+    return {
+      command: SENSOR_TO_PID[sensor],
+      pid_key: sensor,
+      source_mode: nativeRead.source_mode || nativeRead.sourceMode || 'PHONE-LIVE',
+      source_hint: nativeRead.source_hint || nativeRead.sourceHint || 'iso9141_2',
+      raw_response: rawResponse,
+      value: nativeRead.value ?? null,
+      unit: nativeRead.unit ?? null,
+      latency_ms: nativeRead.latency_ms ?? nativeRead.latencyMs ?? null,
+      error: nativeRead.error ?? null,
+      backend_status: nativeRead.backend_status || nativeRead.backendStatus || undefined,
+      ts: nativeRead.ts || nativeRead.timestamp || undefined,
+    };
+  } catch (error) {
+    phoneBridge = { ...phoneBridge, last_error: error?.message || 'native-read-failed' };
+    return null;
+  }
+}
 function gaugeEditor(idx,g){return `<div class="gauge"><h4>${g.label}</h4><div class="grid2"><select data-field="sensor" data-idx="${idx}">${GAUGE_SENSORS.map(s=>`<option value="${s}" ${g.sensor===s?'selected':''}>${s}</option>`).join('')}</select><input data-field="label" data-idx="${idx}" value="${g.label}" placeholder="Label" /><input data-field="unit" data-idx="${idx}" value="${g.unit}" placeholder="Unit" /><input data-field="warn" data-idx="${idx}" type="number" value="${g.warn}" placeholder="Warn" /><input data-field="critical" data-idx="${idx}" type="number" value="${g.critical}" placeholder="Critical" /></div><div class="tiny" id="gaugeLive${idx}">Disconnected</div></div>`;}
 function renderGauges(){const grid=document.getElementById('gaugeGrid');grid.innerHTML=gauges.map((g,i)=>gaugeEditor(i,g)).join('');grid.querySelectorAll('input,select').forEach(el=>el.onchange=(e)=>{const i=Number(e.target.dataset.idx);const f=e.target.dataset.field;gauges[i][f]=e.target.type==='number'?Number(e.target.value):e.target.value;});const reads=(state&&state.recent_reads?state.recent_reads:[]).slice().reverse();gauges.forEach((g,i)=>{const found=reads.find(r=>r.pid_key===g.sensor||r.command===SENSOR_TO_PID[g.sensor]);document.getElementById(`gaugeLive${i}`).textContent=found?`${g.label}: ${found.value ?? found.raw_response} ${g.unit || found.unit || ''} [${found.source_mode}]`:`${g.label}: ${(phoneBridge.status==='connected')?'Waiting for 500ms polling':'Disconnected'}`;});}
 async function fetchState(){const res=await fetch('/dashboard/state');state=await res.json();phoneBridge={...phoneBridge,...state.phone_bridge};renderGauges();syncGaugePolling();}
@@ -1765,7 +1835,7 @@ function renderTimeline(){
 }
 
 async function ensureSession(){if(state&&state.active_session)return state.active_session;await fetch('/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vehicle_id:'toyota_sienna_2006'})});await fetchState();return state.active_session;}
-async function pollAllGaugesOnce(){if(pollingInFlight){return;}if((phoneBridge.status||'disconnected')!=='connected'){stopGaugePolling();return;}const active=await ensureSession();pollingInFlight=true;try{const jobs=gauges.map(g=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,command:SENSOR_TO_PID[g.sensor],pid_key:g.sensor,source_mode:'PHONE-LIVE',source_hint:'iso9141_2',polling:true,raw_response:'PHONE-NATIVE'})}));await Promise.allSettled(jobs);}finally{pollingInFlight=false;await fetchState();}}
+async function pollAllGaugesOnce(){if(pollingInFlight){return;}if((phoneBridge.status||'disconnected')!=='connected'){stopGaugePolling();return;}const service=getMobileBluetoothService();if(!service||typeof service.readPid!=='function'){await fetchState();return;}const active=await ensureSession();pollingInFlight=true;try{const nativeReads=await Promise.allSettled(gauges.map(g=>readNativePid(g.sensor)));const ingestJobs=nativeReads.filter(result=>result.status==='fulfilled'&&result.value).map(result=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,...result.value,polling:true})}));if(ingestJobs.length){await Promise.allSettled(ingestJobs);}}finally{pollingInFlight=false;await fetchState();}}
 function startGaugePolling(){if(pollingHandle)return;pollAllGaugesOnce();pollingHandle=setInterval(()=>{pollAllGaugesOnce();},500);} function stopGaugePolling(){if(pollingHandle){clearInterval(pollingHandle);pollingHandle=null;}}
 function syncGaugePolling(){if((phoneBridge.status||'disconnected')==='connected'&&state?.active_session&&(phoneBridge.polling_state||'inactive')!=='inactive'){startGaugePolling();return;}stopGaugePolling();}
 function savePreset(){const name=document.getElementById('presetName').value||'Default';localStorage.setItem(`gaugePreset:${name}`,JSON.stringify(gauges));}
