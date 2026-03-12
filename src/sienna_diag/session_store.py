@@ -28,6 +28,8 @@ class SessionStore:
         self.ai_alerts_by_session: dict[str, list[AIAlertRecord]] = defaultdict(list)
         self.ai_responses_by_session: dict[str, list[AIResponseRecord]] = defaultdict(list)
         self.timeline_by_session: dict[str, list[DiagnosticTimelineEvent]] = defaultdict(list)
+        self.guided_diagnosis_plans_by_session: dict[str, dict] = {}
+        self.guided_diagnosis_results_by_session: dict[str, list[dict]] = defaultdict(list)
         self.last_ai_request: dict | None = None
         self.last_ai_response_timestamp: str | None = None
         self.knowledge_library: dict[str, dict] = {
@@ -293,6 +295,27 @@ class SessionStore:
 
     def get_timeline_events(self, session_id: str) -> list[DiagnosticTimelineEvent]:
         return self.timeline_by_session.get(session_id, [])
+
+
+    def set_guided_diagnosis_plan(self, session_id: str, plan: dict) -> dict:
+        if session_id not in self.sessions:
+            raise KeyError(session_id)
+        self.guided_diagnosis_plans_by_session[session_id] = plan
+        return plan
+
+    def get_guided_diagnosis_plan(self, session_id: str) -> dict | None:
+        return self.guided_diagnosis_plans_by_session.get(session_id)
+
+    def add_guided_diagnosis_result(self, session_id: str, result: dict) -> dict:
+        if session_id not in self.sessions:
+            raise KeyError(session_id)
+        history = self.guided_diagnosis_results_by_session[session_id]
+        history.append(result)
+        self.guided_diagnosis_results_by_session[session_id] = history[-150:]
+        return result
+
+    def get_guided_diagnosis_results(self, session_id: str) -> list[dict]:
+        return self.guided_diagnosis_results_by_session.get(session_id, [])
 
 
 store = SessionStore()

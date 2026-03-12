@@ -18,6 +18,8 @@ from sienna_diag.models import (
     CommandLearningRecord,
     DiagnosticTimelineEvent,
     EventTag,
+    GuidedDiagnosisResultSubmitRequest,
+    GuidedDiagnosisRunRequest,
     CaptureStartRequest,
     CaptureTagRequest,
     OBDReadRequest,
@@ -787,6 +789,84 @@ def current_vehicle_image(manual_vehicle_id: str | None = None) -> dict:
     return _resolve_vehicle_image(manual_vehicle_id)
 
 
+def _compute_vehicle_health_score(reads: list[dict], alerts: list[dict]) -> dict:
+    latest = _latest_values(reads, ["rpm", "coolant_temp", "control_module_voltage"])
+    score = 100
+    factors = []
+
+    dtc_count = sum(1 for item in reads if item.get("command") in {"03", "07"})
+    if dtc_count:
+        penalty = min(30, dtc_count * 8)
+        score -= penalty
+        factors.append(f"DTC activity penalty -{penalty}")
+
+    coolant = latest.get("coolant_temp", {}).get("value")
+    if isinstance(coolant, (int, float)) and coolant >= 108:
+        score -= 18
+        factors.append("Coolant temperature elevated")
+
+    voltage = latest.get("control_module_voltage", {}).get("value")
+    if isinstance(voltage, (int, float)) and (voltage < 12.2 or voltage > 15.1):
+        score -= 14
+        factors.append("Control module voltage unstable")
+
+    rpm = latest.get("rpm", {}).get("value")
+    if isinstance(rpm, (int, float)) and rpm > 3500:
+        score -= 6
+        factors.append("RPM outlier observed")
+
+    if alerts:
+        penalty = min(20, len(alerts) * 5)
+        score -= penalty
+        factors.append(f"AI alert activity penalty -{penalty}")
+
+    score = max(0, min(100, int(score)))
+    status = "good" if score >= 80 else ("watch" if score >= 60 else "service recommended")
+    return {"score": score, "status": status, "factors": factors}
+
+
+def _vehicle_intelligence_core_snapshot(active: dict | None, reads: list[dict], events: list[dict], alerts: list[dict]) -> dict:
+    latest = _latest_values(reads, ["rpm", "coolant_temp", "fuel_level", "control_module_voltage", "vehicle_speed", "throttle_position", "intake_air_temp"])
+    dtc_stored = [r for r in reads if r.get("command") == "03" or r.get("pid_key") == "dtc_stored"][-10:]
+    dtc_pending = [r for r in reads if r.get("command") == "07" or r.get("pid_key") == "dtc_pending"][-10:]
+    freeze = [r for r in reads if r.get("pid_key") == "freeze_frame" or r.get("command") == "020C"][-5:]
+    readiness = [r for r in reads if r.get("pid_key") == "readiness_status" or r.get("command") == "0101"][-5:]
+    plan = store.get_guided_diagnosis_plan(active["session_id"]) if active else None
+    results = store.get_guided_diagnosis_results(active["session_id"]) if active else []
+    return {
+        "vehicle_identity_manager": {
+            "vin": active.get("vin") if active else None,
+            "vin_source": active.get("assignment_source") if active else None,
+            "active_vehicle_profile": active,
+        },
+        "live_telemetry_engine": {
+            "polling_interval_ms": 500,
+            "current_values": latest,
+            "rolling_sensor_history": reads[-120:],
+            "reconnect_state": phone_bridge_state.get("status"),
+        },
+        "diagnostic_state_engine": {
+            "stored_dtcs": dtc_stored,
+            "pending_dtcs": dtc_pending,
+            "freeze_frame_data": freeze,
+            "readiness_monitors": readiness,
+            "vehicle_health_score": _compute_vehicle_health_score(reads, alerts),
+        },
+        "timeline_engine": {
+            "events": events[-200:],
+            "ai_alerts": alerts[-120:],
+        },
+        "command_learning_engine": {
+            "command_library": store.command_library,
+            "session_records": store.get_learning_records(active["session_id"]) if active else [],
+        },
+        "ai_test_assistant": {
+            "guided_plan": plan,
+            "submitted_results": results[-50:],
+        },
+    }
+
+
 @app.get("/vehicle-visualization/state")
 def vehicle_visualization_state_view() -> dict:
     return {
@@ -844,6 +924,8 @@ def dashboard_state() -> dict:
     ]
 
     learning_records = [item.model_dump() for item in store.get_learning_records(active["session_id"])] if active else []
+    alerts = [item.model_dump() for item in store.get_ai_alerts(active["session_id"])] if active else []
+    core_snapshot = _vehicle_intelligence_core_snapshot(active, reads, events, alerts)
 
     return {
         "app_id": settings.app_id,
@@ -866,6 +948,7 @@ def dashboard_state() -> dict:
         "learning_records": learning_records[-40:],
         "learning_library": store.command_library,
         "vehicle_image": _resolve_vehicle_image(active.get("vehicle_id") if active else None),
+        "ai_alerts": alerts,
         "vehicle_visualization": {"component_groups": VEHICLE_COMPONENT_GROUPS, "highlight": vehicle_visualization_state},
         "ai_alerts": [item.model_dump() for item in store.get_ai_alerts(active["session_id"])] if active else [],
         "diagnostic_timeline": [item.model_dump() for item in store.get_timeline_events(active["session_id"])] if active else [],
@@ -874,6 +957,8 @@ def dashboard_state() -> dict:
             "last_ai_request": store.last_ai_request,
             "last_ai_response_timestamp": store.last_ai_response_timestamp,
         },
+        "vehicle_intelligence_core": core_snapshot,
+        "vehicle_health_score": core_snapshot.get("diagnostic_state_engine", {}).get("vehicle_health_score"),
         "report_integration_hooks": {
             "ai_summary": True,
             "notable_live_data_alerts": True,
@@ -947,6 +1032,8 @@ def _build_ai_context(active: dict | None, reads: list[dict], events: list[dict]
         "technician_notes": memory.get("notes", []),
         "report_summaries": memory.get("report_summaries", []),
         "confidence_tags": memory.get("confidence_tags", []),
+        "timeline_events": store.get_timeline_events(active["session_id"])[-60:] if active else [],
+        "component_mappings": store.knowledge_library.get("component_mappings", {}),
         "unresolved_issues": memory.get("unresolved_issues", []),
         "false_positives": memory.get("false_positives", []),
         "safety_guardrails": {
@@ -1041,6 +1128,80 @@ def _run_proactive_monitoring(session_id: str, vehicle_id: str, context: dict) -
         ))
         _ = timeline_event
     return [a.model_dump() for a in alerts]
+
+
+@app.post("/ai/guided-diagnosis/run")
+def run_guided_diagnosis(payload: GuidedDiagnosisRunRequest) -> dict:
+    if payload.session_id:
+        session = store.get_session(payload.session_id)
+    elif store.active_session_id:
+        session = store.get_active_session()
+    else:
+        raise HTTPException(status_code=404, detail="Start a vehicle check before running guided diagnosis")
+
+    reads = [item.model_dump() for item in store.get_reads(session.session_id)]
+    coolant = _latest_values(reads, ["coolant_temp"]).get("coolant_temp", {}).get("value")
+
+    ranked_causes = [
+        {"cause": "Air/fuel imbalance", "confidence": "suspected"},
+        {"cause": "Ignition performance issue", "confidence": "suspected"},
+        {"cause": "Cooling system instability" if isinstance(coolant, (int, float)) and coolant > 105 else "Charging system instability", "confidence": "monitor only"},
+    ]
+    recommended_tests = [
+        {"step_id": "gd-1", "name": "Warm idle baseline", "instruction": "Observe idle RPM for 60 seconds.", "expected_sensor_values": {"rpm": "650-850"}},
+        {"step_id": "gd-2", "name": "Cooling trend check", "instruction": "Monitor coolant temp for 3 minutes at idle.", "expected_sensor_values": {"coolant_temp": "85-102°C"}},
+        {"step_id": "gd-3", "name": "Charging stability check", "instruction": "Monitor control module voltage with headlights on.", "expected_sensor_values": {"control_module_voltage": "13.2-14.8V"}},
+    ]
+    plan = {
+        "session_id": session.session_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "symptom": payload.symptom or "general diagnostic",
+        "ranked_possible_causes": ranked_causes,
+        "recommended_tests": recommended_tests,
+        "dynamic_tree_state": "open",
+    }
+    store.set_guided_diagnosis_plan(session.session_id, plan)
+    store.add_timeline_event(DiagnosticTimelineEvent(
+        session_id=session.session_id,
+        event_type="ai_advice_generated",
+        title="Run Guided Diagnosis created plan",
+        detail=f"Plan generated with {len(recommended_tests)} read-only test steps.",
+        source="ai",
+        metadata={"feature": "run_guided_diagnosis"},
+    ))
+    return {"status": "ok", "plan": plan, "read_only_enforced": True}
+
+
+@app.post("/ai/guided-diagnosis/result")
+def submit_guided_diagnosis_result(payload: GuidedDiagnosisResultSubmitRequest) -> dict:
+    store.get_session(payload.session_id)
+    result = {
+        "step_id": payload.step_id,
+        "observed_result": payload.observed_result,
+        "notes": payload.notes,
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+    }
+    store.add_guided_diagnosis_result(payload.session_id, result)
+    store.add_timeline_event(DiagnosticTimelineEvent(
+        session_id=payload.session_id,
+        event_type="user_tag_event",
+        title="Guided diagnosis result submitted",
+        detail=f"{payload.step_id}: {payload.observed_result}",
+        source="user",
+        metadata={"feature": "run_guided_diagnosis", "step_id": payload.step_id},
+    ))
+
+    existing_plan = store.get_guided_diagnosis_plan(payload.session_id)
+    if existing_plan:
+        existing_plan["dynamic_tree_state"] = "updated_after_result"
+        existing_plan["last_result_step"] = payload.step_id
+        store.set_guided_diagnosis_plan(payload.session_id, existing_plan)
+
+    return {
+        "status": "accepted",
+        "result": result,
+        "updated_plan": store.get_guided_diagnosis_plan(payload.session_id),
+    }
 
 
 @app.get("/diagnostic-timeline/{session_id}")

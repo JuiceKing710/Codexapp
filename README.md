@@ -12,6 +12,28 @@ This app supports standard read-only OBD requests only.
 - No undocumented control commands
 - Default assumption remains: DLC3 ECM diagnostics are ISO 9141-2 request/response unless source clearly indicates CAN capture
 
+
+## Locked master architecture (Vehicle Intelligence Core)
+
+Zeb's OBD AI now treats **Vehicle Intelligence Core** as the single source of truth.
+
+Mandatory production flow:
+
+`OBDLink MX+ -> Hybrid Mobile Bluetooth Layer -> Vehicle Intelligence Core -> Backend Sync + AI Processing -> UI/AI/Reports/Visualization`
+
+Key implementation status in this prototype:
+
+- Mobile app owns production Bluetooth path (`PHONE-LIVE` bridge).
+- Backend does **not** own direct production Bluetooth access.
+- Core snapshot is exposed in `GET /dashboard/state` under `vehicle_intelligence_core` with modules:
+  - Vehicle Identity Manager
+  - Live Telemetry Engine (500 ms shared interval target)
+  - Diagnostic State Engine
+  - AI Test Assistant hooks (`Run Guided Diagnosis`)
+  - Timeline Engine
+  - Command Learning Engine
+- Vehicle health score is provided in `dashboard/state.vehicle_health_score`.
+
 ## Vehicle profiles
 
 Included vehicle profiles:
