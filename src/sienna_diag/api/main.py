@@ -30,6 +30,7 @@ from sienna_diag.models import (
     ReplayExecuteRequest,
     ReviewRequest,
     SessionCreateRequest,
+    VehicleVisualizationHighlightRequest,
 )
 from sienna_diag.obd.adapter import OBDLinkAdapter
 from sienna_diag.preprocessing.pipeline import run_preprocessing
@@ -123,11 +124,39 @@ CAPTURE_PRESETS = {
 CAPTURE_FAST_COMMANDS = ["010C", "0111", "0142", "010D"]
 CAPTURE_SLOW_COMMANDS = ["0105", "010F", "03", "07", "0902"]
 
+VEHICLE_COMPONENT_GROUPS = {
+    "engine": ["engine_block", "spark_plug_bank", "thermostat"],
+    "cooling_system": ["radiator", "thermostat", "water_pump"],
+    "intake": ["air_filter", "throttle_body", "intake_manifold"],
+    "exhaust": ["exhaust_manifold", "catalytic_converter", "muffler"],
+    "fuel_system": ["fuel_pump", "fuel_rail", "injector_bank"],
+    "electrical_system": ["battery", "alternator", "starter"],
+    "transmission": ["transmission_case", "torque_converter", "transmission_fluid_pan"],
+}
+
 capture_lock = threading.Lock()
 capture_stop_event = threading.Event()
 capture_thread: threading.Thread | None = None
 capture_status = "idle"
 capture_preset = "cold_start_capture"
+
+vehicle_visualization_state = {
+    "action": None,
+    "component": None,
+    "system": None,
+    "source": "system",
+    "updated_at": None,
+}
+
+COMPONENT_EXPLANATIONS = {
+    "thermostat": "Regulates coolant flow so the engine reaches and maintains normal operating temperature.",
+    "radiator": "Transfers heat from coolant to airflow to keep engine temperature stable.",
+    "engine_block": "Main engine structure containing cylinders and coolant passages.",
+    "throttle_body": "Controls intake airflow into the engine based on throttle input.",
+    "catalytic_converter": "Reduces harmful exhaust emissions before gases exit the tailpipe.",
+    "battery": "Supplies electrical power for starting and supports vehicle electronics.",
+    "transmission_case": "Houses gears and hydraulic pathways that transfer engine torque.",
+}
 
 
 @app.on_event("startup")
@@ -758,6 +787,44 @@ def current_vehicle_image(manual_vehicle_id: str | None = None) -> dict:
     return _resolve_vehicle_image(manual_vehicle_id)
 
 
+@app.get("/vehicle-visualization/state")
+def vehicle_visualization_state_view() -> dict:
+    return {
+        "component_groups": VEHICLE_COMPONENT_GROUPS,
+        "highlight": vehicle_visualization_state,
+    }
+
+
+@app.post("/vehicle-visualization/highlight")
+def vehicle_visualization_highlight(payload: VehicleVisualizationHighlightRequest) -> dict:
+    if payload.action == "highlight_component" and not payload.component:
+        raise HTTPException(status_code=400, detail="component is required for highlight_component")
+    if payload.action == "highlight_system" and not payload.system:
+        raise HTTPException(status_code=400, detail="system is required for highlight_system")
+
+    component = payload.component.strip().lower() if payload.component else None
+    system = payload.system.strip().lower() if payload.system else None
+    system_alias = {"cooling": "cooling_system", "electrical": "electrical_system", "fuel": "fuel_system"}
+    if system:
+        system = system_alias.get(system, system)
+
+    vehicle_visualization_state.update({
+        "action": payload.action,
+        "component": component,
+        "system": system,
+        "source": payload.source,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"status": "ok", "highlight": vehicle_visualization_state}
+
+
+@app.get("/vehicle-visualization/explain")
+def vehicle_visualization_explain(component: str) -> dict:
+    normalized = component.strip().lower()
+    explanation = COMPONENT_EXPLANATIONS.get(normalized, "Component detail not available yet. Use AI Mechanic for deeper diagnostic context.")
+    return {"component": normalized, "explanation": explanation}
+
+
 @app.get("/dashboard/state")
 def dashboard_state() -> dict:
     active = None
@@ -799,6 +866,7 @@ def dashboard_state() -> dict:
         "learning_records": learning_records[-40:],
         "learning_library": store.command_library,
         "vehicle_image": _resolve_vehicle_image(active.get("vehicle_id") if active else None),
+        "vehicle_visualization": {"component_groups": VEHICLE_COMPONENT_GROUPS, "highlight": vehicle_visualization_state},
         "ai_alerts": [item.model_dump() for item in store.get_ai_alerts(active["session_id"])] if active else [],
         "diagnostic_timeline": [item.model_dump() for item in store.get_timeline_events(active["session_id"])] if active else [],
         "ai_response_history": [item.model_dump() for item in store.get_ai_responses(active["session_id"])] if active else [],
@@ -890,7 +958,26 @@ def _build_ai_context(active: dict | None, reads: list[dict], events: list[dict]
                 "vehicle control actions",
             ],
         },
+        "vehicle_component_groups": VEHICLE_COMPONENT_GROUPS,
     }
+
+
+def _resolve_visualization_request(payload: AIMechanicQuestionRequest) -> dict | None:
+    component = payload.memory_updates.get("highlight_component")
+    system = payload.memory_updates.get("highlight_system") or payload.memory_updates.get("system")
+    system_alias = {
+        "cooling": "cooling_system",
+        "electrical": "electrical_system",
+        "fuel": "fuel_system",
+    }
+    normalized_system = system.strip().lower() if isinstance(system, str) and system.strip() else None
+    if normalized_system:
+        normalized_system = system_alias.get(normalized_system, normalized_system)
+    if isinstance(component, str) and component.strip():
+        return {"action": "highlight_component", "component": component.strip().lower(), "system": normalized_system}
+    if normalized_system:
+        return {"action": "highlight_system", "system": normalized_system}
+    return None
 
 
 def _run_proactive_monitoring(session_id: str, vehicle_id: str, context: dict) -> list[dict]:
@@ -980,6 +1067,7 @@ def ai_mechanic(payload: AIMechanicQuestionRequest) -> dict:
             "context": {},
             "response_basis": "general_knowledge",
             "read_only_enforced": True,
+            "visualization_hook": _resolve_visualization_request(payload),
         }
 
     reads = [item.model_dump() for item in store.get_reads(active["session_id"])]
@@ -1047,6 +1135,7 @@ def ai_mechanic(payload: AIMechanicQuestionRequest) -> dict:
         "context": context,
         "response_basis": response_basis,
         "read_only_enforced": True,
+        "visualization_hook": _resolve_visualization_request(payload),
         "conversation_history": [r.model_dump() for r in store.get_ai_responses(active["session_id"])][-20:],
         "proactive_alerts": proactive_alerts,
         "timeline_event_id": timeline.timeline_event_id,
@@ -1086,7 +1175,10 @@ def dashboard() -> str:
     button.secondary { background:#fff; color:var(--ink); }
     button.danger { background:var(--danger); border-color:var(--danger); }
     .tiny { font-size:.8rem; color:var(--muted); }
-    .vehicle-image { border:1px solid var(--line); border-radius:12px; min-height:220px; background:linear-gradient(135deg,#f8fafc,#e2e8f0); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; padding:10px; }
+    .vehicle-image { border:1px solid var(--line); border-radius:12px; min-height:220px; background:linear-gradient(135deg,#f8fafc,#e2e8f0); display:flex; flex-direction:column; gap:8px; padding:10px; }
+    .vehicle-canvas { width:100%; height:min(48vw,320px); min-height:220px; border-radius:10px; border:1px solid var(--line); background:#0f172a; touch-action:manipulation; }
+    .vehicle-fallback { width:100%; max-width:560px; border-radius:10px; border:1px solid var(--line); display:none; }
+    .component-pill { display:inline-flex; align-items:center; gap:6px; border-radius:999px; border:1px solid var(--line); padding:6px 10px; background:#fff; font-size:.82rem; }
     .ai-quick { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
     .ai-quick button { width:auto; min-height:40px; padding:10px 12px; font-size:.9rem; }
     @media (max-width:640px) { .btn-grid { grid-template-columns:1fr; } }
@@ -1107,9 +1199,12 @@ def dashboard() -> str:
       <select id="vehicleSelect"></select>
       <h2 class="title" style="margin-top:14px;">Current Vehicle Image</h2>
       <div class="vehicle-image">
-        <img id="vehicleImageAsset" alt="Current vehicle image" style="width:100%;max-width:560px;border-radius:10px;border:1px solid var(--line);" />
+        <div id="vehicleCanvas" class="vehicle-canvas" aria-label="3D vehicle model viewer"></div>
+        <img id="vehicleImageAsset" class="vehicle-fallback" alt="Fallback vehicle image" />
         <div id="vehicleImageLabel" style="font-weight:700;">Vehicle placeholder</div>
         <div class="tiny" id="vehicleImageSource">Loading vehicle source…</div>
+        <div class="component-pill"><span style="width:10px;height:10px;border-radius:50%;background:#dc2626;display:inline-block"></span><span id="highlightedComponentName">No highlighted component</span></div>
+        <button id="componentExplainBtn" class="secondary" style="min-height:40px;padding:8px 12px;max-width:280px;" disabled>Tap component for explanation</button>
       </div>
       <div class="btn-grid" style="margin-top:10px;">
         <button id="connectVehicleBtn" class="secondary">Connect Vehicle</button>
@@ -1153,70 +1248,78 @@ def dashboard() -> str:
       </div>
     </div>
   </div>
-<script>
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.162.0/build/three.module.js';
+
 let state = null;
 let selectedVehicleId = 'toyota_sienna_2006';
 let phoneBridge = { status: 'disconnected', source_mode: 'PHONE-LIVE' };
+let vehicleRenderer = null;
+let selectedMesh = null;
+
 function card(label, value){ return `<div class="card status-card"><div class="status-label">${label}</div><div class="status-value">${value || '-'}</div></div>`; }
+function webglAvailable(){ try { const c=document.createElement('canvas'); return !!window.WebGLRenderingContext && !!(c.getContext('webgl') || c.getContext('experimental-webgl')); } catch { return false; } }
+
+function buildGenericVehicleViewer(){
+  const host=document.getElementById('vehicleCanvas');
+  if(!host || !webglAvailable()){ showFallbackImage('WebGL unavailable — static fallback image in use'); return; }
+  const scene=new THREE.Scene(); scene.background=new THREE.Color(0x0f172a);
+  const camera=new THREE.PerspectiveCamera(52, host.clientWidth/host.clientHeight, 0.1, 100); camera.position.set(5.5,3.2,6.6);
+  const renderer=new THREE.WebGLRenderer({antialias:false,alpha:false,powerPreference:'low-power'}); renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2)); renderer.setSize(host.clientWidth,host.clientHeight); host.innerHTML=''; host.appendChild(renderer.domElement);
+  scene.add(new THREE.AmbientLight(0xffffff,0.85)); const key=new THREE.DirectionalLight(0xffffff,0.85); key.position.set(4,7,6); scene.add(key);
+  const root=new THREE.Group(); scene.add(root);
+  const partMap={};
+  function addPart(name,system,geo,color,pos,scale){ const mat=new THREE.MeshStandardMaterial({color,roughness:0.72,metalness:0.08,transparent:true,opacity:1}); const m=new THREE.Mesh(geo,mat); m.position.set(...pos); m.scale.set(...scale); m.userData={component:name,system,baseColor:color}; root.add(m); partMap[name]=m; return m; }
+  addPart('engine_block','engine',new THREE.BoxGeometry(1.35,0.72,1.05),0x64748b,[-0.85,0.35,0.2],[1,1,1]);
+  addPart('thermostat','cooling_system',new THREE.SphereGeometry(0.16,12,10),0x93c5fd,[-0.4,0.75,0.35],[1,1,1]);
+  addPart('radiator','cooling_system',new THREE.BoxGeometry(0.18,0.86,1.26),0x38bdf8,[1.45,0.38,0],[1,1,1]);
+  addPart('intake_manifold','intake',new THREE.BoxGeometry(1.2,0.28,0.72),0x22d3ee,[-0.82,0.9,0.14],[1,1,1]);
+  addPart('throttle_body','intake',new THREE.CylinderGeometry(0.12,0.12,0.36,10),0x06b6d4,[0.18,0.84,0.58],[1,1,1]);
+  addPart('exhaust_manifold','exhaust',new THREE.BoxGeometry(0.88,0.2,0.26),0xf59e0b,[-1.25,0.08,0.78],[1,1,1]);
+  addPart('catalytic_converter','exhaust',new THREE.CylinderGeometry(0.17,0.17,0.65,12),0xf97316,[0.72,-0.18,0.88],[1,1,1]);
+  addPart('fuel_rail','fuel_system',new THREE.BoxGeometry(0.9,0.1,0.12),0xa78bfa,[-0.85,0.64,-0.36],[1,1,1]);
+  addPart('fuel_pump','fuel_system',new THREE.CylinderGeometry(0.11,0.11,0.24,10),0x8b5cf6,[-2.2,-0.3,0],[1,1,1]);
+  addPart('battery','electrical_system',new THREE.BoxGeometry(0.58,0.36,0.42),0x16a34a,[0.92,0.42,-0.72],[1,1,1]);
+  addPart('alternator','electrical_system',new THREE.CylinderGeometry(0.17,0.17,0.3,12),0x22c55e,[0.15,0.24,-0.58],[1,1,1]);
+  addPart('transmission_case','transmission',new THREE.BoxGeometry(1.3,0.62,0.9),0x94a3b8,[-2.05,0.08,0],[1,1,1]);
+  const body=new THREE.Mesh(new THREE.BoxGeometry(5.1,1.2,2.25),new THREE.MeshStandardMaterial({color:0x334155,roughness:0.82,metalness:0.12,transparent:true,opacity:0.95})); body.position.y=0.6; root.add(body);
+  [[-1.7,-0.05,1.2],[-1.7,-0.05,-1.2],[1.7,-0.05,1.2],[1.7,-0.05,-1.2]].forEach(p=>{const w=new THREE.Mesh(new THREE.CylinderGeometry(0.47,0.47,0.3,16),new THREE.MeshStandardMaterial({color:0x0b1120,roughness:0.95})); w.rotation.z=Math.PI/2; w.position.set(...p); root.add(w);});
+
+  const raycaster=new THREE.Raycaster(); const pointer=new THREE.Vector2();
+  function applyHighlight(action,component,system){
+    Object.values(partMap).forEach(m=>{m.material.color.setHex(m.userData.baseColor); m.material.opacity=1;});
+    selectedMesh=null;
+    if(action==='highlight_component' && partMap[component]){selectedMesh=partMap[component]; selectedMesh.material.color.set('#dc2626'); Object.values(partMap).forEach(m=>{if(m!==selectedMesh){m.material.opacity=(m.userData.system===selectedMesh.userData.system)?0.5:0.16;}});} 
+    if(action==='highlight_system' && system){Object.values(partMap).forEach(m=>{if(m.userData.system===system){m.material.color.set('#dc2626');} else {m.material.opacity=0.16;}});} 
+    const name=component|| (selectedMesh?selectedMesh.userData.component:null) || (system?`${system} system` : null);
+    document.getElementById('highlightedComponentName').textContent=name?name.replace(/_/g,' '):'No highlighted component';
+    document.getElementById('componentExplainBtn').disabled=!component;
+    if(component){document.getElementById('componentExplainBtn').dataset.component=component;}
+  }
+  function pick(ev){ const rect=renderer.domElement.getBoundingClientRect(); pointer.x=((ev.clientX-rect.left)/rect.width)*2-1; pointer.y=-((ev.clientY-rect.top)/rect.height)*2+1; raycaster.setFromCamera(pointer,camera); const hit=raycaster.intersectObjects(Object.values(partMap))[0]; if(!hit){return;} const {component,system}=hit.object.userData; applyHighlight('highlight_component',component,system); syncHighlight('highlight_component',component,system,'user'); }
+  renderer.domElement.addEventListener('pointerdown',pick,{passive:true});
+
+  function animate(){ root.rotation.y += 0.0038; renderer.render(scene,camera); requestAnimationFrame(animate); }
+  animate();
+  window.addEventListener('resize',()=>{ if(!host.clientWidth || !host.clientHeight){return;} camera.aspect=host.clientWidth/host.clientHeight; camera.updateProjectionMatrix(); renderer.setSize(host.clientWidth,host.clientHeight); });
+  vehicleRenderer={applyHighlight};
+}
+
+function showFallbackImage(reason){ const img=document.getElementById('vehicleImageAsset'); img.style.display='block'; const source=document.getElementById('vehicleImageSource'); source.textContent=reason; const host=document.getElementById('vehicleCanvas'); if(host){host.innerHTML='';} }
+
 async function fetchState(){
   const res = await fetch('/dashboard/state');
   state = await res.json();
   phoneBridge = { ...phoneBridge, ...state.phone_bridge };
   renderStatusCards(); renderVehicles(); renderBluetoothCard(); renderAiAlerts(); renderTimeline();
+  if(vehicleRenderer && state.vehicle_visualization?.highlight){ const h=state.vehicle_visualization.highlight; vehicleRenderer.applyHighlight(h.action,h.component,h.system); }
 }
-function renderStatusCards(){
-  const active = state.active_session;
-  document.getElementById('statusCards').innerHTML = [
-    card('Current mode', state.adapter_mode || 'MOCK'),
-    card('Bluetooth state', phoneBridge.status || 'disconnected'),
-    card('Active vehicle', active ? active.vehicle : selectedVehicleId),
-    card('Active Vehicle Check', active ? active.session_id : 'None'),
-    card('AI Alerts', (state.ai_alerts||[]).length ? `${state.ai_alerts.length} active` : 'None')
-  ].join('');
-}
-function renderVehicles(){
-  const select = document.getElementById('vehicleSelect'); select.innerHTML='';
-  state.vehicles.forEach(v => {
-    const opt=document.createElement('option'); opt.value=v.vehicle_id; opt.textContent=`${v.label} (${v.protocol_hint})`;
-    if (v.vehicle_id===selectedVehicleId) opt.selected=true; select.appendChild(opt);
-  });
-  select.onchange=async (e)=>{ selectedVehicleId=e.target.value; await updateVehicleImage(); };
-  updateVehicleImage();
-}
-async function updateVehicleImage(){
-  const res = await fetch(`/vehicle-image/current?manual_vehicle_id=${encodeURIComponent(selectedVehicleId)}`);
-  const image = await res.json();
-  const trim = image.trim ? ` ${image.trim}` : '';
-  const label = `${image.year || ''} ${image.make} ${image.model}${trim}`.replace(/\s+/g,' ').trim();
-  document.getElementById('vehicleImageLabel').textContent = label || 'Generic vehicle';
-  const sourceMap = {
-    auto_vin: 'Auto VIN detection result',
-    manual_selection: 'Manual vehicle selection fallback',
-    active_session_vehicle: 'Active session vehicle fallback',
-    closest_supported: 'Closest supported vehicle image fallback',
-    generic_placeholder: 'Generic placeholder image'
-  };
-  document.getElementById('vehicleImageSource').textContent = sourceMap[image.resolved_from] || image.resolved_from;
-  const img = document.getElementById('vehicleImageAsset');
-  img.src = image.image_asset_path || image.fallback_image_asset_path;
-  img.onerror = () => { img.src = image.fallback_image_asset_path; };
-}
-function renderBluetoothCard(){
-  const status = phoneBridge.status || 'disconnected';
-  document.getElementById('btStatusText').textContent = status.charAt(0).toUpperCase() + status.slice(1);
-  document.getElementById('btError').textContent = phoneBridge.last_error || 'No Bluetooth errors';
-}
-
-function renderAiAlerts(){
-  const alerts=state.ai_alerts||[];
-  document.getElementById('aiAlertSummary').textContent=alerts.length?`${alerts.length} proactive alert(s) linked to this vehicle check.`:'No active alerts.';
-  document.getElementById('aiAlertList').innerHTML=alerts.slice(-5).reverse().map(a=>`<div><b>${a.title}</b> (${a.confidence}) — ${a.explanation}. Next: ${a.suggested_next_step}</div>`).join('') || '<div>Waiting for live monitoring.</div>';
-}
-function renderTimeline(){
-  const timeline=state.diagnostic_timeline||[];
-  document.getElementById('timelineList').innerHTML=timeline.slice(-8).reverse().map(t=>`<div>${new Date(t.ts).toLocaleTimeString()} — ${t.title}${t.linked_ai_response_id?` <a href="/dashboard/ai" style="color:#0f766e">AI explanation</a>`:''}</div>`).join('') || '<div>No timeline events yet.</div>';
-}
-
+function renderStatusCards(){ const active = state.active_session; document.getElementById('statusCards').innerHTML = [card('Current mode', state.adapter_mode || 'MOCK'),card('Bluetooth state', phoneBridge.status || 'disconnected'),card('Active vehicle', active ? active.vehicle : selectedVehicleId),card('Active Vehicle Check', active ? active.session_id : 'None'),card('AI Alerts', (state.ai_alerts||[]).length ? `${state.ai_alerts.length} active` : 'None')].join(''); }
+function renderVehicles(){ const select = document.getElementById('vehicleSelect'); select.innerHTML=''; state.vehicles.forEach(v => { const opt=document.createElement('option'); opt.value=v.vehicle_id; opt.textContent=`${v.label} (${v.protocol_hint})`; if (v.vehicle_id===selectedVehicleId) opt.selected=true; select.appendChild(opt); }); select.onchange=async (e)=>{ selectedVehicleId=e.target.value; await updateVehicleImage(); }; updateVehicleImage(); }
+async function updateVehicleImage(){ const res = await fetch(`/vehicle-image/current?manual_vehicle_id=${encodeURIComponent(selectedVehicleId)}`); const image = await res.json(); const trim = image.trim ? ` ${image.trim}` : ''; const label = `${image.year || ''} ${image.make} ${image.model}${trim}`.replace(/\s+/g,' ').trim(); document.getElementById('vehicleImageLabel').textContent = label || 'Generic vehicle'; const sourceMap = {auto_vin: 'Auto VIN detection result',manual_selection: 'Manual vehicle selection fallback',active_session_vehicle: 'Active session vehicle fallback',closest_supported: 'Closest supported vehicle image fallback',generic_placeholder: 'Generic placeholder image'}; const img = document.getElementById('vehicleImageAsset'); img.src = image.image_asset_path || image.fallback_image_asset_path; img.onerror = () => { img.src = image.fallback_image_asset_path; }; if(!vehicleRenderer){ buildGenericVehicleViewer(); } if(!vehicleRenderer){ showFallbackImage((sourceMap[image.resolved_from] || image.resolved_from)+' — WebGL fallback image'); } else { document.getElementById('vehicleImageSource').textContent='3D view active · tap a component to inspect'; } }
+function renderBluetoothCard(){ const status = phoneBridge.status || 'disconnected'; document.getElementById('btStatusText').textContent = status.charAt(0).toUpperCase() + status.slice(1); document.getElementById('btError').textContent = phoneBridge.last_error || 'No Bluetooth errors'; }
+function renderAiAlerts(){ const alerts=state.ai_alerts||[]; document.getElementById('aiAlertSummary').textContent=alerts.length?`${alerts.length} proactive alert(s) linked to this vehicle check.`:'No active alerts.'; document.getElementById('aiAlertList').innerHTML=alerts.slice(-5).reverse().map(a=>`<div><b>${a.title}</b> (${a.confidence}) — ${a.explanation}. Next: ${a.suggested_next_step}</div>`).join('') || '<div>Waiting for live monitoring.</div>'; }
+function renderTimeline(){ const timeline=state.diagnostic_timeline||[]; document.getElementById('timelineList').innerHTML=timeline.slice(-8).reverse().map(t=>`<div>${new Date(t.ts).toLocaleTimeString()} — ${t.title}${t.linked_ai_response_id?` <a href="/dashboard/ai" style="color:#0f766e">AI explanation</a>`:''}</div>`).join('') || '<div>No timeline events yet.</div>'; }
 async function ensureSession(){ if (state && state.active_session) return state.active_session; await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})}); await fetchState(); return state.active_session; }
 async function createSession(){ await ensureSession(); }
 async function stopSession(){ await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
@@ -1224,6 +1327,8 @@ async function startCapture(){ await ensureSession(); await fetch('/capture/star
 async function stopCapture(){ await fetch('/capture/stop',{method:'POST'}); await fetchState(); }
 async function tagEvent(){ if (!state.active_session) { alert('Vehicle Check missing: start Vehicle Check first.'); return; } await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:'idle'})}); await fetchState(); }
 async function connectVehicle(){ await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ platform:'unknown', adapter_name:'OBDLink MX+', status:'connected', source_mode:'PHONE-LIVE', supports_native_bluetooth:true }) }); await fetchState(); }
+async function syncHighlight(action,component,system,source='user'){ await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,component,system,source})}); }
+async function explainSelected(){ const comp=document.getElementById('componentExplainBtn').dataset.component; if(!comp){return;} const res=await fetch(`/vehicle-visualization/explain?component=${encodeURIComponent(comp)}`); const data=await res.json(); alert(`${data.component.replace(/_/g,' ')}: ${data.explanation}`); }
 function openAiWithPrompt(prompt){ window.location.href = `/dashboard/ai?prompt=${encodeURIComponent(prompt || '')}`; }
 document.getElementById('connectVehicleBtn').onclick = connectVehicle;
 document.getElementById('startSessionBtn').onclick = createSession;
@@ -1234,6 +1339,7 @@ document.getElementById('tagEventBtn').onclick = tagEvent;
 document.getElementById('reportsBtn').onclick = () => alert('Reports view is available in the report framework section.');
 document.getElementById('liveGaugesBtn').onclick = () => window.location.href = '/dashboard/gauges';
 document.getElementById('askAiBtn').onclick = () => openAiWithPrompt('');
+document.getElementById('componentExplainBtn').onclick = explainSelected;
 setInterval(fetchState, 1500);
 fetchState();
 </script>
@@ -1352,7 +1458,7 @@ let recog=null;
 const synth=window.speechSynthesis;
 function pushMsg(role,text){const el=document.createElement('div');el.className='bubble';el.innerHTML=`<b>${role}:</b> ${text}`;document.getElementById('chat').prepend(el);}
 function setPrompt(v){document.getElementById('question').value=v;document.getElementById('transcriptPreview').textContent='Transcript preview: '+v;}
-async function ask(){const q=document.getElementById('question').value.trim();if(!q){return;}document.getElementById('aiLoading').textContent='AI status: thinking...';pushMsg('You',q);const res=await fetch('/ai/mechanic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,source:'user'})});const data=await res.json();lastAnswer=data.answer;document.getElementById('aiResponse').textContent=data.answer;document.getElementById('aiLoading').textContent='AI status: response ready';pushMsg('AI Mechanic',data.answer+` [source: ${data.response_basis}]`);}
+async function ask(){const q=document.getElementById('question').value.trim();if(!q){return;}document.getElementById('aiLoading').textContent='AI status: thinking...';pushMsg('You',q);const res=await fetch('/ai/mechanic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,source:'user'})});const data=await res.json();lastAnswer=data.answer;document.getElementById('aiResponse').textContent=data.answer;document.getElementById('aiLoading').textContent='AI status: response ready';if(data.visualization_hook){await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...data.visualization_hook,source:'ai_mechanic'})});}pushMsg('AI Mechanic',data.answer+` [source: ${data.response_basis}]`);}
 function speechAvailable(){return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;}
 function initSpeech(){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){document.getElementById('voiceState').textContent='Voice state: unavailable, text fallback active';return;}recog=new SR();recog.lang='en-US';recog.interimResults=true;recog.onstart=()=>document.getElementById('voiceState').textContent='Voice state: listening';recog.onerror=()=>document.getElementById('voiceState').textContent='Voice state: transcription failed, retry or type';recog.onend=()=>document.getElementById('voiceState').textContent='Voice state: idle';recog.onresult=(e)=>{let t='';for(let i=e.resultIndex;i<e.results.length;i++){t+=e.results[i][0].transcript;}document.getElementById('question').value=t.trim();document.getElementById('transcriptPreview').textContent='Transcript preview: '+(t.trim()||'(none)');};}
 function startListening(){if(!recog){const qp=new URLSearchParams(window.location.search).get('prompt'); if(qp){setPrompt(qp);} initSpeech();}if(recog){recog.start();}}

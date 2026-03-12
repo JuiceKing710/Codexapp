@@ -185,6 +185,17 @@ class ReplayExecuteRequest(BaseModel):
     notes: str | None = None
 
 
+class VehicleVisualizationHighlightRequest(BaseModel):
+    action: Literal["highlight_component", "highlight_system"]
+    component: str | None = None
+    system: str | None = None
+    source: Literal["ai_mechanic", "user", "system"] = "user"
+
+
+class VehicleVisualizationExplainRequest(BaseModel):
+    component: str
+
+
 TimelineEventType = Literal[
     "vehicle_connected",
     "vehicle_disconnected",
