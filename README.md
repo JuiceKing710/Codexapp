@@ -110,6 +110,55 @@ Each reading stores:
 - command
 - raw response
 
+
+## Production mobile Bluetooth architecture (Phase 3)
+
+Production flow is now explicitly phone-native and backend-safe:
+
+`OBDLink MX+ -> native mobile Bluetooth layer -> app UI -> Render backend -> session storage/reports/AI export`
+
+Key rules:
+
+- Browser `navigator.bluetooth` is no longer the production connection path.
+- Dashboard UI now calls a platform abstraction (`MobileBluetoothService`) with:
+  - `connectToAdapter()`
+  - `disconnectAdapter()`
+  - `readPid(pid)`
+  - `readVin()`
+  - `getConnectionState()`
+  - `reconnectIfNeeded()`
+- Backend phone bridge endpoints only ingest phone-submitted reads/state and never attempt direct production Bluetooth access.
+- Source mode badges now support:
+  - `MOCK`
+  - `PHONE-LIVE`
+  - `LOCAL-HARDWARE`
+  - `BROWSER-DEV` (debug fallback only)
+
+VIN handling:
+
+- VIN auto-detect uses Mode `09 PID 02` (`0902`) via phone bridge reads.
+- Backend tracks last VIN command, raw response, parse status, and parsed VIN when successful.
+- If VIN parse fails, UI/debug state indicates manual vehicle selection is required.
+
+### iPhone/iPad production test steps
+
+1. Run backend and open `/dashboard` inside the mobile app webview/native shell.
+2. Tap **Connect Vehicle**.
+3. Confirm debug panel shows `platform=ios` or `platform=ipad`, and Bluetooth state `connected`.
+4. Confirm VIN read is attempted automatically (`last_vin_command=0902`).
+5. Tap **Read RPM** and verify latest read includes PID `010C` with source `PHONE-LIVE`.
+6. Tap **Read Coolant Temp** and verify latest read includes PID `0105` with source `PHONE-LIVE`.
+7. Confirm gauge page updates from latest session reads.
+
+### Android production test steps
+
+1. Run backend and open `/dashboard` inside the mobile app webview/native shell.
+2. Tap **Connect Vehicle**.
+3. Confirm debug panel shows `platform=android` and Bluetooth state `connected`.
+4. Verify VIN auto-attempt and VIN parse status updates.
+5. Tap **Read RPM** and **Read Coolant Temp** and confirm backend session-linked reads are stored.
+6. Stop/restart adapter and retest reconnect path with **Connect Vehicle**.
+
 ## Run instructions
 
 1. Create and activate a virtual environment.
