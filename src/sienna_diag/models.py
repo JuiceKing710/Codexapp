@@ -7,7 +7,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 
-SourceMode = Literal["MOCK", "PHONE-LIVE", "LOCAL-HARDWARE"]
+SourceMode = Literal["MOCK", "PHONE-LIVE", "LOCAL-HARDWARE", "BROWSER-DEV"]
 
 
 class Session(BaseModel):
@@ -73,12 +73,22 @@ class PhoneLiveReadPayload(BaseModel):
     pid_key: str
     value: float | str | None = None
     unit: str | None = None
-    source_mode: SourceMode = "PHONE-LIVE"
+    source_mode: Literal["PHONE-LIVE", "BROWSER-DEV"] = "PHONE-LIVE"
     ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     source_hint: Literal["iso9141_2", "can_capture"] = "iso9141_2"
     latency_ms: int | None = None
     backend_status: str | None = None
     error: str | None = None
+
+
+class PhoneBridgeConnectPayload(BaseModel):
+    platform: Literal["ios", "android", "ipad", "browser", "unknown"] = "unknown"
+    adapter_name: str = "OBDLink MX+"
+    status: Literal["connecting", "connected", "failed"] = "connecting"
+    permission_state: str | None = None
+    source_mode: Literal["PHONE-LIVE", "BROWSER-DEV"] = "PHONE-LIVE"
+    supports_native_bluetooth: bool = True
+    fallback_reason: str | None = None
 
 
 class CaptureStartRequest(BaseModel):
