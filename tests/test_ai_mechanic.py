@@ -76,3 +76,39 @@ def test_proactive_alerts_generated_from_live_data() -> None:
     timeline = client.get(f"/diagnostic-timeline/{session.session_id}")
     assert timeline.status_code == 200
     assert any(item["event_type"] == "ai_alert_created" for item in timeline.json()["timeline"])
+
+
+def test_ai_mechanic_returns_visualization_hook_for_component_requests() -> None:
+    _reset_state()
+    store.create_session(vehicle_id="toyota_sienna_2006")
+
+    response = client.post(
+        "/ai/mechanic",
+        json={
+            "question": "Show me the thermostat",
+            "memory_updates": {"highlight_component": "thermostat", "system": "cooling"},
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["visualization_hook"]["action"] == "highlight_component"
+    assert data["visualization_hook"]["component"] == "thermostat"
+    assert data["visualization_hook"]["system"] == "cooling_system"
+
+
+def test_vehicle_visualization_highlight_and_explain_endpoints() -> None:
+    _reset_state()
+
+    highlight = client.post(
+        "/vehicle-visualization/highlight",
+        json={"action": "highlight_component", "component": "Thermostat", "system": "cooling", "source": "user"},
+    )
+    assert highlight.status_code == 200
+    payload = highlight.json()["highlight"]
+    assert payload["component"] == "thermostat"
+    assert payload["system"] == "cooling_system"
+
+    explain = client.get("/vehicle-visualization/explain", params={"component": "thermostat"})
+    assert explain.status_code == 200
+    assert "coolant" in explain.json()["explanation"].lower()
