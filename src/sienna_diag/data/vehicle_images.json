@@ -1,0 +1,47 @@
+{
+  "vehicles": [
+    {
+      "vehicle_id": "toyota_sienna_2006",
+      "year": 2006,
+      "make": "Toyota",
+      "model": "Sienna",
+      "trim": "FWD V6 3.3L",
+      "lookup_key": "toyota_sienna_2006",
+      "image_asset_path": "/assets/vehicle_images/toyota_sienna_2006.svg",
+      "fallback_image_asset_path": "/assets/vehicle_images/toyota_family_fallback.svg",
+      "model_3d_ref": null
+    },
+    {
+      "vehicle_id": "honda_pilot_2018",
+      "year": 2018,
+      "make": "Honda",
+      "model": "Pilot",
+      "trim": null,
+      "lookup_key": "honda_pilot_2018",
+      "image_asset_path": "/assets/vehicle_images/honda_pilot_2018.svg",
+      "fallback_image_asset_path": "/assets/vehicle_images/honda_family_fallback.svg",
+      "model_3d_ref": null
+    },
+    {
+      "vehicle_id": "mercedes_clk320_2002",
+      "year": 2002,
+      "make": "Mercedes-Benz",
+      "model": "CLK320",
+      "trim": null,
+      "lookup_key": "mercedes_clk320_2002",
+      "image_asset_path": "/assets/vehicle_images/mercedes_clk320_2002.svg",
+      "fallback_image_asset_path": "/assets/vehicle_images/mercedes_family_fallback.svg",
+      "model_3d_ref": null
+    }
+  ],
+  "vin_wmi_map": {
+    "5TD": "toyota_sienna_2006",
+    "2HK": "honda_pilot_2018",
+    "WDB": "mercedes_clk320_2002"
+  },
+  "generic_placeholder": {
+    "image_asset_path": "/assets/vehicle_images/generic_vehicle_placeholder.svg",
+    "fallback_image_asset_path": "/assets/vehicle_images/generic_vehicle_placeholder.svg",
+    "model_3d_ref": null
+  }
+}

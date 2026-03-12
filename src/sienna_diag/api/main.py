@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 from sienna_diag.config import settings
 from sienna_diag.models import (
@@ -32,9 +33,11 @@ from sienna_diag.review.lmstudio import local_llama_review
 from sienna_diag.review.openai_review import openai_second_opinion
 from sienna_diag.safety_policy import SafetyPolicy
 from sienna_diag.session_store import store
+from sienna_diag.vehicle_image_library import vehicle_image_library
 
 
 app = FastAPI(title="Zeb’s OBD AI", version="0.4.0")
+app.mount("/assets", StaticFiles(directory=Path(__file__).resolve().parent / "static"), name="assets")
 adapter = OBDLinkAdapter()
 
 SAFE_QUICK_READS = {
@@ -691,6 +694,34 @@ def preprocess_logs(payload: PreprocessRequest) -> dict:
     return run_preprocessing(Path(payload.input_path), Path(payload.output_dir))
 
 
+def _resolve_vehicle_image(manual_vehicle_id: str | None = None) -> dict:
+    active = store.get_session(store.active_session_id).model_dump() if store.active_session_id else None
+    resolution = vehicle_image_library.resolve(
+        vin=phone_bridge_state.get("vin") if active else None,
+        vin_parse_status=phone_bridge_state.get("vin_parse_status"),
+        manual_vehicle_id=manual_vehicle_id,
+        active_vehicle_id=active.get("vehicle_id") if active else None,
+        assignment_source=active.get("assignment_source") if active else None,
+    )
+    return {
+        "vehicle_id": resolution.vehicle_id,
+        "year": resolution.year,
+        "make": resolution.make,
+        "model": resolution.model,
+        "trim": resolution.trim,
+        "image_asset_path": resolution.image_asset_path,
+        "fallback_image_asset_path": resolution.fallback_image_asset_path,
+        "model_3d_ref": resolution.model_3d_ref,
+        "resolved_from": resolution.resolved_from,
+        "lookup_key_used": resolution.lookup_key_used,
+    }
+
+
+@app.get("/vehicle-image/current")
+def current_vehicle_image(manual_vehicle_id: str | None = None) -> dict:
+    return _resolve_vehicle_image(manual_vehicle_id)
+
+
 @app.get("/dashboard/state")
 def dashboard_state() -> dict:
     active = None
@@ -731,6 +762,7 @@ def dashboard_state() -> dict:
         "polling_supported_pids": LIVE_POLLING_SUPPORTED_PIDS,
         "learning_records": learning_records[-40:],
         "learning_library": store.command_library,
+        "vehicle_image": _resolve_vehicle_image(active.get("vehicle_id") if active else None),
     }
 
 
@@ -791,8 +823,7 @@ def dashboard() -> str:
     button.secondary { background:#fff; color:var(--ink); }
     button.danger { background:var(--danger); border-color:var(--danger); }
     .tiny { font-size:.8rem; color:var(--muted); }
-    .vehicle-image { border:1px solid var(--line); border-radius:12px; min-height:220px; background:linear-gradient(135deg,#f8fafc,#e2e8f0); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; }
-    .vehicle-image .emoji { font-size:3.2rem; }
+    .vehicle-image { border:1px solid var(--line); border-radius:12px; min-height:220px; background:linear-gradient(135deg,#f8fafc,#e2e8f0); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; padding:10px; }
     .ai-quick { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
     .ai-quick button { width:auto; min-height:40px; padding:10px 12px; font-size:.9rem; }
     @media (max-width:640px) { .btn-grid { grid-template-columns:1fr; } }
@@ -809,8 +840,14 @@ def dashboard() -> str:
 
     <div class="card">
       <h2 class="title">Main Controls</h2>
-      <label class="tiny" for="vehicleSelect">Current vehicle</label>
+      <label class="tiny" for="vehicleSelect">Current Vehicle</label>
       <select id="vehicleSelect"></select>
+      <h2 class="title" style="margin-top:14px;">Current Vehicle Image</h2>
+      <div class="vehicle-image">
+        <img id="vehicleImageAsset" alt="Current vehicle image" style="width:100%;max-width:560px;border-radius:10px;border:1px solid var(--line);" />
+        <div id="vehicleImageLabel" style="font-weight:700;">Vehicle placeholder</div>
+        <div class="tiny" id="vehicleImageSource">Loading vehicle source…</div>
+      </div>
       <div class="btn-grid" style="margin-top:10px;">
         <button id="connectVehicleBtn" class="secondary">Connect Vehicle</button>
         <button id="startSessionBtn">Start Vehicle Check</button>
@@ -821,15 +858,6 @@ def dashboard() -> str:
         <button id="reportsBtn" class="secondary">Reports</button>
         <button id="liveGaugesBtn" class="secondary">Live Gauges</button>
         <button id="askAiBtn">Ask AI Mechanic</button>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2 class="title">Current Vehicle Image</h2>
-      <div class="vehicle-image">
-        <div class="emoji">🚗</div>
-        <div id="vehicleImageLabel" style="font-weight:700;">Vehicle placeholder</div>
-        <div class="tiny">Placeholder area ready for real vehicle images.</div>
       </div>
     </div>
 
@@ -875,12 +903,26 @@ function renderVehicles(){
     const opt=document.createElement('option'); opt.value=v.vehicle_id; opt.textContent=`${v.label} (${v.protocol_hint})`;
     if (v.vehicle_id===selectedVehicleId) opt.selected=true; select.appendChild(opt);
   });
-  select.onchange=(e)=>{ selectedVehicleId=e.target.value; updateVehicleImageLabel(); };
-  updateVehicleImageLabel();
+  select.onchange=async (e)=>{ selectedVehicleId=e.target.value; await updateVehicleImage(); };
+  updateVehicleImage();
 }
-function updateVehicleImageLabel(){
-  const vehicle = state && state.vehicles ? state.vehicles.find(v => v.vehicle_id === selectedVehicleId) : null;
-  document.getElementById('vehicleImageLabel').textContent = vehicle ? vehicle.label : selectedVehicleId;
+async function updateVehicleImage(){
+  const res = await fetch(`/vehicle-image/current?manual_vehicle_id=${encodeURIComponent(selectedVehicleId)}`);
+  const image = await res.json();
+  const trim = image.trim ? ` ${image.trim}` : '';
+  const label = `${image.year || ''} ${image.make} ${image.model}${trim}`.replace(/\s+/g,' ').trim();
+  document.getElementById('vehicleImageLabel').textContent = label || 'Generic vehicle';
+  const sourceMap = {
+    auto_vin: 'Auto VIN detection result',
+    manual_selection: 'Manual vehicle selection fallback',
+    active_session_vehicle: 'Active session vehicle fallback',
+    closest_supported: 'Closest supported vehicle image fallback',
+    generic_placeholder: 'Generic placeholder image'
+  };
+  document.getElementById('vehicleImageSource').textContent = sourceMap[image.resolved_from] || image.resolved_from;
+  const img = document.getElementById('vehicleImageAsset');
+  img.src = image.image_asset_path || image.fallback_image_asset_path;
+  img.onerror = () => { img.src = image.fallback_image_asset_path; };
 }
 function renderBluetoothCard(){
   const status = phoneBridge.status || 'disconnected';
