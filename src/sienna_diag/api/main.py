@@ -734,6 +734,37 @@ def dashboard_state() -> dict:
     }
 
 
+@app.post("/ai/mechanic")
+def ai_mechanic(payload: dict) -> dict:
+    question = str(payload.get("question") or "").strip()
+    active = store.get_session(store.active_session_id).model_dump() if store.active_session_id else None
+    reads = [item.model_dump() for item in store.get_reads(active["session_id"])] if active else []
+    events = [item.model_dump() for item in store.get_events(active["session_id"])] if active else []
+    latest_live_data = reads[-5:]
+    context = {
+        "current_vehicle": active.get("vehicle") if active else None,
+        "vin": active.get("vin") if active else None,
+        "current_mode": phone_bridge_state.get("source_mode"),
+        "active_vehicle_check": active.get("session_id") if active else None,
+        "dtcs": [r for r in reads if str(r.get("pid_key", "")).lower().startswith("dtc")],
+        "latest_live_data": latest_live_data,
+        "captured_events": events[-10:],
+        "reports": ["Customer Summary", "Technician Detail", "AI Training Export"],
+    }
+    if not question:
+        answer = "Please ask a question about your vehicle, active vehicle check, codes, live data, or next steps."
+    else:
+        answer = (
+            f"For '{question}', I reviewed the current vehicle context. "
+            f"Vehicle: {context['current_vehicle'] or 'Not selected yet'}. "
+            f"VIN: {context['vin'] or 'Not available yet'}. "
+            f"Active Vehicle Check: {context['active_vehicle_check'] or 'None'}. "
+            f"I can help explain DTC meaning in plain English, safety-to-drive guidance, and recommended next tests "
+            f"using live data and captured events from this check."
+        )
+    return {"answer": answer, "context": context}
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard() -> str:
     return """
@@ -744,10 +775,10 @@ def dashboard() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Zeb’s OBD AI Dashboard</title>
   <style>
-    :root { --bg:#edf2f7; --card:#fff; --ink:#0f172a; --muted:#475569; --line:#d4dde7; --primary:#0f766e; --primary-dark:#0b5a55; --danger:#c2410c; --warn:#b45309; --ok:#15803d; }
-    * { box-sizing: border-box; }
+    :root { --bg:#edf2f7; --card:#fff; --ink:#0f172a; --muted:#475569; --line:#d4dde7; --primary:#0f766e; --danger:#c2410c; --ok:#15803d; }
+    * { box-sizing:border-box; }
     body { margin:0; font-family:"Segoe UI", system-ui, sans-serif; background:var(--bg); color:var(--ink); }
-    .wrap { max-width: 1024px; margin:0 auto; padding:14px; display:grid; gap:12px; }
+    .wrap { max-width:1024px; margin:0 auto; padding:14px; display:grid; gap:12px; }
     .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; }
     .row { display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
     .title { margin:0 0 10px; font-size:1.05rem; }
@@ -757,180 +788,173 @@ def dashboard() -> str:
     .btn-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
     button, select, input { width:100%; border-radius:12px; border:1px solid var(--line); padding:14px; font-size:1rem; }
     button { background:var(--primary); border-color:var(--primary); color:#fff; font-weight:700; min-height:56px; }
-    button:active { transform:scale(0.99); }
-    button:disabled { opacity:0.5; cursor:not-allowed; transform:none; }
-    button.secondary { background:#fff; color:var(--ink); border-color:var(--line); }
+    button.secondary { background:#fff; color:var(--ink); }
     button.danger { background:var(--danger); border-color:var(--danger); }
-    .pill { display:inline-block; border-radius:999px; padding:6px 10px; font-size:.8rem; font-weight:800; color:#fff; }
-    .pill.mock { background:#64748b; } .pill.phone-live { background:#2563eb; } .pill.local-hardware { background:#15803d; }
-    .pill.connected { background:var(--ok); }
-    .pill.connecting { background:#2563eb; }
-    .pill.failed { background:var(--danger); }
-    .pill.disconnected { background:#64748b; }
-    .pill.idle { background:#64748b; }
-    .spinner { display:inline-block; width:14px; height:14px; border:2px solid rgba(255,255,255,0.5); border-top-color:#fff; border-radius:50%; animation:spin 0.8s linear infinite; margin-right:8px; vertical-align:-2px; }
-    .spinner.dark { border-color:rgba(15,23,42,0.2); border-top-color:#0f172a; }
-    .connection-meta { display:grid; gap:6px; margin-top:10px; }
-    @keyframes spin { to { transform: rotate(360deg); } }
     .tiny { font-size:.8rem; color:var(--muted); }
-    .gauge-grid { display:grid; gap:10px; grid-template-columns:1fr; }
-    .gauge { border:1px solid var(--line); border-radius:12px; padding:10px; background:#fcfdff; }
-    .gauge h4 { margin:0 0 8px; }
-    .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-    pre { margin:0; background:#0b1220; color:#dbeafe; border-radius:10px; padding:10px; overflow:auto; font-size:.78rem; max-height:220px; }
-    @media (max-width: 640px) { .btn-grid { grid-template-columns:1fr; } }
+    .vehicle-image { border:1px solid var(--line); border-radius:12px; min-height:220px; background:linear-gradient(135deg,#f8fafc,#e2e8f0); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; }
+    .vehicle-image .emoji { font-size:3.2rem; }
+    .ai-quick { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+    .ai-quick button { width:auto; min-height:40px; padding:10px 12px; font-size:.9rem; }
+    @media (max-width:640px) { .btn-grid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
-      <h1 style="margin:0;">Zeb’s OBD AI — Phase 1 Dashboard</h1>
-      <div class="tiny">Phone-first workflow for safe read-only diagnostics. Mock/live source is always visible.</div>
+      <h1 style="margin:0;">Zeb’s OBD AI — Vehicle Dashboard</h1>
+      <div class="tiny">Simple phone-first workflow for safe read-only diagnostics.</div>
     </div>
 
     <div class="row" id="statusCards"></div>
 
     <div class="card">
       <h2 class="title">Main Controls</h2>
-      <label class="tiny" for="vehicleSelect">Active vehicle profile</label>
+      <label class="tiny" for="vehicleSelect">Current vehicle</label>
       <select id="vehicleSelect"></select>
       <div class="btn-grid" style="margin-top:10px;">
         <button id="connectVehicleBtn" class="secondary">Connect Vehicle</button>
-        <button id="startSessionBtn">Start Session</button>
-        <button id="stopSessionBtn" class="danger">Stop Session</button>
-        <button id="readRpmBtn">Read RPM</button>
-        <button id="readCoolantBtn">Read Coolant Temp</button>
+        <button id="startSessionBtn">Start Vehicle Check</button>
+        <button id="stopSessionBtn" class="danger">End Vehicle Check</button>
         <button id="startCaptureBtn">Start Capture</button>
         <button id="stopCaptureBtn" class="danger">Stop Capture</button>
         <button id="tagEventBtn" class="secondary">Tag Event</button>
         <button id="reportsBtn" class="secondary">Reports</button>
+        <button id="liveGaugesBtn" class="secondary">Live Gauges</button>
+        <button id="askAiBtn">Ask AI Mechanic</button>
       </div>
-      <div class="btn-grid" style="margin-top:10px;">
-        <button id="quickRpmBtn">Quick RPM</button>
-        <button id="quickCoolantBtn">Quick Coolant Temp</button>
+    </div>
+
+    <div class="card">
+      <h2 class="title">Current Vehicle Image</h2>
+      <div class="vehicle-image">
+        <div class="emoji">🚗</div>
+        <div id="vehicleImageLabel" style="font-weight:700;">Vehicle placeholder</div>
+        <div class="tiny">Placeholder area ready for real vehicle images.</div>
       </div>
     </div>
 
     <div class="card" id="bluetoothCard">
       <h2 class="title">OBDLINK BLUETOOTH</h2>
       <div class="status-value" id="btStatusText">Disconnected</div>
-      <div class="connection-meta tiny">
-        <div><strong>Adapter:</strong> <span id="btAdapterName">-</span></div>
-        <div><strong>Last attempt:</strong> <span id="btLastAttempt">None</span></div>
-        <div><strong>Error:</strong> <span id="btError">None</span></div>
-      </div>
-    </div>
-
-    <div class="card" id="gaugePage">
-      <h2 class="title">4-Gauge Presets</h2>
-      <div class="grid2">
-        <input id="presetName" placeholder="Preset name" value="Default" />
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-          <button id="savePresetBtn" class="secondary">Save Preset</button>
-          <button id="loadPresetBtn" class="secondary">Load Preset</button>
-        </div>
-      </div>
-      <div class="tiny" style="margin-top:8px;">Each gauge supports sensor assignment, label, range, unit, warning and critical thresholds.</div>
-      <div class="gauge-grid" id="gaugeGrid" style="margin-top:10px;"></div>
+      <div class="tiny" id="btError">None</div>
     </div>
 
     <div class="card">
-      <h2 class="title">Reports Framework (Phase 1 Hooks)</h2>
-      <div id="reportHooks" class="row"></div>
-    </div>
-
-    <div class="card">
-      <h2 class="title">Developer / Debug Panel</h2>
-      <div class="tiny">Read source classification: MOCK, PHONE-LIVE, LOCAL-HARDWARE, or BROWSER-DEV. Connection states: disconnected, connecting, connected, failed.</div>
-      <pre id="debugPanel">Loading...</pre>
+      <h2 class="title">AI Mechanic Quick Prompts</h2>
+      <div class="ai-quick">
+        <button class="secondary" onclick="openAiWithPrompt('What does this code mean?')">What does this code mean?</button>
+        <button class="secondary" onclick="openAiWithPrompt('Is it safe to drive?')">Is it safe to drive?</button>
+        <button class="secondary" onclick="openAiWithPrompt('What should I test next?')">What should I test next?</button>
+        <button class="secondary" onclick="openAiWithPrompt('Explain this in simple language')">Explain this in simple language</button>
+      </div>
     </div>
   </div>
-
 <script>
 let state = null;
-let selectedVehicleId = "toyota_sienna_2006";
-let pollingHandle = null;
-let phoneBridge = { status: 'disconnected', adapter_name: 'OBDLink MX+', last_error: null, backend_status: 'idle', source_mode: 'PHONE-LIVE', polling_state: 'inactive', polling_interval_ms: 500 };
-const SENSOR_TO_PID = { rpm:'010C', coolant_temp:'0105', control_module_voltage:'0142', intake_air_temp:'010F', vehicle_speed:'010D', throttle_position:'0111', vin:'0902' };
-const GAUGE_SENSORS = ['rpm','coolant_temp','control_module_voltage','vehicle_speed','throttle_position','intake_air_temp'];
-let gauges = [0,1,2,3].map(i => ({slot:i+1, sensor:GAUGE_SENSORS[i] || 'rpm', label:`Gauge ${i+1}`, min:0, max:8000, unit:'', warn:4500, critical:6000}));
-
-const MobileBluetoothService = {
-  async connectToAdapter() {
-    const payload = { platform: detectPlatform(), adapter_name: 'OBDLink MX+', status: 'connected', permission_state: detectPlatform().startsWith('i') ? 'ios-managed' : 'android-managed', source_mode: 'PHONE-LIVE', supports_native_bluetooth: true };
-    await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
-    await fetchState();
-    startGaugePolling();
-  },
-  async disconnectAdapter() { await fetch('/phone/bridge/disconnect', { method:'POST' }); stopGaugePolling(); await fetchState(); },
-  async readPid(pid, pidKey, polling=false) {
-    if ((phoneBridge.status || 'disconnected') !== 'connected') throw new Error('OBDLink disconnected/offline.');
-    const active = await ensureSession();
-    const started = Date.now();
-    const payload = { session_id:active.session_id, vehicle_id:active.vehicle_id, command:pid, raw_response:`PHONE-NATIVE:${pid}:awaiting-native-payload`, pid_key:pidKey, value:null, unit:null, source_mode:'PHONE-LIVE', source_hint:'iso9141_2', latency_ms:Date.now()-started, backend_status:'submitted-from-phone-ui', polling };
-    await fetch('/phone/bridge/read', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
-  },
-  async readVin() { await this.readPid('0902', 'vin', false); },
-  getConnectionState() { return phoneBridge.status || 'disconnected'; },
-};
-
-function detectPlatform(){ const ua = navigator.userAgent || ''; if (/iPad/i.test(ua)) return 'ipad'; if (/iPhone|iPod/i.test(ua)) return 'ios'; if (/Android/i.test(ua)) return 'android'; return 'unknown'; }
-function modeCss(mode){ return String(mode||'').toLowerCase().replace(/\s+/g,'-'); }
+let selectedVehicleId = 'toyota_sienna_2006';
+let phoneBridge = { status: 'disconnected', source_mode: 'PHONE-LIVE' };
 function card(label, value){ return `<div class="card status-card"><div class="status-label">${label}</div><div class="status-value">${value || '-'}</div></div>`; }
+async function fetchState(){
+  const res = await fetch('/dashboard/state');
+  state = await res.json();
+  phoneBridge = { ...phoneBridge, ...state.phone_bridge };
+  renderStatusCards(); renderVehicles(); renderBluetoothCard();
+}
 function renderStatusCards(){
-  const mode = state.adapter_mode || 'MOCK';
-  const bridgeState = phoneBridge.status || 'disconnected';
   const active = state.active_session;
-  const lastRead = state.last_successful_read ? `${state.last_successful_read.pid_key || state.last_successful_read.command}=${state.last_successful_read.value ?? state.last_successful_read.raw_response}` : 'None';
   document.getElementById('statusCards').innerHTML = [
-    card('Current mode', `<span class="pill ${modeCss(mode)}">${mode}</span>`),
-    card('Bluetooth state', `<span class="pill ${modeCss(bridgeState)}">${bridgeState}</span>`),
-    card('Polling', `${phoneBridge.polling_state} @ ${phoneBridge.polling_interval_ms}ms`),
-    card('Source badge', `<span class="pill ${modeCss(phoneBridge.source_mode || 'mock')}">${phoneBridge.source_mode || 'MOCK'}</span>`),
+    card('Current mode', state.adapter_mode || 'MOCK'),
+    card('Bluetooth state', phoneBridge.status || 'disconnected'),
     card('Active vehicle', active ? active.vehicle : selectedVehicleId),
-    card('Active session', active ? active.session_id : 'None'),
-    card('Last successful read', lastRead)
+    card('Active Vehicle Check', active ? active.session_id : 'None')
   ].join('');
 }
-function setReadButtonsEnabled(enabled){ ['readRpmBtn','readCoolantBtn','quickRpmBtn','quickCoolantBtn'].forEach(id => { const btn = document.getElementById(id); if (btn) btn.disabled = !enabled; }); }
-function renderBluetoothCard(){ const status = phoneBridge.status || 'disconnected'; document.getElementById('btStatusText').textContent = status.charAt(0).toUpperCase() + status.slice(1); document.getElementById('btAdapterName').textContent = phoneBridge.adapter_name || 'Not found'; document.getElementById('btLastAttempt').textContent = phoneBridge.updated_at || 'None'; document.getElementById('btError').textContent = phoneBridge.last_error || 'None'; setReadButtonsEnabled(status === 'connected'); document.getElementById('connectVehicleBtn').textContent = status === 'connected' ? 'Reconnect Vehicle' : 'Connect Vehicle'; }
-function renderVehicles(){ const select = document.getElementById('vehicleSelect'); select.innerHTML=''; state.vehicles.forEach(v=>{ const opt=document.createElement('option'); opt.value=v.vehicle_id; opt.textContent=`${v.label} (${v.protocol_hint})`; if(v.vehicle_id===selectedVehicleId) opt.selected=true; select.appendChild(opt); }); select.onchange=(e)=>selectedVehicleId=e.target.value; }
-function gaugeEditor(idx,g){ return `<div class="gauge"><h4>${g.label}</h4><div class="grid2"><select data-field="sensor" data-idx="${idx}">${GAUGE_SENSORS.map(s=>`<option value="${s}" ${g.sensor===s?'selected':''}>${s}</option>`).join('')}</select><input data-field="label" data-idx="${idx}" value="${g.label}" placeholder="Label" /><input data-field="min" data-idx="${idx}" type="number" value="${g.min}" placeholder="Min" /><input data-field="max" data-idx="${idx}" type="number" value="${g.max}" placeholder="Max" /><input data-field="unit" data-idx="${idx}" value="${g.unit}" placeholder="Unit" /><input data-field="warn" data-idx="${idx}" type="number" value="${g.warn}" placeholder="Warning" /><input data-field="critical" data-idx="${idx}" type="number" value="${g.critical}" placeholder="Critical" /></div><div class="tiny" id="gaugeLive${idx}">Disconnected</div></div>`; }
-function renderGauges(){ const grid=document.getElementById('gaugeGrid'); grid.innerHTML=gauges.map((g,i)=>gaugeEditor(i,g)).join(''); grid.querySelectorAll('input,select').forEach(el=>{el.onchange=(e)=>{const idx=Number(e.target.dataset.idx); const field=e.target.dataset.field; const val=e.target.type==='number'?Number(e.target.value):e.target.value; gauges[idx][field]=val;};}); const reads=(state.recent_reads||[]).slice().reverse(); gauges.forEach((g,i)=>{ const found=reads.find(r=>r.pid_key===g.sensor||r.command===SENSOR_TO_PID[g.sensor]); document.getElementById(`gaugeLive${i}`).textContent=found?`${g.label}: ${found.value ?? found.raw_response} ${g.unit || found.unit || ''} [${found.source_mode}]`:`${g.label}: ${phoneBridge.status === 'connected' ? 'Waiting for 500ms polling' : 'Disconnected'}`; }); }
-function renderReports(){ document.getElementById('reportHooks').innerHTML = state.report_tiers.map(t=>`<div class="card"><div style="font-weight:700;">${t.label}</div><div class="tiny" style="margin:6px 0 10px;">${t.description}</div><button class="secondary" onclick="reportHook('${t.id}')">Open ${t.label}</button></div>`).join(''); }
-function renderDebug(){ document.getElementById('debugPanel').textContent = JSON.stringify({ platform:phoneBridge.platform, bluetooth_connection_state:phoneBridge.status, polling_active:phoneBridge.polling_state, last_pid_command:phoneBridge.last_command, last_pid_response:phoneBridge.last_response, last_vin_command:phoneBridge.last_vin_command, vin_parse_status:phoneBridge.vin_parse_status, mode_badge:phoneBridge.source_mode || (phoneBridge.status === 'connected' ? 'PHONE-LIVE' : 'MOCK'), last_error:phoneBridge.last_error, latency_ms:phoneBridge.last_latency_ms, last_replayed_command:phoneBridge.last_replayed_command, command_learning_status:phoneBridge.command_learning_status, passive_can_capture_status:phoneBridge.passive_can_capture_status }, null, 2); }
-async function fetchState(){ const res = await fetch('/dashboard/state'); state = await res.json(); phoneBridge = { ...phoneBridge, ...state.phone_bridge }; renderStatusCards(); renderVehicles(); renderBluetoothCard(); renderGauges(); renderReports(); renderDebug(); }
+function renderVehicles(){
+  const select = document.getElementById('vehicleSelect'); select.innerHTML='';
+  state.vehicles.forEach(v => {
+    const opt=document.createElement('option'); opt.value=v.vehicle_id; opt.textContent=`${v.label} (${v.protocol_hint})`;
+    if (v.vehicle_id===selectedVehicleId) opt.selected=true; select.appendChild(opt);
+  });
+  select.onchange=(e)=>{ selectedVehicleId=e.target.value; updateVehicleImageLabel(); };
+  updateVehicleImageLabel();
+}
+function updateVehicleImageLabel(){
+  const vehicle = state && state.vehicles ? state.vehicles.find(v => v.vehicle_id === selectedVehicleId) : null;
+  document.getElementById('vehicleImageLabel').textContent = vehicle ? vehicle.label : selectedVehicleId;
+}
+function renderBluetoothCard(){
+  const status = phoneBridge.status || 'disconnected';
+  document.getElementById('btStatusText').textContent = status.charAt(0).toUpperCase() + status.slice(1);
+  document.getElementById('btError').textContent = phoneBridge.last_error || 'No Bluetooth errors';
+}
 async function ensureSession(){ if (state && state.active_session) return state.active_session; await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})}); await fetchState(); return state.active_session; }
 async function createSession(){ await ensureSession(); }
-async function stopSession(){ stopGaugePolling(); await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
+async function stopSession(){ await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
 async function startCapture(){ await ensureSession(); await fetch('/capture/start',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId,preset:'cold_start_capture'})}); await fetchState(); }
 async function stopCapture(){ await fetch('/capture/stop',{method:'POST'}); await fetchState(); }
-async function tagEvent(){ if (!state.active_session) { alert('Session missing: create/resume session first.'); return; } await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:'idle'})}); await fetchState(); }
-async function connectVehicle(){ try { await MobileBluetoothService.connectToAdapter(); await MobileBluetoothService.readVin(); await fetchState(); } catch (err) { phoneBridge.status='failed'; phoneBridge.last_error = err && err.message ? err.message : String(err); renderBluetoothCard(); renderDebug(); } }
-async function sendPhoneLiveRead(sensorKey){ try { await MobileBluetoothService.readPid(SENSOR_TO_PID[sensorKey], sensorKey, false); await fetchState(); } catch(err) { alert(err.message || String(err)); } }
-async function pollAllGaugesOnce(){ if ((phoneBridge.status || 'disconnected') !== 'connected') { stopGaugePolling(); return; } const jobs = gauges.map(g => MobileBluetoothService.readPid(SENSOR_TO_PID[g.sensor], g.sensor, true)); await Promise.allSettled(jobs); await fetchState(); }
-function startGaugePolling(){ if (pollingHandle) return; phoneBridge.polling_state='active'; pollingHandle = setInterval(() => { pollAllGaugesOnce(); }, 500); }
-function stopGaugePolling(){ if (pollingHandle) { clearInterval(pollingHandle); pollingHandle = null; } phoneBridge.polling_state='inactive'; }
-function reportHook(id){ alert(`Phase 2 hook remains: ${id}`); }
-function savePreset(){ const name=document.getElementById('presetName').value||'Default'; localStorage.setItem(`gaugePreset:${name}`, JSON.stringify(gauges)); }
-function loadPreset(){ const name=document.getElementById('presetName').value||'Default'; const raw=localStorage.getItem(`gaugePreset:${name}`); if(raw){gauges=JSON.parse(raw); renderGauges();} }
+async function tagEvent(){ if (!state.active_session) { alert('Vehicle Check missing: start Vehicle Check first.'); return; } await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:'idle'})}); await fetchState(); }
+async function connectVehicle(){ await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ platform:'unknown', adapter_name:'OBDLink MX+', status:'connected', source_mode:'PHONE-LIVE', supports_native_bluetooth:true }) }); await fetchState(); }
+function openAiWithPrompt(prompt){ window.location.href = `/dashboard/ai?prompt=${encodeURIComponent(prompt || '')}`; }
 document.getElementById('connectVehicleBtn').onclick = connectVehicle;
 document.getElementById('startSessionBtn').onclick = createSession;
 document.getElementById('stopSessionBtn').onclick = stopSession;
-document.getElementById('readRpmBtn').onclick = () => sendPhoneLiveRead('rpm');
-document.getElementById('readCoolantBtn').onclick = () => sendPhoneLiveRead('coolant_temp');
 document.getElementById('startCaptureBtn').onclick = startCapture;
 document.getElementById('stopCaptureBtn').onclick = stopCapture;
 document.getElementById('tagEventBtn').onclick = tagEvent;
-document.getElementById('reportsBtn').onclick = () => document.getElementById('reportHooks').scrollIntoView({behavior:'smooth'});
-document.getElementById('quickRpmBtn').onclick = () => sendPhoneLiveRead('rpm');
-document.getElementById('quickCoolantBtn').onclick = () => sendPhoneLiveRead('coolant_temp');
-document.getElementById('savePresetBtn').onclick = savePreset;
-document.getElementById('loadPresetBtn').onclick = loadPreset;
-setReadButtonsEnabled(false);
+document.getElementById('reportsBtn').onclick = () => alert('Reports view is available in the report framework section.');
+document.getElementById('liveGaugesBtn').onclick = () => window.location.href = '/dashboard/gauges';
+document.getElementById('askAiBtn').onclick = () => openAiWithPrompt('');
 setInterval(fetchState, 1500);
 fetchState();
 </script>
 </body>
 </html>
+    """
+
+
+@app.get('/dashboard/gauges', response_class=HTMLResponse)
+def gauge_dashboard() -> str:
+    return """
+<!doctype html><html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Live Gauges</title>
+<style>
+body{margin:0;font-family:Segoe UI,system-ui,sans-serif;background:#edf2f7;color:#0f172a;} .wrap{max-width:1024px;margin:0 auto;padding:14px;display:grid;gap:12px;} .card{background:#fff;border:1px solid #d4dde7;border-radius:14px;padding:14px;} .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;} .gauge-grid{display:grid;gap:10px;} .gauge{border:1px solid #d4dde7;border-radius:12px;padding:10px;background:#fcfdff;} .tiny{font-size:.8rem;color:#475569;} button,select,input{width:100%;border-radius:12px;border:1px solid #d4dde7;padding:12px;} button{background:#0f766e;color:#fff;font-weight:700;} button.secondary{background:#fff;color:#0f172a;}
+</style></head><body><div class="wrap"><div class="card"><h1 style="margin:0">Live Gauges</h1><div class="tiny">Dedicated 4-gauge page with side controls and 500ms live polling.</div></div>
+<div class="card"><div class="grid2"><input id="presetName" value="Default" placeholder="Preset name" /><div class="grid2"><button id="savePresetBtn" class="secondary">Save Preset</button><button id="loadPresetBtn" class="secondary">Load Preset</button></div></div><div class="gauge-grid" id="gaugeGrid" style="margin-top:10px;"></div></div>
+<div class="card"><div class="grid2"><button id="startPollingBtn">Start Live Polling</button><button id="stopPollingBtn" class="secondary">Stop Live Polling</button></div><button id="backBtn" class="secondary" style="margin-top:8px;">Back to Main Dashboard</button></div>
+</div>
+<script>
+let state=null; let pollingHandle=null; let phoneBridge={status:'disconnected'};
+const SENSOR_TO_PID={rpm:'010C',coolant_temp:'0105',control_module_voltage:'0142',intake_air_temp:'010F',vehicle_speed:'010D',throttle_position:'0111'};
+const GAUGE_SENSORS=['rpm','coolant_temp','control_module_voltage','vehicle_speed','throttle_position','intake_air_temp'];
+let gauges=[0,1,2,3].map(i=>({slot:i+1,sensor:GAUGE_SENSORS[i]||'rpm',label:`Gauge ${i+1}`,min:0,max:8000,unit:'',warn:4500,critical:6000}));
+function gaugeEditor(idx,g){return `<div class="gauge"><h4>${g.label}</h4><div class="grid2"><select data-field="sensor" data-idx="${idx}">${GAUGE_SENSORS.map(s=>`<option value="${s}" ${g.sensor===s?'selected':''}>${s}</option>`).join('')}</select><input data-field="label" data-idx="${idx}" value="${g.label}" placeholder="Label" /><input data-field="unit" data-idx="${idx}" value="${g.unit}" placeholder="Unit" /><input data-field="warn" data-idx="${idx}" type="number" value="${g.warn}" placeholder="Warn" /><input data-field="critical" data-idx="${idx}" type="number" value="${g.critical}" placeholder="Critical" /></div><div class="tiny" id="gaugeLive${idx}">Disconnected</div></div>`;}
+function renderGauges(){const grid=document.getElementById('gaugeGrid');grid.innerHTML=gauges.map((g,i)=>gaugeEditor(i,g)).join('');grid.querySelectorAll('input,select').forEach(el=>el.onchange=(e)=>{const i=Number(e.target.dataset.idx);const f=e.target.dataset.field;gauges[i][f]=e.target.type==='number'?Number(e.target.value):e.target.value;});const reads=(state&&state.recent_reads?state.recent_reads:[]).slice().reverse();gauges.forEach((g,i)=>{const found=reads.find(r=>r.pid_key===g.sensor||r.command===SENSOR_TO_PID[g.sensor]);document.getElementById(`gaugeLive${i}`).textContent=found?`${g.label}: ${found.value ?? found.raw_response} ${g.unit || found.unit || ''} [${found.source_mode}]`:`${g.label}: ${(phoneBridge.status==='connected')?'Waiting for 500ms polling':'Disconnected'}`;});}
+async function fetchState(){const res=await fetch('/dashboard/state');state=await res.json();phoneBridge={...phoneBridge,...state.phone_bridge};renderGauges();}
+async function ensureSession(){if(state&&state.active_session)return state.active_session;await fetch('/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vehicle_id:'toyota_sienna_2006'})});await fetchState();return state.active_session;}
+async function pollAllGaugesOnce(){if((phoneBridge.status||'disconnected')!=='connected'){stopGaugePolling();return;}const active=await ensureSession();const jobs=gauges.map(g=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,command:SENSOR_TO_PID[g.sensor],pid_key:g.sensor,source_mode:'PHONE-LIVE',source_hint:'iso9141_2',polling:true,raw_response:'PHONE-NATIVE'})}));await Promise.allSettled(jobs);await fetchState();}
+function startGaugePolling(){if(pollingHandle)return;pollingHandle=setInterval(()=>{pollAllGaugesOnce();},500);} function stopGaugePolling(){if(pollingHandle){clearInterval(pollingHandle);pollingHandle=null;}}
+function savePreset(){const name=document.getElementById('presetName').value||'Default';localStorage.setItem(`gaugePreset:${name}`,JSON.stringify(gauges));}
+function loadPreset(){const name=document.getElementById('presetName').value||'Default';const raw=localStorage.getItem(`gaugePreset:${name}`);if(raw){gauges=JSON.parse(raw);renderGauges();}}
+document.getElementById('startPollingBtn').onclick=startGaugePolling; document.getElementById('stopPollingBtn').onclick=stopGaugePolling; document.getElementById('savePresetBtn').onclick=savePreset; document.getElementById('loadPresetBtn').onclick=loadPreset; document.getElementById('backBtn').onclick=()=>window.location.href='/dashboard';
+setInterval(fetchState,1200); fetchState();
+</script></body></html>
+    """
+
+
+@app.get('/dashboard/ai', response_class=HTMLResponse)
+def ai_dashboard() -> str:
+    return """
+<!doctype html><html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Ask AI Mechanic</title>
+<style>body{margin:0;font-family:Segoe UI,system-ui,sans-serif;background:#edf2f7;color:#0f172a}.wrap{max-width:900px;margin:0 auto;padding:14px;display:grid;gap:12px}.card{background:#fff;border:1px solid #d4dde7;border-radius:14px;padding:14px}textarea,input,button{width:100%;border-radius:12px;border:1px solid #d4dde7;padding:12px}button{background:#0f766e;color:#fff;font-weight:700}.secondary{background:#fff;color:#0f172a}.quick{display:flex;flex-wrap:wrap;gap:8px}.quick button{width:auto}</style>
+</head><body><div class="wrap"><div class="card"><h1 style="margin:0">Ask AI Mechanic</h1><div id="ctx" style="font-size:.85rem;color:#475569;margin-top:8px">Loading current vehicle context...</div></div>
+<div class="card"><input id="question" placeholder="Ask about your current vehicle, DTCs, live data, or next steps" /><button id="sendBtn" style="margin-top:8px">Send</button><div class="quick" style="margin-top:8px"><button class="secondary" onclick="setPrompt('What does this code mean?')">What does this code mean?</button><button class="secondary" onclick="setPrompt('Is it safe to drive?')">Is it safe to drive?</button><button class="secondary" onclick="setPrompt('What should I test next?')">What should I test next?</button><button class="secondary" onclick="setPrompt('Explain this in simple language')">Explain this in simple language</button></div></div>
+<div class="card"><h3 style="margin-top:0">AI Mechanic Answer</h3><div id="answer">Ask a question to get a context-aware answer.</div></div>
+<div class="card"><button class="secondary" id="backBtn">Back to Main Dashboard</button></div></div>
+<script>
+function setPrompt(v){document.getElementById('question').value=v;}
+async function loadContext(){const res=await fetch('/dashboard/state');const state=await res.json();const active=state.active_session;document.getElementById('ctx').textContent=`Vehicle: ${active?active.vehicle:'Not selected'} | VIN: ${active&&active.vin?active.vin:'Not available'} | Mode: ${state.adapter_mode || 'MOCK'} | Active Vehicle Check: ${active?active.session_id:'None'}`;}
+async function ask(){const q=document.getElementById('question').value;const res=await fetch('/ai/mechanic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});const data=await res.json();document.getElementById('answer').textContent=data.answer;}
+const params=new URLSearchParams(window.location.search);const prompt=params.get('prompt');if(prompt){setPrompt(prompt);}
+document.getElementById('sendBtn').onclick=ask;document.getElementById('backBtn').onclick=()=>window.location.href='/dashboard';loadContext();
+</script></body></html>
     """
