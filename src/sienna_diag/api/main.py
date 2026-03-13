@@ -1537,97 +1537,1075 @@ def dashboard() -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Zeb’s OBD AI Dashboard</title>
+  <title>Zeb's OBD AI Dashboard</title>
   <style>
-    :root { --bg:#edf2f7; --card:#fff; --ink:#0f172a; --muted:#475569; --line:#d4dde7; --primary:#0f766e; --danger:#c2410c; --ok:#15803d; }
-    * { box-sizing:border-box; }
-    body { margin:0; font-family:"Segoe UI", system-ui, sans-serif; background:var(--bg); color:var(--ink); }
-    .wrap { max-width:1024px; margin:0 auto; padding:14px; display:grid; gap:12px; }
-    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; }
-    .row { display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
-    .title { margin:0 0 10px; font-size:1.05rem; }
-    .status-card { border-left:5px solid var(--primary); }
-    .status-label { color:var(--muted); font-size:.82rem; text-transform:uppercase; letter-spacing:.02em; }
-    .status-value { font-size:1rem; font-weight:700; margin-top:4px; word-break:break-word; }
-    .btn-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-    button, select, input { width:100%; border-radius:12px; border:1px solid var(--line); padding:14px; font-size:1rem; }
-    button { background:var(--primary); border-color:var(--primary); color:#fff; font-weight:700; min-height:56px; }
-    button.secondary { background:#fff; color:var(--ink); }
-    button.danger { background:var(--danger); border-color:var(--danger); }
-    .tiny { font-size:.8rem; color:var(--muted); }
-    .vehicle-image { border:1px solid var(--line); border-radius:12px; min-height:220px; background:linear-gradient(135deg,#f8fafc,#e2e8f0); display:flex; flex-direction:column; gap:8px; padding:10px; }
-    .vehicle-canvas { width:100%; height:min(48vw,320px); min-height:220px; border-radius:10px; border:1px solid var(--line); background:#0f172a; touch-action:manipulation; }
-    .vehicle-fallback { width:100%; max-width:560px; border-radius:10px; border:1px solid var(--line); display:none; }
-    .component-pill { display:inline-flex; align-items:center; gap:6px; border-radius:999px; border:1px solid var(--line); padding:6px 10px; background:#fff; font-size:.82rem; }
-    .ai-quick { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
-    .ai-quick button { width:auto; min-height:40px; padding:10px 12px; font-size:.9rem; }
-    @media (max-width:640px) { .btn-grid { grid-template-columns:1fr; } }
+    :root {
+      --bg: #0B0F14;
+      --panel: #141B23;
+      --panel-elevated: #19222C;
+      --panel-strong: #1F2A35;
+      --accent: #00E5FF;
+      --accent-soft: rgba(0,229,255,0.18);
+      --success: #32D74B;
+      --warning: #FF9F0A;
+      --danger: #FF453A;
+      --text: #F5F7FA;
+      --text-secondary: #A7B0BA;
+      --border: rgba(255,255,255,0.08);
+      --border-strong: rgba(255,255,255,0.14);
+      --shadow-lg: 0 22px 48px rgba(0,0,0,0.34);
+      --shadow-md: 0 14px 30px rgba(0,0,0,0.26);
+      --radius-lg: 24px;
+      --radius-md: 20px;
+      --radius-sm: 16px;
+    }
+
+    * { box-sizing: border-box; }
+    html { color-scheme: dark; background: var(--bg); }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(0,229,255,0.14), transparent 28%),
+        radial-gradient(circle at top right, rgba(50,215,75,0.07), transparent 20%),
+        linear-gradient(180deg, #091018 0%, #0B0F14 52%, #0A0E13 100%);
+      position: relative;
+      overflow-x: hidden;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.38;
+      background:
+        linear-gradient(transparent 0, transparent calc(100% - 1px), rgba(255,255,255,0.02) calc(100% - 1px)),
+        linear-gradient(90deg, transparent 0, transparent calc(100% - 1px), rgba(255,255,255,0.02) calc(100% - 1px));
+      background-size: 100% 120px, 120px 100%;
+      mask-image: radial-gradient(circle at center, black 40%, transparent 88%);
+    }
+    ::selection { background: rgba(0,229,255,0.28); color: var(--text); }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .wrap {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 18px 14px 42px;
+      display: grid;
+      gap: 16px;
+      position: relative;
+      z-index: 1;
+    }
+    .card {
+      position: relative;
+      overflow: hidden;
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(25,34,44,0.98) 0%, rgba(20,27,35,0.96) 100%);
+      box-shadow: var(--shadow-lg);
+      padding: 18px;
+      animation: panelIn 0.55s ease both;
+    }
+    .card::after {
+      content: "";
+      position: absolute;
+      inset: 1px;
+      border-radius: calc(var(--radius-lg) - 1px);
+      border: 1px solid rgba(255,255,255,0.02);
+      pointer-events: none;
+    }
+    .hero-card {
+      padding: 22px;
+      background:
+        radial-gradient(circle at top right, rgba(0,229,255,0.12), transparent 34%),
+        linear-gradient(155deg, rgba(25,34,44,0.99) 0%, rgba(16,21,28,0.98) 100%);
+    }
+    .hero-grid,
+    .inspection-grid,
+    .support-grid {
+      display: grid;
+      gap: 16px;
+    }
+    .hero-main,
+    .hero-panel,
+    .inspection-sidebar {
+      display: grid;
+      gap: 14px;
+    }
+    .hero-title,
+    .metric-value,
+    .info-title {
+      font-family: "Eurostile", "Avenir Next", "Segoe UI", sans-serif;
+    }
+    .section-kicker,
+    .field-label,
+    .status-label,
+    .metric-label,
+    .detail-label {
+      text-transform: uppercase;
+      letter-spacing: 0.16em;
+      font-size: 0.72rem;
+      color: var(--text-secondary);
+    }
+    .section-kicker { color: var(--accent); }
+    .section-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .section-title {
+      margin: 6px 0 0;
+      font-size: 1.16rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+    .section-copy,
+    .hero-copy,
+    .tiny,
+    .panel-note {
+      color: var(--text-secondary);
+      line-height: 1.55;
+    }
+    .tiny { font-size: 0.84rem; }
+    .hero-title {
+      margin: 6px 0 0;
+      font-size: clamp(1.7rem, 5vw, 2.7rem);
+      line-height: 1.08;
+      letter-spacing: 0.02em;
+    }
+    .hero-copy {
+      margin: 0;
+      max-width: 60ch;
+      font-size: 0.96rem;
+    }
+    .hero-panel {
+      align-content: space-between;
+      padding: 18px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(11,15,20,0.72) 0%, rgba(16,21,28,0.94) 100%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+    }
+    .hero-badges,
+    .ai-quick {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .badge,
+    .component-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: var(--text);
+      min-height: 40px;
+    }
+    .badge-dot,
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(167,176,186,0.44);
+      box-shadow: 0 0 0 0 rgba(0,229,255,0);
+      flex: 0 0 auto;
+    }
+    .badge[data-tone="accent"] .badge-dot,
+    .status-indicator[data-tone="accent"] .status-dot,
+    .component-pill[data-tone="accent"] .status-dot {
+      background: var(--accent);
+      box-shadow: 0 0 0 6px rgba(0,229,255,0.14);
+    }
+    .badge[data-tone="success"] .badge-dot,
+    .status-indicator[data-tone="success"] .status-dot,
+    .component-pill[data-tone="success"] .status-dot {
+      background: var(--success);
+      box-shadow: 0 0 0 6px rgba(50,215,75,0.12);
+    }
+    .badge[data-tone="warning"] .badge-dot,
+    .status-indicator[data-tone="warning"] .status-dot,
+    .component-pill[data-tone="warning"] .status-dot {
+      background: var(--warning);
+      box-shadow: 0 0 0 6px rgba(255,159,10,0.13);
+    }
+    .badge[data-tone="danger"] .badge-dot,
+    .status-indicator[data-tone="danger"] .status-dot,
+    .component-pill[data-tone="danger"] .status-dot {
+      background: var(--danger);
+      box-shadow: 0 0 0 6px rgba(255,69,58,0.14);
+    }
+    .status-strip,
+    .telemetry-grid,
+    .action-grid,
+    .tool-grid {
+      display: grid;
+      gap: 12px;
+    }
+    .status-strip {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .status-indicator {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-height: 74px;
+      padding: 12px 14px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(11,15,20,0.42);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+    }
+    .status-value {
+      display: block;
+      margin-top: 4px;
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .telemetry-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .metric-card {
+      position: relative;
+      min-height: 118px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(25,34,44,0.98) 0%, rgba(15,20,26,0.94) 100%);
+      box-shadow: var(--shadow-md);
+      padding: 16px;
+      overflow: hidden;
+    }
+    .metric-card::before {
+      content: "";
+      position: absolute;
+      inset: auto 16px 16px 16px;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(0,229,255,0.42), transparent);
+      opacity: 0.6;
+    }
+    .metric-card[data-live="true"] {
+      border-color: rgba(0,229,255,0.24);
+      box-shadow:
+        var(--shadow-md),
+        0 0 0 1px rgba(0,229,255,0.05),
+        0 0 24px rgba(0,229,255,0.08);
+    }
+    .metric-value {
+      margin-top: 16px;
+      font-size: clamp(1.45rem, 5vw, 2.02rem);
+      font-weight: 700;
+      line-height: 1.05;
+    }
+    .metric-meta {
+      margin-top: 14px;
+      font-size: 0.82rem;
+      color: var(--text-secondary);
+    }
+    .inspection-grid {
+      align-items: start;
+    }
+    .vehicle-stage {
+      position: relative;
+      padding: 12px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border);
+      background:
+        radial-gradient(circle at top, rgba(0,229,255,0.08), transparent 50%),
+        linear-gradient(180deg, rgba(9,13,18,0.98) 0%, rgba(14,18,24,0.96) 100%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+      min-height: 260px;
+    }
+    .vehicle-stage::after {
+      content: "";
+      position: absolute;
+      inset: 12px;
+      border-radius: calc(var(--radius-md) - 6px);
+      border: 1px solid rgba(255,255,255,0.03);
+      pointer-events: none;
+    }
+    .vehicle-canvas {
+      width: 100%;
+      height: min(58vw, 380px);
+      min-height: 240px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,0.06);
+      background:
+        radial-gradient(circle at top, rgba(0,229,255,0.10), transparent 42%),
+        linear-gradient(180deg, #05080D 0%, #101720 100%);
+      touch-action: manipulation;
+      overflow: hidden;
+    }
+    .vehicle-fallback {
+      display: none;
+      width: 100%;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.02);
+    }
+    .info-panel {
+      display: grid;
+      gap: 12px;
+      padding: 16px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(17,23,30,0.92) 0%, rgba(13,17,22,0.95) 100%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+    }
+    .info-title {
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      color: var(--text);
+    }
+    button,
+    select,
+    input {
+      font: inherit;
+    }
+    button {
+      width: 100%;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      cursor: pointer;
+      transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+      -webkit-tap-highlight-color: transparent;
+    }
+    button:hover {
+      transform: translateY(-1px);
+      border-color: rgba(0,229,255,0.22);
+      box-shadow:
+        0 16px 30px rgba(0,0,0,0.24),
+        0 0 0 1px rgba(0,229,255,0.04);
+    }
+    button:active { transform: translateY(0); }
+    button[disabled] {
+      cursor: not-allowed;
+      opacity: 0.58;
+      box-shadow: none;
+      transform: none;
+    }
+    select {
+      width: 100%;
+      min-height: 54px;
+      border-radius: 16px;
+      padding: 14px 44px 14px 14px;
+      border: 1px solid var(--border-strong);
+      background:
+        linear-gradient(135deg, rgba(17,23,30,1) 0%, rgba(13,17,22,0.98) 100%);
+      color: var(--text);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+      appearance: none;
+    }
+    button:focus-visible,
+    select:focus-visible,
+    input:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .action-banner,
+    .action-tile,
+    .tool-tile,
+    .panel-button,
+    .quick-chip {
+      border-radius: var(--radius-md);
+      box-shadow: var(--shadow-md);
+      box-shadow: 0 16px 30px rgba(0,0,0,0.22);
+    }
+    .action-banner,
+    .action-tile,
+    .tool-tile,
+    .panel-button {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 18px;
+      text-align: left;
+      background: linear-gradient(180deg, rgba(25,34,44,0.98) 0%, rgba(16,21,28,0.96) 100%);
+      min-height: 82px;
+    }
+    .action-banner[data-tone="accent"],
+    .action-tile[data-tone="accent"],
+    .tool-tile[data-tone="accent"] {
+      border-color: rgba(0,229,255,0.24);
+      background: linear-gradient(135deg, rgba(0,229,255,0.10) 0%, rgba(18,26,34,0.96) 48%, rgba(13,17,22,0.98) 100%);
+    }
+    .action-banner[data-tone="success"],
+    .action-tile[data-tone="success"],
+    .tool-tile[data-tone="success"] {
+      border-color: rgba(50,215,75,0.26);
+      background: linear-gradient(135deg, rgba(50,215,75,0.12) 0%, rgba(17,25,21,0.96) 52%, rgba(13,17,22,0.98) 100%);
+    }
+    .action-banner[data-tone="danger"],
+    .action-tile[data-tone="danger"],
+    .tool-tile[data-tone="danger"] {
+      border-color: rgba(255,69,58,0.26);
+      background: linear-gradient(135deg, rgba(255,69,58,0.11) 0%, rgba(29,18,18,0.96) 52%, rgba(13,17,22,0.98) 100%);
+    }
+    .action-banner[data-tone="warning"],
+    .action-tile[data-tone="warning"],
+    .tool-tile[data-tone="warning"] {
+      border-color: rgba(255,159,10,0.24);
+      background: linear-gradient(135deg, rgba(255,159,10,0.10) 0%, rgba(31,22,14,0.96) 52%, rgba(13,17,22,0.98) 100%);
+    }
+    .action-banner[data-active="true"],
+    .action-tile[data-active="true"],
+    .tool-tile[data-active="true"] {
+      box-shadow:
+        0 20px 34px rgba(0,0,0,0.28),
+        0 0 0 1px rgba(255,255,255,0.03),
+        0 0 26px rgba(0,229,255,0.08);
+    }
+    .action-banner[data-pulse="true"],
+    .action-tile[data-pulse="true"],
+    .tool-tile[data-pulse="true"],
+    .badge[data-pulse="true"] {
+      animation: pulseGlow 2.2s ease-in-out infinite;
+    }
+    .action-grid,
+    .tool-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .action-tile,
+    .tool-tile {
+      flex-direction: column;
+      align-items: flex-start;
+      justify-content: space-between;
+      min-height: 138px;
+    }
+    .tool-tile {
+      min-height: 120px;
+      padding: 16px;
+    }
+    .tool-tile[data-feature="signature"] {
+      border-color: rgba(0,229,255,0.28);
+      background:
+        radial-gradient(circle at top right, rgba(0,229,255,0.14), transparent 36%),
+        linear-gradient(180deg, rgba(25,34,44,0.99) 0%, rgba(14,18,24,0.96) 100%);
+      box-shadow:
+        0 18px 34px rgba(0,0,0,0.28),
+        0 0 0 1px rgba(0,229,255,0.05),
+        0 0 26px rgba(0,229,255,0.10);
+    }
+    .tile-lead {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      width: 100%;
+    }
+    .tile-copy {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      min-width: 0;
+    }
+    .tile-title {
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      color: var(--text);
+    }
+    .tile-meta {
+      font-size: 0.84rem;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+    .tile-state {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.05);
+      color: var(--text);
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.10em;
+    }
+    .tile-icon {
+      display: grid;
+      place-items: center;
+      width: 50px;
+      height: 50px;
+      border-radius: 16px;
+      border: 1px solid var(--border);
+      background: rgba(8,12,18,0.54);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+      color: var(--text);
+      flex: 0 0 auto;
+    }
+    .tile-icon svg { width: 22px; height: 22px; }
+    .action-banner[data-tone="accent"] .tile-icon,
+    .action-tile[data-tone="accent"] .tile-icon,
+    .tool-tile[data-tone="accent"] .tile-icon,
+    .panel-button[data-tone="accent"] .tile-icon {
+      color: var(--accent);
+      border-color: rgba(0,229,255,0.22);
+      background: rgba(0,229,255,0.12);
+    }
+    .action-banner[data-tone="success"] .tile-icon,
+    .action-tile[data-tone="success"] .tile-icon,
+    .tool-tile[data-tone="success"] .tile-icon,
+    .panel-button[data-tone="success"] .tile-icon {
+      color: var(--success);
+      border-color: rgba(50,215,75,0.22);
+      background: rgba(50,215,75,0.10);
+    }
+    .action-banner[data-tone="danger"] .tile-icon,
+    .action-tile[data-tone="danger"] .tile-icon,
+    .tool-tile[data-tone="danger"] .tile-icon,
+    .panel-button[data-tone="danger"] .tile-icon {
+      color: var(--danger);
+      border-color: rgba(255,69,58,0.22);
+      background: rgba(255,69,58,0.10);
+    }
+    .action-banner[data-tone="warning"] .tile-icon,
+    .action-tile[data-tone="warning"] .tile-icon,
+    .tool-tile[data-tone="warning"] .tile-icon,
+    .panel-button[data-tone="warning"] .tile-icon {
+      color: var(--warning);
+      border-color: rgba(255,159,10,0.22);
+      background: rgba(255,159,10,0.10);
+    }
+    .panel-button {
+      min-height: 76px;
+      padding: 14px 16px;
+    }
+    .panel-button--ghost {
+      background: linear-gradient(180deg, rgba(18,24,30,0.96) 0%, rgba(12,16,21,0.96) 100%);
+    }
+    .quick-chip {
+      width: auto;
+      min-height: 42px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(10,14,20,0.82);
+      color: var(--text);
+      border: 1px solid var(--border);
+      font-size: 0.88rem;
+      line-height: 1.2;
+    }
+    .ai-panel {
+      margin-top: 16px;
+      padding: 18px;
+      border-radius: var(--radius-md);
+      border: 1px solid rgba(0,229,255,0.20);
+      background:
+        radial-gradient(circle at top right, rgba(0,229,255,0.14), transparent 35%),
+        linear-gradient(180deg, rgba(19,27,35,0.99) 0%, rgba(12,16,21,0.96) 100%);
+      box-shadow:
+        0 18px 36px rgba(0,0,0,0.28),
+        0 0 0 1px rgba(0,229,255,0.04),
+        0 0 28px rgba(0,229,255,0.10);
+    }
+    .support-grid {
+      gap: 16px;
+    }
+    .info-card {
+      display: grid;
+      gap: 14px;
+      min-height: 100%;
+    }
+    .detail-list,
+    .alert-list,
+    .timeline-list {
+      display: grid;
+      gap: 10px;
+    }
+    .detail-row,
+    .timeline-item,
+    .alert-item {
+      display: grid;
+      gap: 6px;
+      padding: 12px 14px;
+      border-radius: 16px;
+      border: 1px solid var(--border);
+      background: rgba(10,14,20,0.62);
+    }
+    .detail-row {
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+    }
+    .detail-value {
+      color: var(--text);
+      font-weight: 600;
+      text-align: right;
+      word-break: break-word;
+    }
+    .alert-head,
+    .timeline-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .confidence-pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .confidence-pill[data-tone="danger"] {
+      color: #FFD0CC;
+      border-color: rgba(255,69,58,0.24);
+      background: rgba(255,69,58,0.10);
+    }
+    .confidence-pill[data-tone="warning"] {
+      color: #FFE1B2;
+      border-color: rgba(255,159,10,0.24);
+      background: rgba(255,159,10,0.10);
+    }
+    .confidence-pill[data-tone="success"] {
+      color: #CFF6D5;
+      border-color: rgba(50,215,75,0.24);
+      background: rgba(50,215,75,0.10);
+    }
+    .timeline-item {
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+    }
+    .timeline-dot {
+      width: 10px;
+      height: 10px;
+      margin-top: 6px;
+      border-radius: 999px;
+      background: var(--accent);
+      box-shadow: 0 0 0 6px rgba(0,229,255,0.10);
+    }
+    .empty-state {
+      padding: 14px;
+      border-radius: 16px;
+      border: 1px dashed var(--border);
+      color: var(--text-secondary);
+      background: rgba(255,255,255,0.02);
+    }
+    .pulse-dot {
+      display: inline-flex;
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--danger);
+      box-shadow: 0 0 0 0 rgba(255,69,58,0.38);
+      animation: recordingPulse 1.8s ease-in-out infinite;
+    }
+
+    @media (min-width: 760px) {
+      .telemetry-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    }
+    @media (min-width: 900px) {
+      .hero-grid { grid-template-columns: minmax(0, 1.7fr) minmax(290px, 0.95fr); }
+      .inspection-grid { grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.95fr); }
+      .support-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+    @media (max-width: 760px) {
+      .status-strip,
+      .action-grid,
+      .tool-grid {
+        grid-template-columns: 1fr;
+      }
+      .section-head {
+        flex-direction: column;
+      }
+      .action-banner {
+        align-items: flex-start;
+      }
+    }
+    @media (max-width: 520px) {
+      .hero-card,
+      .card { padding: 16px; }
+      .hero-panel,
+      .metric-card,
+      .info-panel,
+      .ai-panel { padding: 15px; }
+      .tile-icon { width: 46px; height: 46px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        animation: none !important;
+        transition: none !important;
+        scroll-behavior: auto !important;
+      }
+    }
+
+    @keyframes panelIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes pulseGlow {
+      0%, 100% { box-shadow: 0 18px 34px rgba(0,0,0,0.28), 0 0 0 1px rgba(255,255,255,0.03), 0 0 0 rgba(0,229,255,0.0); }
+      50% { box-shadow: 0 18px 34px rgba(0,0,0,0.32), 0 0 0 1px rgba(255,255,255,0.03), 0 0 22px rgba(0,229,255,0.12); }
+    }
+    @keyframes recordingPulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255,69,58,0.34); }
+      50% { box-shadow: 0 0 0 8px rgba(255,69,58,0); }
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
-      <h1 style="margin:0;">Zeb’s OBD AI — Vehicle Dashboard</h1>
-      <div class="tiny">Simple phone-first workflow for safe read-only diagnostics. AI Mechanic is advisory only: no control commands, no actuations, no code clearing.</div>
-    </div>
-
-    <div class="row" id="statusCards"></div>
-
-    <div class="card">
-      <h2 class="title">Main Controls</h2>
-      <label class="tiny" for="vehicleSelect">Current Vehicle</label>
-      <select id="vehicleSelect"></select>
-      <h2 class="title" style="margin-top:14px;">Current Vehicle Image</h2>
-      <div class="vehicle-image">
-        <div id="vehicleCanvas" class="vehicle-canvas" aria-label="3D vehicle model viewer"></div>
-        <img id="vehicleImageAsset" class="vehicle-fallback" alt="Fallback vehicle image" />
-        <div id="vehicleImageLabel" style="font-weight:700;">Vehicle placeholder</div>
-        <div class="tiny" id="vehicleImageSource">Loading vehicle source…</div>
-        <div class="component-pill"><span style="width:10px;height:10px;border-radius:50%;background:#dc2626;display:inline-block"></span><span id="highlightedComponentName">No highlighted component</span></div>
-        <button id="componentExplainBtn" class="secondary" style="min-height:40px;padding:8px 12px;max-width:280px;" disabled>Tap component for explanation</button>
+    <section class="card hero-card">
+      <div class="hero-grid">
+        <div class="hero-main">
+          <div>
+            <div class="section-kicker">Vehicle Command Center</div>
+            <h1 class="hero-title" id="headerVehicleName">2006 Toyota Sienna FWD V6 3.3L</h1>
+            <p class="hero-copy" id="headerVehicleDetail">Safe read-only diagnostics with a live command surface for Bluetooth status, OBD streaming, capture, and AI guidance.</p>
+          </div>
+          <div class="status-strip" aria-live="polite">
+            <div class="status-indicator" id="statusBluetooth" data-tone="warning">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span>
+                <span class="status-label">Bluetooth</span>
+                <span class="status-value" id="statusBluetoothValue">Not Connected</span>
+              </span>
+            </div>
+            <div class="status-indicator" id="statusStreaming" data-tone="neutral">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span>
+                <span class="status-label">OBD Data</span>
+                <span class="status-value" id="statusStreamingValue">Idle</span>
+              </span>
+            </div>
+            <div class="status-indicator" id="statusAiAssist" data-tone="neutral">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span>
+                <span class="status-label">AI Assist</span>
+                <span class="status-value" id="statusAiAssistValue">Offline</span>
+              </span>
+            </div>
+          </div>
+        </div>
+        <aside class="hero-panel">
+          <div>
+            <label class="field-label" for="vehicleSelect">Vehicle Profile</label>
+            <select id="vehicleSelect" aria-label="Select current vehicle profile"></select>
+            <div class="panel-note tiny" id="vehicleProfileNote">Select the active vehicle profile for safe read-only diagnostics.</div>
+          </div>
+          <div class="hero-badges" aria-live="polite">
+            <span class="badge" id="sessionBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="sessionBadgeText">Vehicle Check Idle</span></span>
+            <span class="badge" id="captureBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="captureBadgeText">Capture Idle</span></span>
+            <span class="badge" id="modeBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="modeBadgeText">Standby</span></span>
+          </div>
+        </aside>
       </div>
-      <div class="btn-grid" style="margin-top:10px;">
-        <button id="connectVehicleBtn" class="secondary">Connect Vehicle</button>
-        <button id="startSessionBtn">Start Vehicle Check</button>
-        <button id="stopSessionBtn" class="danger">End Vehicle Check</button>
-        <button id="startCaptureBtn">Start Capture</button>
-        <button id="stopCaptureBtn" class="danger">Stop Capture</button>
-        <button id="tagEventBtn" class="secondary">Tag Event</button>
-        <button id="reportsBtn" class="secondary">Reports</button>
-        <button id="liveGaugesBtn" class="secondary">Live Gauges</button>
-        <button id="askAiBtn">Ask AI Mechanic</button>
+    </section>
+
+    <section class="telemetry-grid" aria-label="Mini live telemetry strip">
+      <article class="metric-card" id="metricCardRpm" data-live="false">
+        <div class="metric-label">RPM</div>
+        <div class="metric-value" id="metricRpmValue">--</div>
+        <div class="metric-meta" id="metricRpmMeta">Awaiting live data</div>
+      </article>
+      <article class="metric-card" id="metricCardVoltage" data-live="false">
+        <div class="metric-label">Battery Voltage</div>
+        <div class="metric-value" id="metricVoltageValue">--</div>
+        <div class="metric-meta" id="metricVoltageMeta">Awaiting live data</div>
+      </article>
+      <article class="metric-card" id="metricCardCoolant" data-live="false">
+        <div class="metric-label">Coolant Temp</div>
+        <div class="metric-value" id="metricCoolantValue">--</div>
+        <div class="metric-meta" id="metricCoolantMeta">Awaiting live data</div>
+      </article>
+      <article class="metric-card" id="metricCardThrottle" data-live="false">
+        <div class="metric-label">Throttle Position</div>
+        <div class="metric-value" id="metricThrottleValue">--</div>
+        <div class="metric-meta" id="metricThrottleMeta">Awaiting live data</div>
+      </article>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Featured Module</div>
+          <h2 class="section-title">3D Vehicle Inspection</h2>
+          <div class="section-copy">Tap a component to inspect and explain. The viewer remains advisory and read-only at all times.</div>
+        </div>
+        <span class="badge" id="inspectionBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="inspectionBadgeText">No highlighted component</span></span>
       </div>
-    </div>
-
-    <div class="card" id="bluetoothCard">
-      <h2 class="title">OBDLINK BLUETOOTH</h2>
-      <div class="status-value" id="btStatusText">Disconnected</div>
-      <div class="tiny" id="btError">None</div>
-      <div class="tiny" id="btDebug" style="margin-top:8px;display:grid;gap:4px"></div>
-    </div>
-
-    <div class="card">
-      <h2 class="title">AI Alerts (Proactive)</h2>
-      <div class="tiny" id="aiAlertSummary">No active alerts.</div>
-      <div id="aiAlertList" class="tiny" style="margin-top:8px;display:grid;gap:6px"></div>
-    </div>
-
-    <div class="card">
-      <h2 class="title">Diagnostic Timeline</h2>
-      <div id="timelineList" class="tiny" style="display:grid;gap:6px"></div>
-    </div>
-
-    <div class="card">
-      <h2 class="title">AI Mechanic Quick Prompts</h2>
-      <div class="ai-quick">
-        <button class="secondary" onclick="openAiWithPrompt('What does this code mean?')">What does this code mean?</button>
-        <button class="secondary" onclick="openAiWithPrompt('Is it safe to drive?')">Is it safe to drive?</button>
-        <button class="secondary" onclick="openAiWithPrompt('What should I test next?')">What should I test next?</button>
-        <button class="secondary" onclick="openAiWithPrompt('Explain this in simple language')">Explain this in simple language</button>
-        <button class="secondary" onclick="openAiWithPrompt('What changed in live data?')">What changed in live data?</button>
-        <button class="secondary" onclick="openAiWithPrompt('What should I watch right now?')">What should I watch right now?</button>
+      <div class="inspection-grid">
+        <div class="vehicle-stage">
+          <div id="vehicleCanvas" class="vehicle-canvas" aria-label="3D vehicle model viewer"></div>
+          <img id="vehicleImageAsset" class="vehicle-fallback" alt="Fallback vehicle image" />
+        </div>
+        <div class="inspection-sidebar">
+          <div class="info-panel">
+            <div class="field-label">Highlighted Component</div>
+            <div class="component-pill" id="componentStatusPill" data-tone="neutral">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span id="highlightedComponentName">No highlighted component</span>
+            </div>
+            <button id="componentExplainBtn" class="panel-button panel-button--ghost" data-tone="accent" disabled>
+              <span class="tile-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 18h.01"></path>
+                  <path d="M9.09 9a3 3 0 1 1 5.82 1c0 2-3 2-3 4"></path>
+                </svg>
+              </span>
+              <span class="tile-copy">
+                <span class="tile-title">Explain Component</span>
+                <span class="tile-meta">Tap a component to inspect and explain</span>
+              </span>
+              <span class="tile-state" id="componentExplainState">Select Part</span>
+            </button>
+          </div>
+          <div class="info-panel">
+            <div class="field-label">Inspection Source</div>
+            <div class="info-title" id="vehicleImageLabel">Vehicle placeholder</div>
+            <div class="tiny" id="vehicleImageSource">Loading vehicle source...</div>
+          </div>
+          <div class="info-panel">
+            <div class="field-label">Safety Envelope</div>
+            <div class="tiny">No control commands, no actuations, no code clearing, and no unsafe programming paths. Visual inspection is strictly read-only.</div>
+          </div>
+        </div>
       </div>
-    </div>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Primary Command Center</div>
+          <h2 class="section-title">Diagnostic Actions</h2>
+          <div class="section-copy">Connect the adapter, launch a vehicle check, and control capture without breaking the current diagnostic flow.</div>
+        </div>
+        <span class="badge" id="diagnosticStateBadge" data-tone="warning"><span class="badge-dot" aria-hidden="true"></span><span id="diagnosticStateText">Awaiting connection</span></span>
+      </div>
+
+      <button id="connectVehicleBtn" class="action-banner" data-tone="accent" data-active="false" data-pulse="false">
+        <span class="tile-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 7V5a3 3 0 0 1 6 0v2"></path>
+            <path d="M6 11h12"></path>
+            <path d="M8 11v4a4 4 0 0 0 8 0v-4"></path>
+          </svg>
+        </span>
+        <span class="tile-copy">
+          <span class="tile-title">Connect Vehicle</span>
+          <span class="tile-meta" id="connectVehicleMeta">Pair with OBDLink MX+ and arm live read-only telemetry.</span>
+        </span>
+        <span class="tile-state" id="connectVehicleState">Standby</span>
+      </button>
+
+      <div class="action-grid" style="margin-top:12px;">
+        <button id="startSessionBtn" class="action-tile" data-tone="accent" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 12h4l2-5 4 10 2-5h4"></path>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Start Vehicle Check</span>
+              <span class="tile-meta">Run system-wide diagnostic scan</span>
+            </span>
+          </span>
+          <span class="tile-state" id="startSessionState">Ready</span>
+        </button>
+
+        <button id="stopSessionBtn" class="action-tile" data-tone="danger" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <rect x="7" y="7" width="10" height="10" rx="1.8"></rect>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">End Vehicle Check</span>
+              <span class="tile-meta">Close the active diagnostic session</span>
+            </span>
+          </span>
+          <span class="tile-state" id="stopSessionState">Idle</span>
+        </button>
+
+        <button id="startCaptureBtn" class="action-tile" data-tone="success" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="7"></circle>
+                <path d="M12 3v3"></path>
+                <path d="M12 18v3"></path>
+                <path d="M3 12h3"></path>
+                <path d="M18 12h3"></path>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Start Capture</span>
+              <span class="tile-meta">Record live data stream</span>
+            </span>
+          </span>
+          <span class="tile-state" id="startCaptureState">Ready</span>
+        </button>
+
+        <button id="stopCaptureBtn" class="action-tile" data-tone="danger" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="8"></circle>
+                <rect x="9" y="9" width="6" height="6" rx="1.2" fill="currentColor" stroke="none"></rect>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Stop Capture</span>
+              <span class="tile-meta">End active recording safely</span>
+            </span>
+          </span>
+          <span class="tile-state" id="stopCaptureState">Idle</span>
+        </button>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Secondary Tools</div>
+          <h2 class="section-title">Analysis and Workflow Utilities</h2>
+          <div class="section-copy">Fast access to event tagging, saved outputs, live gauges, and the AI diagnostic assistant.</div>
+        </div>
+      </div>
+
+      <div class="tool-grid">
+        <button id="tagEventBtn" class="tool-tile" data-tone="warning" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 13l-7 7-9-9V4h7z"></path>
+                <circle cx="8.5" cy="8.5" r="1"></circle>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Tag Event</span>
+              <span class="tile-meta">Bookmark a notable moment</span>
+            </span>
+          </span>
+          <span class="tile-state" id="tagEventState">Session Needed</span>
+        </button>
+
+        <button id="reportsBtn" class="tool-tile" data-tone="neutral" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M8 6h8"></path>
+                <path d="M8 10h8"></path>
+                <path d="M8 14h5"></path>
+                <path d="M6 3h12a2 2 0 0 1 2 2v14l-4-2-4 2-4-2-4 2V5a2 2 0 0 1 2-2z"></path>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Reports</span>
+              <span class="tile-meta">View saved diagnostic summaries</span>
+            </span>
+          </span>
+          <span class="tile-state" id="reportsState">Available</span>
+        </button>
+
+        <button id="liveGaugesBtn" class="tool-tile" data-tone="accent" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 16a8 8 0 1 1 16 0"></path>
+                <path d="M12 12l4-4"></path>
+                <path d="M12 16h.01"></path>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Live Gauges</span>
+              <span class="tile-meta">Monitor sensor data in real time</span>
+            </span>
+          </span>
+          <span class="tile-state" id="liveGaugesState">Standby</span>
+        </button>
+
+        <button id="askAiBtn" class="tool-tile" data-tone="accent" data-active="true" data-pulse="false" data-feature="signature">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3l7 4v5c0 5-3.4 8.6-7 9-3.6-.4-7-4-7-9V7z"></path>
+                <path d="M9.5 11.5a2.5 2.5 0 0 1 5 0c0 1.6-2.5 1.8-2.5 3.5"></path>
+                <path d="M12 18h.01"></path>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Ask AI Mechanic</span>
+              <span class="tile-meta">Voice and diagnostic assistant</span>
+            </span>
+          </span>
+          <span class="tile-state" id="askAiState">Standby</span>
+        </button>
+      </div>
+
+      <div class="ai-panel">
+        <div class="section-head" style="margin-bottom:12px;">
+          <div>
+            <div class="section-kicker">AI Mechanic</div>
+            <h2 class="section-title">Diagnostic Guidance Layer</h2>
+            <div class="section-copy">Ask about codes, sensors, symptoms, and repairs. Guidance stays read-only and grounded in the current vehicle context when a vehicle check is active.</div>
+          </div>
+          <span class="badge" id="aiPanelBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="aiPanelBadgeText">Awaiting vehicle check</span></span>
+        </div>
+        <div class="ai-quick">
+          <button class="quick-chip" onclick="openAiWithPrompt('What does this code mean?')">What does this code mean?</button>
+          <button class="quick-chip" onclick="openAiWithPrompt('Is it safe to drive?')">Is it safe to drive?</button>
+          <button class="quick-chip" onclick="openAiWithPrompt('What should I test next?')">What should I test next?</button>
+          <button class="quick-chip" onclick="openAiWithPrompt('Explain this in simple language')">Explain this in simple language</button>
+          <button class="quick-chip" onclick="openAiWithPrompt('What changed in live data?')">What changed in live data?</button>
+          <button class="quick-chip" onclick="openAiWithPrompt('What should I watch right now?')">What should I watch right now?</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="support-grid">
+      <div class="card info-card" id="bluetoothCard">
+        <div>
+          <div class="section-kicker">Connection Telemetry</div>
+          <h2 class="section-title">Bluetooth and Bridge Status</h2>
+        </div>
+        <span class="badge" id="btStatusBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="btStatusText">Disconnected</span></span>
+        <div class="tiny" id="btError">No Bluetooth errors</div>
+        <div id="btDebug" class="detail-list"></div>
+      </div>
+
+      <div class="card info-card">
+        <div>
+          <div class="section-kicker">Proactive Monitoring</div>
+          <h2 class="section-title">AI Alerts</h2>
+        </div>
+        <div class="tiny" id="aiAlertSummary">No active alerts.</div>
+        <div id="aiAlertList" class="alert-list"></div>
+      </div>
+
+      <div class="card info-card">
+        <div>
+          <div class="section-kicker">Traceability</div>
+          <h2 class="section-title">Diagnostic Timeline</h2>
+        </div>
+        <div id="timelineList" class="timeline-list"></div>
+      </div>
+    </section>
   </div>
 <script type="module">
 import * as THREE from 'https://unpkg.com/three@0.162.0/build/three.module.js';
@@ -1639,8 +2617,13 @@ let vehicleRenderer = null;
 let selectedMesh = null;
 let livePollingHandle = null;
 let livePollingInFlight = false;
+let renderedVehicleKey = '';
+let lastVehicleImageSelection = null;
+let lastVehicleImageRequestId = 0;
 const SENSOR_TO_PID = { rpm:'010C', coolant_temp:'0105', control_module_voltage:'0142', vehicle_speed:'010D' };
 const LIVE_SENSOR_ORDER = ['rpm', 'coolant_temp', 'control_module_voltage', 'vehicle_speed'];
+const LIVE_TELEMETRY_KEYS = ['rpm', 'coolant_temp', 'control_module_voltage', 'vehicle_speed', 'throttle_position'];
+const TOYOTA_PREMIUM_NAME = '2006 Toyota Sienna FWD V6 3.3L';
 function getMobileBluetoothService(){ return window.MobileBluetoothService || null; }
 function normalizeConnectPayload(payload){
   const serviceAvailable = Boolean(getMobileBluetoothService());
@@ -1651,8 +2634,109 @@ function normalizeConnectPayload(payload){
     permission_state: payload?.permission_state || payload?.permissionState || null,
     source_mode: payload?.source_mode || payload?.sourceMode || 'PHONE-LIVE',
     supports_native_bluetooth: payload?.supports_native_bluetooth ?? payload?.supportsNativeBluetooth ?? serviceAvailable,
-    fallback_reason: payload?.fallback_reason || payload?.fallbackReason || (serviceAvailable ? null : 'native-service-unavailable'),
+      fallback_reason: payload?.fallback_reason || payload?.fallbackReason || (serviceAvailable ? null : 'native-service-unavailable'),
   };
+}
+function escapeHtml(value){
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+}
+function formatLabel(value){
+  return String(value ?? '')
+    .replace(/_/g, ' ')
+    .replace(/\\b\\w/g, (char) => char.toUpperCase());
+}
+function formatMode(value){
+  return String(value || 'standby')
+    .toLowerCase()
+    .replace(/_/g, ' ')
+    .replace(/\\b\\w/g, (char) => char.toUpperCase());
+}
+function shortId(value){
+  if(!value){ return 'None'; }
+  return `${String(value).slice(0, 8)}...`;
+}
+function getVehicleProfileById(vehicleId){
+  return (state?.vehicles || []).find((vehicle) => vehicle.vehicle_id === vehicleId) || null;
+}
+function getSelectedVehicleProfile(){
+  return getVehicleProfileById(selectedVehicleId);
+}
+function getVehicleDisplayName(){
+  const activeVehicleId = state?.active_session?.vehicle_id || selectedVehicleId;
+  if(activeVehicleId === 'toyota_sienna_2006'){ return TOYOTA_PREMIUM_NAME; }
+  return getVehicleProfileById(activeVehicleId)?.label || state?.active_session?.vehicle || 'Vehicle not selected';
+}
+function getLatestRead(pidKey){
+  const reads = state?.recent_reads || [];
+  for(let index = reads.length - 1; index >= 0; index -= 1){
+    if(reads[index].pid_key === pidKey){ return reads[index]; }
+  }
+  return null;
+}
+function getTelemetryAge(ts){
+  if(!ts){ return null; }
+  const ageMs = Date.now() - Date.parse(ts);
+  if(!Number.isFinite(ageMs) || ageMs < 0){ return null; }
+  return ageMs;
+}
+function isFreshRead(read){
+  const ageMs = getTelemetryAge(read?.ts);
+  return ageMs !== null && ageMs <= 15000;
+}
+function formatAge(ts){
+  const ageMs = getTelemetryAge(ts);
+  if(ageMs === null){ return 'Timestamp unavailable'; }
+  if(ageMs < 2000){ return 'Updated just now'; }
+  const seconds = Math.round(ageMs / 1000);
+  if(seconds < 60){ return `Updated ${seconds}s ago`; }
+  return `Updated ${Math.round(seconds / 60)}m ago`;
+}
+function formatSourceLabel(source){
+  if(!source){ return 'Source pending'; }
+  if(source === 'PHONE-LIVE'){ return 'Phone live'; }
+  if(source === 'LOCAL-HARDWARE'){ return 'Local hardware'; }
+  if(source === 'BROWSER-DEV'){ return 'Browser bridge'; }
+  return formatMode(source);
+}
+function formatMetricValue(read, fallbackUnit, precision){
+  if(!read || read.value === null || read.value === undefined || read.value === ''){ return { value: '--', meta: 'Awaiting live data', live: false }; }
+  const numeric = Number(read.value);
+  const hasNumeric = Number.isFinite(numeric);
+  const value = hasNumeric ? numeric.toFixed(precision) : String(read.value);
+  const unit = read.unit || fallbackUnit || '';
+  return {
+    value: unit ? `${value} ${unit}` : value,
+    meta: `${formatSourceLabel(read.source_mode)} · ${formatAge(read.ts)}`,
+    live: isFreshRead(read),
+  };
+}
+function applyTone(id, tone){
+  const element = document.getElementById(id);
+  if(element){ element.dataset.tone = tone; }
+}
+function updateIndicator(rootId, valueId, tone, value){
+  applyTone(rootId, tone);
+  const target = document.getElementById(valueId);
+  if(target){ target.textContent = value; }
+}
+function updateBadge(rootId, textId, tone, value, pulse=false){
+  const badge = document.getElementById(rootId);
+  if(badge){
+    badge.dataset.tone = tone;
+    badge.dataset.pulse = pulse ? 'true' : 'false';
+  }
+  const text = document.getElementById(textId);
+  if(text){ text.textContent = value; }
+}
+function setButtonState(buttonId, tone, stateText, active=false, pulse=false, ariaPressed=false){
+  const button = document.getElementById(buttonId);
+  if(!button){ return; }
+  button.dataset.tone = tone;
+  button.dataset.active = active ? 'true' : 'false';
+  button.dataset.pulse = pulse ? 'true' : 'false';
+  button.setAttribute('aria-pressed', ariaPressed ? 'true' : 'false');
+  const stateEl = button.querySelector('.tile-state');
+  if(stateEl){ stateEl.textContent = stateText; }
 }
 async function readNativePid(sensor){
   const service = getMobileBluetoothService();
@@ -1681,50 +2765,54 @@ async function readNativePid(sensor){
     return null;
   }
 }
-
-function card(label, value){ return `<div class="card status-card"><div class="status-label">${label}</div><div class="status-value">${value || '-'}</div></div>`; }
 function webglAvailable(){ try { const c=document.createElement('canvas'); return !!window.WebGLRenderingContext && !!(c.getContext('webgl') || c.getContext('experimental-webgl')); } catch { return false; } }
 
 function buildGenericVehicleViewer(){
   const host=document.getElementById('vehicleCanvas');
-  if(!host || !webglAvailable()){ showFallbackImage('WebGL unavailable — static fallback image in use'); return; }
-  const scene=new THREE.Scene(); scene.background=new THREE.Color(0x0f172a);
+  if(!host || !webglAvailable()){ showFallbackImage('WebGL unavailable - static fallback image in use'); return; }
+  const scene=new THREE.Scene(); scene.background=new THREE.Color(0x05080d);
   const camera=new THREE.PerspectiveCamera(52, host.clientWidth/host.clientHeight, 0.1, 100); camera.position.set(5.5,3.2,6.6);
   const renderer=new THREE.WebGLRenderer({antialias:false,alpha:false,powerPreference:'low-power'}); renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2)); renderer.setSize(host.clientWidth,host.clientHeight); host.innerHTML=''; host.appendChild(renderer.domElement);
-  scene.add(new THREE.AmbientLight(0xffffff,0.85)); const key=new THREE.DirectionalLight(0xffffff,0.85); key.position.set(4,7,6); scene.add(key);
+  scene.add(new THREE.AmbientLight(0xffffff,0.76));
+  const key=new THREE.DirectionalLight(0xffffff,0.88); key.position.set(4,7,6); scene.add(key);
+  const fill=new THREE.PointLight(0x00e5ff,0.45,18); fill.position.set(-3,3,4); scene.add(fill);
   const root=new THREE.Group(); scene.add(root);
   const partMap={};
   function addPart(name,system,geo,color,pos,scale){ const mat=new THREE.MeshStandardMaterial({color,roughness:0.72,metalness:0.08,transparent:true,opacity:1}); const m=new THREE.Mesh(geo,mat); m.position.set(...pos); m.scale.set(...scale); m.userData={component:name,system,baseColor:color}; root.add(m); partMap[name]=m; return m; }
-  addPart('engine_block','engine',new THREE.BoxGeometry(1.35,0.72,1.05),0x64748b,[-0.85,0.35,0.2],[1,1,1]);
-  addPart('thermostat','cooling_system',new THREE.SphereGeometry(0.16,12,10),0x93c5fd,[-0.4,0.75,0.35],[1,1,1]);
-  addPart('radiator','cooling_system',new THREE.BoxGeometry(0.18,0.86,1.26),0x38bdf8,[1.45,0.38,0],[1,1,1]);
-  addPart('intake_manifold','intake',new THREE.BoxGeometry(1.2,0.28,0.72),0x22d3ee,[-0.82,0.9,0.14],[1,1,1]);
-  addPart('throttle_body','intake',new THREE.CylinderGeometry(0.12,0.12,0.36,10),0x06b6d4,[0.18,0.84,0.58],[1,1,1]);
-  addPart('exhaust_manifold','exhaust',new THREE.BoxGeometry(0.88,0.2,0.26),0xf59e0b,[-1.25,0.08,0.78],[1,1,1]);
-  addPart('catalytic_converter','exhaust',new THREE.CylinderGeometry(0.17,0.17,0.65,12),0xf97316,[0.72,-0.18,0.88],[1,1,1]);
-  addPart('fuel_rail','fuel_system',new THREE.BoxGeometry(0.9,0.1,0.12),0xa78bfa,[-0.85,0.64,-0.36],[1,1,1]);
-  addPart('fuel_pump','fuel_system',new THREE.CylinderGeometry(0.11,0.11,0.24,10),0x8b5cf6,[-2.2,-0.3,0],[1,1,1]);
-  addPart('battery','electrical_system',new THREE.BoxGeometry(0.58,0.36,0.42),0x16a34a,[0.92,0.42,-0.72],[1,1,1]);
-  addPart('alternator','electrical_system',new THREE.CylinderGeometry(0.17,0.17,0.3,12),0x22c55e,[0.15,0.24,-0.58],[1,1,1]);
-  addPart('transmission_case','transmission',new THREE.BoxGeometry(1.3,0.62,0.9),0x94a3b8,[-2.05,0.08,0],[1,1,1]);
-  const body=new THREE.Mesh(new THREE.BoxGeometry(5.1,1.2,2.25),new THREE.MeshStandardMaterial({color:0x334155,roughness:0.82,metalness:0.12,transparent:true,opacity:0.95})); body.position.y=0.6; root.add(body);
+  addPart('engine_block','engine',new THREE.BoxGeometry(1.35,0.72,1.05),0x5b6774,[-0.85,0.35,0.2],[1,1,1]);
+  addPart('thermostat','cooling_system',new THREE.SphereGeometry(0.16,12,10),0x1c9aae,[-0.4,0.75,0.35],[1,1,1]);
+  addPart('radiator','cooling_system',new THREE.BoxGeometry(0.18,0.86,1.26),0x216578,[1.45,0.38,0],[1,1,1]);
+  addPart('intake_manifold','intake',new THREE.BoxGeometry(1.2,0.28,0.72),0x426070,[-0.82,0.9,0.14],[1,1,1]);
+  addPart('throttle_body','intake',new THREE.CylinderGeometry(0.12,0.12,0.36,10),0x3b8797,[0.18,0.84,0.58],[1,1,1]);
+  addPart('exhaust_manifold','exhaust',new THREE.BoxGeometry(0.88,0.2,0.26),0x7d6338,[-1.25,0.08,0.78],[1,1,1]);
+  addPart('catalytic_converter','exhaust',new THREE.CylinderGeometry(0.17,0.17,0.65,12),0xa87434,[0.72,-0.18,0.88],[1,1,1]);
+  addPart('fuel_rail','fuel_system',new THREE.BoxGeometry(0.9,0.1,0.12),0x5f657f,[-0.85,0.64,-0.36],[1,1,1]);
+  addPart('fuel_pump','fuel_system',new THREE.CylinderGeometry(0.11,0.11,0.24,10),0x6d7396,[-2.2,-0.3,0],[1,1,1]);
+  addPart('battery','electrical_system',new THREE.BoxGeometry(0.58,0.36,0.42),0x357757,[0.92,0.42,-0.72],[1,1,1]);
+  addPart('alternator','electrical_system',new THREE.CylinderGeometry(0.17,0.17,0.3,12),0x4d9b72,[0.15,0.24,-0.58],[1,1,1]);
+  addPart('transmission_case','transmission',new THREE.BoxGeometry(1.3,0.62,0.9),0x6c7683,[-2.05,0.08,0],[1,1,1]);
+  const body=new THREE.Mesh(new THREE.BoxGeometry(5.1,1.2,2.25),new THREE.MeshStandardMaterial({color:0x243241,roughness:0.82,metalness:0.12,transparent:true,opacity:0.95})); body.position.y=0.6; root.add(body);
   [[-1.7,-0.05,1.2],[-1.7,-0.05,-1.2],[1.7,-0.05,1.2],[1.7,-0.05,-1.2]].forEach(p=>{const w=new THREE.Mesh(new THREE.CylinderGeometry(0.47,0.47,0.3,16),new THREE.MeshStandardMaterial({color:0x0b1120,roughness:0.95})); w.rotation.z=Math.PI/2; w.position.set(...p); root.add(w);});
 
   const raycaster=new THREE.Raycaster(); const pointer=new THREE.Vector2();
   function applyHighlight(action,component,system){
     Object.values(partMap).forEach(m=>{m.material.color.setHex(m.userData.baseColor); m.material.opacity=1;});
     selectedMesh=null;
-    if(action==='highlight_component' && partMap[component]){selectedMesh=partMap[component]; selectedMesh.material.color.set('#dc2626'); Object.values(partMap).forEach(m=>{if(m!==selectedMesh){m.material.opacity=(m.userData.system===selectedMesh.userData.system)?0.5:0.16;}});} 
-    if(action==='highlight_system' && system){Object.values(partMap).forEach(m=>{if(m.userData.system===system){m.material.color.set('#dc2626');} else {m.material.opacity=0.16;}});} 
+    if(action==='highlight_component' && partMap[component]){selectedMesh=partMap[component]; selectedMesh.material.color.set('#00E5FF'); Object.values(partMap).forEach(m=>{if(m!==selectedMesh){m.material.opacity=(m.userData.system===selectedMesh.userData.system)?0.42:0.16;}});} 
+    if(action==='highlight_system' && system){Object.values(partMap).forEach(m=>{if(m.userData.system===system){m.material.color.set('#00E5FF'); m.material.opacity=0.94;} else {m.material.opacity=0.16;}});} 
     const name=component|| (selectedMesh?selectedMesh.userData.component:null) || (system?`${system} system` : null);
-    document.getElementById('highlightedComponentName').textContent=name?name.replace(/_/g,' '):'No highlighted component';
-    document.getElementById('componentExplainBtn').disabled=!component;
-    if(component){document.getElementById('componentExplainBtn').dataset.component=component;}
+    const hasComponent = Boolean(component);
+    document.getElementById('highlightedComponentName').textContent=name?formatLabel(name):'No highlighted component';
+    document.getElementById('componentExplainBtn').disabled=!hasComponent;
+    document.getElementById('componentExplainBtn').dataset.component=component || '';
+    document.getElementById('componentExplainState').textContent=hasComponent?'Explain':'Select Part';
+    applyTone('componentStatusPill', hasComponent ? 'accent' : system ? 'warning' : 'neutral');
+    updateBadge('inspectionBadge', 'inspectionBadgeText', hasComponent ? 'accent' : system ? 'warning' : 'neutral', hasComponent ? `Focused: ${formatLabel(component)}` : system ? `${formatLabel(system)} selected` : 'No highlighted component');
   }
   function pick(ev){ const rect=renderer.domElement.getBoundingClientRect(); pointer.x=((ev.clientX-rect.left)/rect.width)*2-1; pointer.y=-((ev.clientY-rect.top)/rect.height)*2+1; raycaster.setFromCamera(pointer,camera); const hit=raycaster.intersectObjects(Object.values(partMap))[0]; if(!hit){return;} const {component,system}=hit.object.userData; applyHighlight('highlight_component',component,system); syncHighlight('highlight_component',component,system,'user'); }
   renderer.domElement.addEventListener('pointerdown',pick,{passive:true});
 
-  function animate(){ root.rotation.y += 0.0038; renderer.render(scene,camera); requestAnimationFrame(animate); }
+  function animate(){ root.rotation.y += 0.0028; renderer.render(scene,camera); requestAnimationFrame(animate); }
   animate();
   window.addEventListener('resize',()=>{ if(!host.clientWidth || !host.clientHeight){return;} camera.aspect=host.clientWidth/host.clientHeight; camera.updateProjectionMatrix(); renderer.setSize(host.clientWidth,host.clientHeight); });
   vehicleRenderer={applyHighlight};
@@ -1736,15 +2824,194 @@ async function fetchState(){
   const res = await fetch('/dashboard/state');
   state = await res.json();
   phoneBridge = { ...phoneBridge, ...state.phone_bridge };
-  renderStatusCards(); renderVehicles(); renderBluetoothCard(); renderAiAlerts(); renderTimeline(); syncLivePolling();
+  renderVehicles(); renderDashboardState(); renderBluetoothCard(); renderAiAlerts(); renderTimeline(); syncLivePolling();
   if(vehicleRenderer && state.vehicle_visualization?.highlight){ const h=state.vehicle_visualization.highlight; vehicleRenderer.applyHighlight(h.action,h.component,h.system); }
 }
-function renderStatusCards(){ const active = state.active_session; document.getElementById('statusCards').innerHTML = [card('Current mode', state.current_mode || state.adapter_mode || 'MOCK'),card('Bluetooth state', phoneBridge.status || 'disconnected'),card('Active vehicle', active ? active.vehicle : selectedVehicleId),card('Active Vehicle Check', active ? active.session_id : 'None'),card('AI Alerts', (state.ai_alerts||[]).length ? `${state.ai_alerts.length} active` : 'None')].join(''); }
-function renderVehicles(){ const select = document.getElementById('vehicleSelect'); select.innerHTML=''; state.vehicles.forEach(v => { const opt=document.createElement('option'); opt.value=v.vehicle_id; opt.textContent=`${v.label} (${v.protocol_hint})`; if (v.vehicle_id===selectedVehicleId) opt.selected=true; select.appendChild(opt); }); select.onchange=async (e)=>{ selectedVehicleId=e.target.value; await updateVehicleImage(); }; updateVehicleImage(); }
-async function updateVehicleImage(){ const res = await fetch(`/vehicle-image/current?manual_vehicle_id=${encodeURIComponent(selectedVehicleId)}`); const image = await res.json(); const trim = image.trim ? ` ${image.trim}` : ''; const label = `${image.year || ''} ${image.make} ${image.model}${trim}`.replace(/\\s+/g,' ').trim(); document.getElementById('vehicleImageLabel').textContent = label || 'Generic vehicle'; const sourceMap = {auto_vin: 'Auto VIN detection result',manual_selection: 'Manual vehicle selection fallback',active_session_vehicle: 'Active session vehicle fallback',closest_supported: 'Closest supported vehicle image fallback',generic_placeholder: 'Generic placeholder image'}; const img = document.getElementById('vehicleImageAsset'); img.src = image.image_asset_path || image.fallback_image_asset_path; img.onerror = () => { img.src = image.fallback_image_asset_path; }; if(!vehicleRenderer){ buildGenericVehicleViewer(); } if(!vehicleRenderer){ showFallbackImage((sourceMap[image.resolved_from] || image.resolved_from)+' — WebGL fallback image'); } else { document.getElementById('vehicleImageSource').textContent='3D view active · tap a component to inspect'; } }
-function renderBluetoothCard(){ const status = phoneBridge.status || 'disconnected'; document.getElementById('btStatusText').textContent = status.charAt(0).toUpperCase() + status.slice(1); document.getElementById('btError').textContent = phoneBridge.last_error || 'No Bluetooth errors'; const debugLines = [`Bluetooth connected: ${phoneBridge.bluetooth_connected ? 'true' : 'false'}`,`Polling active: ${phoneBridge.polling_active ? 'true' : 'false'} (${phoneBridge.polling_state || 'inactive'})`,`First live read received: ${phoneBridge.first_live_read_received ? 'true' : 'false'}`,`Current source_mode: ${phoneBridge.current_source_mode || phoneBridge.source_mode || 'unknown'}`,`Last live PID command: ${phoneBridge.last_live_pid_command || 'None'}`,`Last live PID response: ${phoneBridge.last_live_pid_response || 'None'}`,`Last ingest status: ${phoneBridge.last_ingest_status || 'idle'}`,`Backend acceptance: ${phoneBridge.backend_acceptance_status || 'idle'}`,`Last ingest error: ${phoneBridge.last_ingest_error || 'None'}`]; if(phoneBridge.fallback_reason){ debugLines.push(`Fallback reason: ${phoneBridge.fallback_reason}`); } if((state.current_mode || phoneBridge.current_mode) === 'MOCK'){ debugLines.push(`MOCK reason: ${phoneBridge.mock_reason || state.current_mode_reason || 'Unknown'}`); } document.getElementById('btDebug').innerHTML = debugLines.map(line => `<div>${line}</div>`).join(''); }
-function renderAiAlerts(){ const alerts=state.ai_alerts||[]; const monitoring=state.ai_monitoring||{active:false,message:'Waiting for live monitoring.'}; document.getElementById('aiAlertSummary').textContent=alerts.length?`${alerts.length} proactive alert(s) linked to this vehicle check.`:(monitoring.active?'Live monitoring active.':'No active alerts.'); document.getElementById('aiAlertList').innerHTML=alerts.slice(-5).reverse().map(a=>`<div><b>${a.title}</b> (${a.confidence}) — ${a.explanation}. Next: ${a.suggested_next_step}</div>`).join('') || `<div>${monitoring.message}</div>`; }
-function renderTimeline(){ const timeline=state.diagnostic_timeline||[]; document.getElementById('timelineList').innerHTML=timeline.slice(-8).reverse().map(t=>`<div>${new Date(t.ts).toLocaleTimeString()} — ${t.title}${t.linked_ai_response_id?` <a href="/dashboard/ai" style="color:#0f766e">AI explanation</a>`:''}</div>`).join('') || '<div>No timeline events yet.</div>'; }
+function renderVehicles(){
+  const select = document.getElementById('vehicleSelect');
+  const vehicles = state?.vehicles || [];
+  if(!select || !vehicles.length){ return; }
+  if(state?.active_session?.vehicle_id && vehicles.some((vehicle) => vehicle.vehicle_id === state.active_session.vehicle_id)){
+    selectedVehicleId = state.active_session.vehicle_id;
+  } else if(!vehicles.some((vehicle) => vehicle.vehicle_id === selectedVehicleId)){
+    selectedVehicleId = vehicles[0].vehicle_id;
+  }
+  const nextKey = vehicles.map((vehicle) => `${vehicle.vehicle_id}:${vehicle.label}:${vehicle.protocol_hint}`).join('|');
+  if(nextKey !== renderedVehicleKey){
+    select.innerHTML = '';
+    vehicles.forEach((vehicle) => {
+      const option = document.createElement('option');
+      option.value = vehicle.vehicle_id;
+      option.textContent = `${vehicle.label} (${vehicle.protocol_hint})`;
+      if(vehicle.vehicle_id === selectedVehicleId){ option.selected = true; }
+      select.appendChild(option);
+    });
+    renderedVehicleKey = nextKey;
+  }
+  select.value = selectedVehicleId;
+  select.onchange = async (event) => {
+    selectedVehicleId = event.target.value;
+    renderDashboardState();
+    if(lastVehicleImageSelection !== selectedVehicleId){
+      lastVehicleImageSelection = selectedVehicleId;
+      await updateVehicleImage();
+    }
+  };
+  if(lastVehicleImageSelection !== selectedVehicleId){
+    lastVehicleImageSelection = selectedVehicleId;
+    updateVehicleImage();
+  }
+}
+function renderDashboardState(){
+  const active = state?.active_session;
+  const profile = getVehicleProfileById(active?.vehicle_id || selectedVehicleId);
+  const connected = (phoneBridge.status || 'disconnected') === 'connected';
+  const captureRecording = state?.capture_status === 'recording';
+  const waitingForLiveRead = connected && !phoneBridge.first_live_read_received;
+  const liveReadActive = captureRecording || phoneBridge.ai_monitoring_active || (state?.recent_reads || []).some((read) => LIVE_TELEMETRY_KEYS.includes(read.pid_key) && isFreshRead(read));
+  const aiReady = Boolean(active);
+  const bluetoothTone = connected ? 'success' : phoneBridge.status === 'failed' ? 'danger' : phoneBridge.status === 'connecting' ? 'warning' : 'neutral';
+  const bluetoothLabel = connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Retry Required' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Not Connected';
+  const streamTone = liveReadActive ? 'accent' : waitingForLiveRead ? 'warning' : 'neutral';
+  const streamLabel = liveReadActive ? 'Streaming' : waitingForLiveRead ? 'Priming' : 'Idle';
+  const aiTone = aiReady ? (state?.ai_monitoring?.active ? 'accent' : 'success') : 'neutral';
+  const aiLabel = aiReady ? (state?.ai_monitoring?.active ? 'Monitoring' : 'Ready') : 'Offline';
+  const protocolLabel = formatMode(active?.protocol || profile?.protocol_hint || 'protocol pending');
+  const profileNote = profile?.notes || 'Safe read-only diagnostic workflow enabled.';
+
+  document.getElementById('headerVehicleName').textContent = getVehicleDisplayName();
+  document.getElementById('headerVehicleDetail').textContent = active
+    ? `${protocolLabel} workflow armed. ${profileNote} Vehicle check ${shortId(active.session_id)} is active and ready for live context.`
+    : `${protocolLabel} workflow armed. ${profileNote} Start a vehicle check to unlock capture, reports, and full AI context.`;
+  document.getElementById('vehicleProfileNote').textContent = profileNote;
+
+  updateIndicator('statusBluetooth', 'statusBluetoothValue', bluetoothTone, bluetoothLabel);
+  updateIndicator('statusStreaming', 'statusStreamingValue', streamTone, streamLabel);
+  updateIndicator('statusAiAssist', 'statusAiAssistValue', aiTone, aiLabel);
+
+  updateBadge('sessionBadge', 'sessionBadgeText', active ? 'success' : 'neutral', active ? 'Vehicle Check Active' : 'Vehicle Check Idle');
+  updateBadge('captureBadge', 'captureBadgeText', captureRecording ? 'danger' : state?.capture_status === 'stopped' ? 'warning' : 'neutral', captureRecording ? 'Capture Recording' : state?.capture_status === 'stopped' ? 'Capture Stopped' : 'Capture Idle', captureRecording);
+  updateBadge('modeBadge', 'modeBadgeText', connected ? 'accent' : 'neutral', formatMode(state?.current_mode || phoneBridge.current_mode || 'standby'));
+  updateBadge('diagnosticStateBadge', 'diagnosticStateText', captureRecording ? 'danger' : active ? 'success' : connected ? 'accent' : 'warning', captureRecording ? 'Recording live capture' : active ? 'Vehicle check active' : connected ? 'Connected and ready' : 'Awaiting connection', captureRecording);
+  updateBadge('aiPanelBadge', 'aiPanelBadgeText', state?.ai_monitoring?.active ? 'accent' : aiReady ? 'success' : 'neutral', state?.ai_monitoring?.active ? 'Live monitoring active' : aiReady ? 'AI ready for diagnostics' : 'Awaiting vehicle check');
+
+  renderTelemetry();
+
+  const connectMeta = connected
+    ? `OBDLink bridge active. ${liveReadActive ? 'Live telemetry is streaming.' : 'Waiting for live PID traffic.'}`
+    : phoneBridge.status === 'failed'
+      ? `Connection did not complete. ${phoneBridge.fallback_reason || 'Retry the Bluetooth handshake.'}`
+      : phoneBridge.status === 'connecting'
+        ? 'Negotiating Bluetooth link and preparing live polling.'
+        : 'Pair with OBDLink MX+ and arm live read-only telemetry.';
+  document.getElementById('connectVehicleMeta').textContent = connectMeta;
+  setButtonState('connectVehicleBtn', connected ? 'success' : phoneBridge.status === 'failed' ? 'danger' : phoneBridge.status === 'connecting' ? 'warning' : 'accent', connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Retry' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Standby', connected, phoneBridge.status === 'connecting', connected);
+
+  setButtonState('startSessionBtn', active ? 'success' : 'accent', active ? 'Active' : 'Ready', Boolean(active), false, Boolean(active));
+  setButtonState('stopSessionBtn', active ? 'danger' : 'warning', active ? 'Available' : 'Idle', Boolean(active), false, false);
+  setButtonState('startCaptureBtn', captureRecording ? 'success' : 'accent', captureRecording ? 'Recording' : 'Ready', captureRecording, captureRecording, captureRecording);
+  setButtonState('stopCaptureBtn', captureRecording ? 'danger' : 'warning', captureRecording ? 'Armed' : 'Idle', captureRecording, captureRecording, false);
+  setButtonState('tagEventBtn', active ? 'warning' : 'neutral', captureRecording ? 'Live Tagging' : active ? 'Ready' : 'Session Needed', Boolean(active), captureRecording, false);
+  setButtonState('reportsBtn', 'neutral', active ? 'Review' : 'Available', Boolean(active), false, false);
+  setButtonState('liveGaugesBtn', connected ? 'accent' : 'neutral', liveReadActive ? 'Live' : connected ? 'Ready' : 'Standby', connected, liveReadActive, connected);
+  setButtonState('askAiBtn', state?.ai_monitoring?.active ? 'accent' : aiReady ? 'success' : 'accent', state?.ai_monitoring?.active ? 'Monitoring' : aiReady ? 'Ready' : 'Standby', Boolean(state?.ai_monitoring?.active || aiReady), false, false);
+}
+function renderTelemetry(){
+  const metrics = [
+    { cardId:'metricCardRpm', valueId:'metricRpmValue', metaId:'metricRpmMeta', read:getLatestRead('rpm'), unit:'rpm', precision:0 },
+    { cardId:'metricCardVoltage', valueId:'metricVoltageValue', metaId:'metricVoltageMeta', read:getLatestRead('control_module_voltage'), unit:'V', precision:1 },
+    { cardId:'metricCardCoolant', valueId:'metricCoolantValue', metaId:'metricCoolantMeta', read:getLatestRead('coolant_temp'), unit:'C', precision:0 },
+    { cardId:'metricCardThrottle', valueId:'metricThrottleValue', metaId:'metricThrottleMeta', read:getLatestRead('throttle_position'), unit:'%', precision:0 },
+  ];
+  metrics.forEach((metric) => {
+    const summary = formatMetricValue(metric.read, metric.unit, metric.precision);
+    document.getElementById(metric.valueId).textContent = summary.value;
+    document.getElementById(metric.metaId).textContent = summary.meta;
+    document.getElementById(metric.cardId).dataset.live = summary.live ? 'true' : 'false';
+  });
+}
+async function updateVehicleImage(){
+  const requestId = ++lastVehicleImageRequestId;
+  const res = await fetch(`/vehicle-image/current?manual_vehicle_id=${encodeURIComponent(selectedVehicleId)}`);
+  const image = await res.json();
+  if(requestId !== lastVehicleImageRequestId){ return; }
+  const trim = image.trim ? ` ${image.trim}` : '';
+  const label = `${image.year || ''} ${image.make} ${image.model}${trim}`.replace(/\\s+/g,' ').trim();
+  document.getElementById('vehicleImageLabel').textContent = label || 'Generic vehicle';
+  const sourceMap = {
+    auto_vin: 'Auto VIN detection result',
+    manual_selection: 'Manual vehicle selection fallback',
+    active_session_vehicle: 'Active session vehicle fallback',
+    closest_supported: 'Closest supported vehicle image fallback',
+    generic_placeholder: 'Generic placeholder image',
+  };
+  const img = document.getElementById('vehicleImageAsset');
+  img.src = image.image_asset_path || image.fallback_image_asset_path;
+  img.onerror = () => { img.src = image.fallback_image_asset_path; };
+  if(!vehicleRenderer){ buildGenericVehicleViewer(); }
+  if(!vehicleRenderer){
+    showFallbackImage(`${sourceMap[image.resolved_from] || image.resolved_from} - WebGL fallback image`);
+  } else {
+    img.style.display = 'none';
+    document.getElementById('vehicleImageSource').textContent = '3D view active - tap a component to inspect and explain';
+  }
+}
+function renderBluetoothCard(){
+  const status = phoneBridge.status || 'disconnected';
+  const tone = status === 'connected' ? 'success' : status === 'failed' ? 'danger' : status === 'connecting' ? 'warning' : 'neutral';
+  updateBadge('btStatusBadge', 'btStatusText', tone, formatMode(status));
+  document.getElementById('btError').textContent = phoneBridge.last_error || 'No Bluetooth errors';
+  const detailRows = [
+    { label: 'Bluetooth link', value: phoneBridge.bluetooth_connected ? 'Connected' : 'Idle' },
+    { label: 'Polling state', value: `${phoneBridge.polling_active ? 'Active' : 'Inactive'} (${phoneBridge.polling_state || 'inactive'})` },
+    { label: 'First live read', value: phoneBridge.first_live_read_received ? 'Received' : 'Pending' },
+    { label: 'Source mode', value: phoneBridge.current_source_mode || phoneBridge.source_mode || 'unknown' },
+    { label: 'Last PID command', value: phoneBridge.last_live_pid_command || 'None' },
+    { label: 'Last PID response', value: phoneBridge.last_live_pid_response || 'None' },
+    { label: 'Ingest status', value: phoneBridge.last_ingest_status || 'idle' },
+    { label: 'Backend acceptance', value: phoneBridge.backend_acceptance_status || 'idle' },
+  ];
+  if(phoneBridge.fallback_reason){ detailRows.push({ label: 'Fallback reason', value: phoneBridge.fallback_reason }); }
+  if((state.current_mode || phoneBridge.current_mode) === 'MOCK'){ detailRows.push({ label: 'Mock mode reason', value: phoneBridge.mock_reason || state.current_mode_reason || 'Unknown' }); }
+  document.getElementById('btDebug').innerHTML = detailRows.map((row) => `<div class="detail-row"><span class="detail-label">${escapeHtml(row.label)}</span><span class="detail-value">${escapeHtml(row.value)}</span></div>`).join('');
+}
+function alertTone(confidence){
+  if(confidence === 'high confidence'){ return 'danger'; }
+  if(confidence === 'likely' || confidence === 'suspected'){ return 'warning'; }
+  return 'success';
+}
+function renderAiAlerts(){
+  const alerts = state.ai_alerts || [];
+  const monitoring = state.ai_monitoring || { active:false, message:'Waiting for live monitoring.' };
+  document.getElementById('aiAlertSummary').textContent = alerts.length
+    ? `${alerts.length} proactive alert(s) linked to this vehicle check.`
+    : (monitoring.active ? 'Live monitoring active.' : 'No active alerts.');
+  document.getElementById('aiAlertList').innerHTML = alerts.slice(-5).reverse().map((alert) => `
+    <div class="alert-item">
+      <div class="alert-head">
+        <strong>${escapeHtml(alert.title)}</strong>
+        <span class="confidence-pill" data-tone="${escapeHtml(alertTone(alert.confidence))}">${escapeHtml(alert.confidence)}</span>
+      </div>
+      <div class="tiny">${escapeHtml(alert.explanation)}</div>
+      <div class="tiny"><span class="detail-label">Next</span> ${escapeHtml(alert.suggested_next_step)}</div>
+    </div>
+  `).join('') || `<div class="empty-state">${escapeHtml(monitoring.message)}</div>`;
+}
+function renderTimeline(){
+  const timeline = state.diagnostic_timeline || [];
+  document.getElementById('timelineList').innerHTML = timeline.slice(-8).reverse().map((item) => `
+    <div class="timeline-item">
+      <span class="timeline-dot" aria-hidden="true"></span>
+      <div>
+        <div class="timeline-top">
+          <strong>${escapeHtml(item.title)}</strong>
+          <span class="tiny">${escapeHtml(new Date(item.ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }))}</span>
+        </div>
+        <div class="tiny">${escapeHtml(item.detail || '')}${item.linked_ai_response_id ? ` <a href="/dashboard/ai">AI explanation</a>` : ''}</div>
+      </div>
+    </div>
+  `).join('') || '<div class="empty-state">No timeline events yet.</div>';
+}
 async function ensureSession(){ if (state && state.active_session) return state.active_session; await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})}); await fetchState(); return state.active_session; }
 async function createSession(){ await ensureSession(); }
 async function pollLiveSensorsOnce(){ if(livePollingInFlight){return;} if((phoneBridge.status||'disconnected')!=='connected'){stopLivePolling();return;} const service=getMobileBluetoothService(); if(!service || typeof service.readPid !== 'function'){ await fetchState(); return; } const active=await ensureSession(); livePollingInFlight=true; try { const nativeReads=await Promise.allSettled(LIVE_SENSOR_ORDER.map(sensor=>readNativePid(sensor))); const ingestJobs=nativeReads.filter(result=>result.status==='fulfilled'&&result.value).map(result=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,...result.value,polling:true})})); if(ingestJobs.length){ await Promise.allSettled(ingestJobs); } } finally { livePollingInFlight=false; await fetchState(); } }
@@ -1759,6 +3026,7 @@ async function connectVehicle(){ const service=getMobileBluetoothService(); let 
 async function syncHighlight(action,component,system,source='user'){ await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,component,system,source})}); }
 async function explainSelected(){ const comp=document.getElementById('componentExplainBtn').dataset.component; if(!comp){return;} const res=await fetch(`/vehicle-visualization/explain?component=${encodeURIComponent(comp)}`); const data=await res.json(); alert(`${data.component.replace(/_/g,' ')}: ${data.explanation}`); }
 function openAiWithPrompt(prompt){ window.location.href = `/dashboard/ai?prompt=${encodeURIComponent(prompt || '')}`; }
+window.openAiWithPrompt = openAiWithPrompt;
 document.getElementById('connectVehicleBtn').onclick = connectVehicle;
 document.getElementById('startSessionBtn').onclick = createSession;
 document.getElementById('stopSessionBtn').onclick = stopSession;
