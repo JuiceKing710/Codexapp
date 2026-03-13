@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import secrets
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -33,13 +35,17 @@ from sienna_diag.models import (
     ReviewRequest,
     SessionCreateRequest,
     VehicleVisualizationHighlightRequest,
+    UserSignInRequest,
+    UserSignUpRequest,
+    UserProfileUpdateRequest,
+    VehicleProfile,
 )
 from sienna_diag.obd.adapter import OBDLinkAdapter
 from sienna_diag.preprocessing.pipeline import run_preprocessing
 from sienna_diag.review.lmstudio import local_llama_review
 from sienna_diag.review.openai_review import openai_second_opinion
 from sienna_diag.safety_policy import SafetyPolicy
-from sienna_diag.session_store import store
+from sienna_diag.session_store import set_active_user_context, store
 from sienna_diag.vehicle_image_library import vehicle_image_library
 
 
@@ -115,7 +121,49 @@ def _new_phone_bridge_state() -> dict:
     }
 
 
-phone_bridge_state = _new_phone_bridge_state()
+class UserScopedDict:
+    def __init__(self, factory):
+        self._factory = factory
+        self._data: dict[str, dict] = {}
+
+    def _bucket(self) -> dict:
+        user_id = store._default_user_id(None)
+        if user_id not in self._data:
+            self._data[user_id] = self._factory()
+        return self._data[user_id]
+
+    def get(self, key, default=None):
+        return self._bucket().get(key, default)
+
+    def __getitem__(self, key):
+        return self._bucket()[key]
+
+    def __setitem__(self, key, value):
+        self._bucket()[key] = value
+
+    def update(self, payload: dict):
+        self._bucket().update(payload)
+
+    def __iter__(self):
+        return iter(self._bucket())
+
+    def __len__(self):
+        return len(self._bucket())
+
+    def keys(self):
+        return self._bucket().keys()
+
+    def items(self):
+        return self._bucket().items()
+
+    def copy(self):
+        return dict(self._bucket())
+
+    def clear(self):
+        self._bucket().clear()
+
+
+phone_bridge_state = UserScopedDict(_new_phone_bridge_state)
 
 SAFE_EVENT_TAGS = [
     "engine start",
@@ -154,13 +202,36 @@ capture_thread: threading.Thread | None = None
 capture_status = "idle"
 capture_preset = "cold_start_capture"
 
-vehicle_visualization_state = {
+vehicle_visualization_state = UserScopedDict(lambda: {
     "action": None,
     "component": None,
     "system": None,
     "source": "system",
     "updated_at": None,
-}
+})
+
+
+
+auth_tokens: dict[str, str] = {}
+
+
+def _hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def _resolve_user_id(token: str | None) -> str:
+    if not token:
+        return "demo"
+    return auth_tokens.get(token, "demo")
+
+
+@app.middleware("http")
+async def bind_user_context(request: Request, call_next):
+    token = request.headers.get("x-session-token")
+    set_active_user_context(_resolve_user_id(token))
+    response = await call_next(request)
+    return response
+
 
 COMPONENT_EXPLANATIONS = {
     "thermostat": "Regulates coolant flow so the engine reaches and maintains normal operating temperature.",
@@ -300,7 +371,7 @@ def _build_phone_bridge_snapshot(active: dict | None = None, reads: list[dict] |
         and latest_live_read is not None
     )
 
-    snapshot = dict(phone_bridge_state)
+    snapshot = phone_bridge_state.copy()
     snapshot.update({
         "bluetooth_connected": phone_bridge_state.get("status") == "connected",
         "polling_active": polling_active,
@@ -500,6 +571,71 @@ def stop_capture() -> dict:
                 detail="Capture polling stopped.",
             ))
         return {"status": capture_status}
+
+
+
+
+@app.post("/auth/signup")
+def auth_signup(payload: UserSignUpRequest) -> dict:
+    try:
+        user = store.register_user(email=payload.email, password_hash=_hash_password(payload.password), display_name=payload.display_name)
+    except ValueError:
+        raise HTTPException(status_code=409, detail="Email already exists")
+    token = secrets.token_urlsafe(24)
+    auth_tokens[token] = user.user_id
+    profile = store.get_user_profile(user.user_id)
+    return {"session_token": token, "user": user.model_dump(), "profile": profile.model_dump()}
+
+
+@app.post("/auth/signin")
+def auth_signin(payload: UserSignInRequest) -> dict:
+    user = store.authenticate_user(email=payload.email, password_hash=_hash_password(payload.password))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = secrets.token_urlsafe(24)
+    auth_tokens[token] = user.user_id
+    profile = store.get_user_profile(user.user_id)
+    return {"session_token": token, "user": user.model_dump(), "profile": profile.model_dump()}
+
+
+@app.post("/auth/signout")
+def auth_signout(x_session_token: str | None = Header(default=None)) -> dict:
+    if x_session_token:
+        auth_tokens.pop(x_session_token, None)
+    return {"status": "signed_out"}
+
+
+@app.get("/auth/me")
+def auth_me(x_session_token: str | None = Header(default=None)) -> dict:
+    user_id = _resolve_user_id(x_session_token)
+    user = store.get_user(user_id)
+    profile = store.get_user_profile(user_id)
+    return {"authenticated": user_id != "demo", "user": user.model_dump(), "profile": profile.model_dump()}
+
+
+@app.patch("/profile")
+def update_profile(payload: UserProfileUpdateRequest, x_session_token: str | None = Header(default=None)) -> dict:
+    user_id = _resolve_user_id(x_session_token)
+    if user_id == "demo":
+        raise HTTPException(status_code=401, detail="Authentication required")
+    user, profile = store.update_user_profile(user_id, payload.model_dump(exclude_none=True))
+    return {"user": user.model_dump(), "profile": profile.model_dump()}
+
+
+@app.post("/vehicles")
+def add_vehicle(payload: dict, x_session_token: str | None = Header(default=None)) -> dict:
+    user_id = _resolve_user_id(x_session_token)
+    if user_id == "demo":
+        raise HTTPException(status_code=401, detail="Authentication required")
+    vehicle = VehicleProfile(
+        vehicle_id=payload.get("vehicle_id") or secrets.token_hex(6),
+        user_id=user_id,
+        label=payload.get("nickname") or payload.get("label") or "Custom Vehicle",
+        protocol_hint=payload.get("protocol") or payload.get("protocol_hint") or "ISO_9141_2",
+        notes=payload.get("notes"),
+    )
+    saved = store.create_vehicle(user_id=user_id, vehicle=vehicle)
+    return saved.model_dump()
 
 
 @app.get("/health")
@@ -1075,7 +1211,7 @@ def _vehicle_intelligence_core_snapshot(
 def vehicle_visualization_state_view() -> dict:
     return {
         "component_groups": VEHICLE_COMPONENT_GROUPS,
-        "highlight": vehicle_visualization_state,
+        "highlight": vehicle_visualization_state.copy(),
     }
 
 
@@ -1099,7 +1235,7 @@ def vehicle_visualization_highlight(payload: VehicleVisualizationHighlightReques
         "source": payload.source,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     })
-    return {"status": "ok", "highlight": vehicle_visualization_state}
+    return {"status": "ok", "highlight": vehicle_visualization_state.copy()}
 
 
 @app.get("/vehicle-visualization/explain")
@@ -1133,9 +1269,13 @@ def dashboard_state() -> dict:
     ai_monitoring = _build_ai_monitoring_snapshot(bridge_snapshot, alerts)
     core_snapshot = _vehicle_intelligence_core_snapshot(active, reads, events, alerts, bridge_snapshot, ai_monitoring)
 
+    current_user = store.get_user(store._default_user_id(None))
+    current_profile = store.get_user_profile(current_user.user_id)
     return {
         "app_id": settings.app_id,
         "display_name": settings.app_display_name,
+        "current_user": current_user.model_dump(),
+        "current_profile": current_profile.model_dump(),
         "vehicles": [item.model_dump() for item in store.list_vehicles()],
         "active_session": active,
         "adapter_mode": adapter.mode_status(),
@@ -1157,7 +1297,7 @@ def dashboard_state() -> dict:
         "learning_library": store.command_library,
         "vehicle_image": _resolve_vehicle_image(active.get("vehicle_id") if active else None),
         "ai_monitoring": ai_monitoring,
-        "vehicle_visualization": {"component_groups": VEHICLE_COMPONENT_GROUPS, "highlight": vehicle_visualization_state},
+        "vehicle_visualization": {"component_groups": VEHICLE_COMPONENT_GROUPS, "highlight": vehicle_visualization_state.copy()},
         "ai_alerts": [item.model_dump() for item in store.get_ai_alerts(active["session_id"])] if active else [],
         "diagnostic_timeline": [item.model_dump() for item in store.get_timeline_events(active["session_id"])] if active else [],
         "ai_response_history": [item.model_dump() for item in store.get_ai_responses(active["session_id"])] if active else [],
@@ -2310,6 +2450,7 @@ def dashboard() -> str:
             <span class="badge" id="sessionBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="sessionBadgeText">Vehicle Check Idle</span></span>
             <span class="badge" id="captureBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="captureBadgeText">Capture Idle</span></span>
             <span class="badge" id="modeBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="modeBadgeText">Standby</span></span>
+            <span class="badge" id="userBadge" data-tone="accent"><span class="badge-dot" aria-hidden="true"></span><span id="userBadgeText">Signed in: Demo Tester</span></span>
           </div>
         </aside>
       </div>
@@ -2892,6 +3033,8 @@ function renderDashboardState(){
   updateBadge('sessionBadge', 'sessionBadgeText', active ? 'success' : 'neutral', active ? 'Vehicle Check Active' : 'Vehicle Check Idle');
   updateBadge('captureBadge', 'captureBadgeText', captureRecording ? 'danger' : state?.capture_status === 'stopped' ? 'warning' : 'neutral', captureRecording ? 'Capture Recording' : state?.capture_status === 'stopped' ? 'Capture Stopped' : 'Capture Idle', captureRecording);
   updateBadge('modeBadge', 'modeBadgeText', connected ? 'accent' : 'neutral', formatMode(state?.current_mode || phoneBridge.current_mode || 'standby'));
+  const who = state?.current_user?.display_name || 'Demo Tester';
+  document.getElementById('userBadgeText').textContent = `Signed in: ${who}`;
   updateBadge('diagnosticStateBadge', 'diagnosticStateText', captureRecording ? 'danger' : active ? 'success' : connected ? 'accent' : 'warning', captureRecording ? 'Recording live capture' : active ? 'Vehicle check active' : connected ? 'Connected and ready' : 'Awaiting connection', captureRecording);
   updateBadge('aiPanelBadge', 'aiPanelBadgeText', state?.ai_monitoring?.active ? 'accent' : aiReady ? 'success' : 'neutral', state?.ai_monitoring?.active ? 'Live monitoring active' : aiReady ? 'AI ready for diagnostics' : 'Awaiting vehicle check');
 
