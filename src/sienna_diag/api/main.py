@@ -400,6 +400,15 @@ def _build_phone_bridge_snapshot(active: dict | None = None, reads: list[dict] |
     return snapshot
 
 
+def _has_true_connection(bridge_snapshot: dict | None = None) -> bool:
+    snapshot = bridge_snapshot or _build_phone_bridge_snapshot()
+    return bool(
+        snapshot.get("status") == "connected"
+        and snapshot.get("transport_supported")
+        and snapshot.get("first_live_read_received")
+    )
+
+
 def _build_ai_monitoring_snapshot(bridge_snapshot: dict, alerts: list[dict]) -> dict:
     if bridge_snapshot.get("ai_monitoring_active"):
         if alerts:
@@ -524,6 +533,9 @@ def _capture_loop(session_id: str) -> None:
 
 def start_capture(vehicle_id: str | None, preset: str) -> dict:
     global capture_thread, capture_status, capture_preset
+    bridge_snapshot = _build_phone_bridge_snapshot()
+    if not _has_true_connection(bridge_snapshot):
+        raise HTTPException(status_code=409, detail="Live capture requires a true vehicle connection with active telemetry")
     with capture_lock:
         if capture_status == "recording":
             session = store.get_active_session()
@@ -671,6 +683,9 @@ def list_vehicles() -> dict:
 
 @app.post("/sessions")
 def create_session(payload: SessionCreateRequest | None = None) -> dict:
+    bridge_snapshot = _build_phone_bridge_snapshot()
+    if not _has_true_connection(bridge_snapshot):
+        raise HTTPException(status_code=409, detail="Connect to the vehicle and wait for first live read before starting a vehicle check")
     vehicle_id = payload.vehicle_id if payload else None
     try:
         session = store.create_session(vehicle_id=vehicle_id)
@@ -2764,6 +2779,15 @@ def dashboard() -> str:
       </div>
     </section>
   </div>
+<div id="tagEventModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:30;align-items:center;justify-content:center;padding:16px">
+  <div style="max-width:460px;width:100%;background:#111a25;border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:14px;display:grid;gap:10px">
+    <strong>Tag Event</strong>
+    <input id="tagTitleInput" placeholder="Event title (e.g. throttle blip)" style="width:100%;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.15);background:#0d1420;color:#fff" />
+    <textarea id="tagNoteInput" placeholder="Optional note" style="width:100%;min-height:84px;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.15);background:#0d1420;color:#fff"></textarea>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button id="cancelTagBtn" class="secondary">Cancel</button><button id="submitTagBtn">Save Tag</button></div>
+    <div class="tiny" id="tagConfirmMsg"></div>
+  </div>
+</div>
 <script type="module">
 import * as THREE from 'https://unpkg.com/three@0.162.0/build/three.module.js';
 
@@ -3085,11 +3109,11 @@ function renderDashboardState(){
         ? 'Negotiating Bluetooth link and preparing live polling.'
         : (unsupported ? 'This environment does not expose the required native Bluetooth bridge.' : 'Pair with OBDLink MX+ and arm live read-only telemetry.');
   document.getElementById('connectVehicleMeta').textContent = connectMeta;
-  setButtonState('connectVehicleBtn', connected ? 'success' : phoneBridge.status === 'failed' ? 'danger' : phoneBridge.status === 'connecting' ? 'warning' : 'accent', connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Unavailable' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Standby', connected, phoneBridge.status === 'connecting', connected);
+  setButtonState('connectVehicleBtn', connected ? 'success' : phoneBridge.status === 'failed' ? 'danger' : phoneBridge.status === 'connecting' ? 'warning' : 'accent', connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Retry' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Connect', connected, phoneBridge.status === 'connecting', connected);
 
-  setButtonState('startSessionBtn', active ? 'success' : 'accent', active ? 'Active' : 'Ready', Boolean(active), false, Boolean(active));
+  setButtonState('startSessionBtn', active ? 'success' : connected ? 'accent' : 'neutral', active ? 'Active' : connected ? 'Ready' : 'Connect First', Boolean(active), false, Boolean(active));
   setButtonState('stopSessionBtn', active ? 'danger' : 'warning', active ? 'Available' : 'Idle', Boolean(active), false, false);
-  setButtonState('startCaptureBtn', captureRecording ? 'success' : connected && active ? 'accent' : 'neutral', captureRecording ? 'Recording' : connected && active ? 'Ready' : 'Requires Link', captureRecording, captureRecording, captureRecording);
+  setButtonState('startCaptureBtn', captureRecording ? 'success' : isConnectedForActions() && active ? 'accent' : 'neutral', captureRecording ? 'Recording' : isConnectedForActions() && active ? 'Ready' : 'Requires Connection', captureRecording, captureRecording, captureRecording);
   setButtonState('stopCaptureBtn', captureRecording ? 'danger' : 'warning', captureRecording ? 'Available' : 'Idle', captureRecording, false, false);
   setButtonState('tagEventBtn', active && connected ? 'warning' : 'neutral', captureRecording ? 'Live Tagging' : active && connected ? 'Ready' : 'Session Needed', Boolean(active && connected), captureRecording, false);
   setButtonState('reportsBtn', 'neutral', active ? 'Review' : 'Available', Boolean(active), false, false);
@@ -3143,8 +3167,8 @@ function renderBluetoothCard(){
   updateBadge('btStatusBadge', 'btStatusText', tone, statusLabel);
   document.getElementById('btError').textContent = phoneBridge.failure_message || phoneBridge.last_error || 'No Bluetooth errors';
   const detailRows = [
-    { label: 'Selected transport', value: bridgeDebug.selected_transport || 'unknown' },
-    { label: 'Native bridge available', value: bridgeDebug.native_bridge_available ? 'true' : 'false' },
+    { label: 'Connection method', value: bridgeDebug.selected_transport === 'PHONE-LIVE' ? 'Native phone bridge' : 'Unavailable in this browser' },
+    { label: 'Native bridge available', value: bridgeDebug.native_bridge_available ? 'Yes' : 'No' },
     { label: 'Bluetooth link', value: phoneBridge.bluetooth_connected ? 'Connected' : 'Idle' },
     { label: 'Polling state', value: `${phoneBridge.polling_active ? 'Active' : 'Inactive'} (${phoneBridge.polling_state || 'inactive'})` },
     { label: 'First live read', value: phoneBridge.first_live_read_received ? 'Received' : 'Pending' },
@@ -3197,7 +3221,10 @@ function renderTimeline(){
   `).join('') || '<div class="empty-state">No timeline events yet.</div>';
 }
 async function ensureSession(){ if (state && state.active_session) return state.active_session; await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})}); await fetchState(); return state.active_session; }
-async function createSession(){ await ensureSession(); }
+async function createSession(){
+  if(!isConnectedForActions()){ alert('Connect Vehicle first and wait for live telemetry.'); return; }
+  await ensureSession();
+}
 async function pollLiveSensorsOnce(){
   if(livePollingInFlight){return;}
   if((phoneBridge.status||'disconnected')!=='connected' || !phoneBridge.transport_supported){stopLivePolling();return;}
@@ -3228,9 +3255,32 @@ function startLivePolling(){ if(livePollingHandle){return;} logBridge('polling-a
 function stopLivePolling(){ if(livePollingHandle){ clearInterval(livePollingHandle); livePollingHandle=null; } }
 function syncLivePolling(){ if((phoneBridge.status||'disconnected')==='connected' && phoneBridge.transport_supported && state?.active_session && (phoneBridge.polling_state||'inactive')!=='inactive'){ startLivePolling(); return; } stopLivePolling(); }
 async function stopSession(){ stopLivePolling(); await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
-async function startCapture(){ await ensureSession(); await fetch('/capture/start',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId,preset:'cold_start_capture'})}); await fetchState(); }
+async function startCapture(){
+  if(!isConnectedForActions()){ alert('Start Capture is locked until connection is confirmed with live telemetry.'); return; }
+  await ensureSession();
+  const res = await fetch('/capture/start',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId,preset:'cold_start_capture'})});
+  if(!res.ok){ const data = await res.json().catch(()=>({})); alert(data.detail || 'Unable to start capture.'); }
+  await fetchState();
+}
 async function stopCapture(){ await fetch('/capture/stop',{method:'POST'}); await fetchState(); }
-async function tagEvent(){ if (!state.active_session) { alert('Vehicle Check missing: start Vehicle Check first.'); return; } await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:'idle'})}); await fetchState(); }
+function openTagModal(){ document.getElementById('tagConfirmMsg').textContent=''; document.getElementById('tagTitleInput').value=''; document.getElementById('tagNoteInput').value=''; document.getElementById('tagEventModal').style.display='flex'; }
+function closeTagModal(){ document.getElementById('tagEventModal').style.display='none'; }
+async function tagEvent(){
+  if (!state.active_session) { alert('Vehicle Check missing: start Vehicle Check first.'); return; }
+  if (!isConnectedForActions()) { alert('Tagging events requires a confirmed live connection.'); return; }
+  const rawTitle=(document.getElementById('tagTitleInput').value||'').trim().toLowerCase();
+  const note=(document.getElementById('tagNoteInput').value||'').trim();
+  const safeTags=['engine start','engine stop','idle','throttle blip','brake press','headlights on','headlights off'];
+  const tag=safeTags.includes(rawTitle)?rawTitle:'idle';
+  const res=await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag,note})});
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok){ document.getElementById('tagConfirmMsg').textContent=data.detail||'Unable to tag event.'; return; }
+  document.getElementById('tagConfirmMsg').textContent='Event tagged successfully.';
+  await fetchState();
+}
+function isConnectedForActions(){
+  return (phoneBridge.status||'disconnected')==='connected' && Boolean(phoneBridge.first_live_read_received);
+}
 async function connectVehicle(){
   const transport = detectTransport();
   logBridge('selected-transport',{selected: bridgeDebug.selected_transport, native_bridge_available: bridgeDebug.native_bridge_available});
@@ -3248,8 +3298,10 @@ async function connectVehicle(){
       logBridge('connection-failure', { error: connectPayload.fallback_reason });
     }
   }
-  await ensureSession();
-  await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(connectPayload) });
+  const connectRes = await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(connectPayload) });
+  if(!connectRes.ok){
+    alert('Connection request failed. Please retry.');
+  }
   await fetchState();
   if(connectPayload.status==='connected'){ startLivePolling(); }
 }
@@ -3262,8 +3314,10 @@ document.getElementById('startSessionBtn').onclick = createSession;
 document.getElementById('stopSessionBtn').onclick = stopSession;
 document.getElementById('startCaptureBtn').onclick = startCapture;
 document.getElementById('stopCaptureBtn').onclick = stopCapture;
-document.getElementById('tagEventBtn').onclick = tagEvent;
-document.getElementById('reportsBtn').onclick = () => alert('Reports view is available in the report framework section.');
+document.getElementById('tagEventBtn').onclick = openTagModal;
+document.getElementById('cancelTagBtn').onclick = closeTagModal;
+document.getElementById('submitTagBtn').onclick = tagEvent;
+document.getElementById('reportsBtn').onclick = () => window.location.href = '/dashboard/reports';
 document.getElementById('liveGaugesBtn').onclick = () => window.location.href = '/dashboard/gauges';
 document.getElementById('askAiBtn').onclick = () => openAiWithPrompt('');
 document.getElementById('componentExplainBtn').onclick = explainSelected;
@@ -3308,9 +3362,9 @@ def ai_mechanic_page() -> str:
 </head><body><div class="wrap"><div class="card header"><div><h1 style="margin:0">AI Mechanic</h1><div class="tiny">Premium diagnostic copilot for codes, symptoms, and live-data interpretation.</div></div><div class="badge">READ-ONLY DIAGNOSTIC ADVISOR</div></div><div class="card"><div class="status-grid"><div class="status"><div class="tiny">Vehicle</div><strong id="ctxVehicle">Loading...</strong></div><div class="status"><div class="tiny">Connection</div><strong id="ctxConnection">Checking...</strong></div><div class="status"><div class="tiny">Live Data</div><strong id="ctxLive">Waiting</strong></div><div class="status"><div class="tiny">AI Context</div><strong id="ctxAi">Preparing</strong></div><div class="status"><div class="tiny">Microphone</div><strong id="ctxMic">Idle</strong></div></div></div><div class="card"><div id="chat" class="chat"><div id="emptyState" class="empty">Ask about codes, symptoms, sensors, or repairs. Guidance uses current vehicle context when available, and live telemetry context when connected.</div></div></div><div class="card"><div class="chips" id="chips"></div><div class="bar" style="margin-top:10px"><input id="question" placeholder="Ask AI Mechanic anything about this vehicle session" /><button id="sendBtn">Send</button><button id="micBtn" class="secondary">🎤</button><button id="stopMicBtn" class="secondary" style="display:none">Stop</button><button id="speakBtn" class="secondary hide-mobile">🔊</button></div></div><div class="card"><button id="backBtn" class="secondary">Back to Main Dashboard</button></div></div>
 <script>
 let state=null,lastAnswer='';let recog=null;const synth=window.speechSynthesis;const QUICK=['What does this code mean?','Is it safe to drive?','What should I test next?','Explain this simply','What changed in live data?'];
-function addMsg(role,text){const box=document.createElement('div');box.className=`msg ${role==='You'?'user':'ai'}`;box.innerHTML=`<strong>${role}</strong><div>${text}</div><div class='tiny'>${new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}</div>`;document.getElementById('chat').appendChild(box);document.getElementById('emptyState')?.remove();box.scrollIntoView({block:'end'});}async function refreshContext(){const res=await fetch('/dashboard/state');state=await res.json();const pb=state.phone_bridge||{};document.getElementById('ctxVehicle').textContent=state.active_session?.vehicle||'No active vehicle check';document.getElementById('ctxConnection').textContent=(pb.status||'disconnected');document.getElementById('ctxLive').textContent=pb.first_live_read_received?'Live feed active':'No live PID stream';document.getElementById('ctxAi').textContent=state.ai_monitoring?.active?'Context synced':'Session-only context';}
+function addMsg(role,text){const box=document.createElement('div');box.className=`msg ${role==='You'?'user':'ai'}`;box.innerHTML=`<strong>${role}</strong><div>${text}</div><div class='tiny'>${new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}</div>`;document.getElementById('chat').appendChild(box);document.getElementById('emptyState')?.remove();box.scrollIntoView({block:'end'});}function aiAvailable(){const pb=state?.phone_bridge||{};return Boolean(state?.active_session && pb.status==='connected' && pb.first_live_read_received);}async function refreshContext(){const res=await fetch('/dashboard/state');state=await res.json();const pb=state.phone_bridge||{};const available=aiAvailable();document.getElementById('ctxVehicle').textContent=state.active_session?.vehicle||'No active vehicle check';document.getElementById('ctxConnection').textContent=(pb.status||'disconnected');document.getElementById('ctxLive').textContent=pb.first_live_read_received?'Live feed active':'No live PID stream';document.getElementById('ctxAi').textContent=available?'Context synced':'Unavailable until connected';document.getElementById('sendBtn').disabled=!available;document.getElementById('question').disabled=!available;if(!available){document.getElementById('emptyState').textContent='AI Mechanic is unavailable until a vehicle check is active and live telemetry is confirmed.';}}
 function setPrompt(v){document.getElementById('question').value=v;document.getElementById('question').focus();}
-async function ask(){const q=document.getElementById('question').value.trim();if(!q)return;addMsg('You',q);document.getElementById('question').value='';const res=await fetch('/ai/mechanic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,source:'user'})});const data=await res.json();lastAnswer=data.answer;addMsg('AI Mechanic',data.answer);if(data.visualization_hook){await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...data.visualization_hook,source:'ai_mechanic'})});}}
+async function ask(){if(!aiAvailable()){addMsg('AI Mechanic','Unavailable until your vehicle is connected and live telemetry is confirmed.');return;}const q=document.getElementById('question').value.trim();if(!q)return;addMsg('You',q);document.getElementById('question').value='';const res=await fetch('/ai/mechanic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,source:'user'})});const data=await res.json();lastAnswer=data.answer;addMsg('AI Mechanic',data.answer);if(data.visualization_hook){await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...data.visualization_hook,source:'ai_mechanic'})});}}
 function initSpeech(){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){document.getElementById('ctxMic').textContent='Unavailable';document.getElementById('micBtn').disabled=true;return;}recog=new SR();recog.lang='en-US';recog.interimResults=true;recog.onstart=()=>{document.getElementById('ctxMic').textContent='Listening';document.getElementById('stopMicBtn').style.display='block';};recog.onend=()=>{document.getElementById('ctxMic').textContent='Idle';document.getElementById('stopMicBtn').style.display='none';};recog.onerror=()=>{document.getElementById('ctxMic').textContent='Error';};recog.onresult=(e)=>{let t='';for(let i=e.resultIndex;i<e.results.length;i++){t+=e.results[i][0].transcript;}document.getElementById('question').value=t.trim();};}
 function play(){if(!lastAnswer||!synth)return;const u=new SpeechSynthesisUtterance(lastAnswer);synth.speak(u);}document.getElementById('sendBtn').onclick=ask;document.getElementById('micBtn').onclick=()=>recog&&recog.start();document.getElementById('stopMicBtn').onclick=()=>recog&&recog.stop();document.getElementById('speakBtn').onclick=play;document.getElementById('backBtn').onclick=()=>window.location.href='/dashboard';document.getElementById('chips').innerHTML=QUICK.map(q=>`<button class='chip'>${q}</button>`).join('');document.querySelectorAll('.chip').forEach((el)=>el.onclick=()=>setPrompt(el.textContent));const qp=new URLSearchParams(window.location.search).get('prompt');if(qp){setPrompt(qp);}initSpeech();refreshContext();
 </script></body></html>
@@ -3341,6 +3395,9 @@ def list_vehicles() -> dict:
 
 @app.post("/sessions")
 def create_session(payload: SessionCreateRequest | None = None) -> dict:
+    bridge_snapshot = _build_phone_bridge_snapshot()
+    if not _has_true_connection(bridge_snapshot):
+        raise HTTPException(status_code=409, detail="Connect to the vehicle and wait for first live read before starting a vehicle check")
     vehicle_id = payload.vehicle_id if payload else None
     try:
         session = store.create_session(vehicle_id=vehicle_id)
@@ -5434,6 +5491,15 @@ def dashboard() -> str:
       </div>
     </section>
   </div>
+<div id="tagEventModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:30;align-items:center;justify-content:center;padding:16px">
+  <div style="max-width:460px;width:100%;background:#111a25;border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:14px;display:grid;gap:10px">
+    <strong>Tag Event</strong>
+    <input id="tagTitleInput" placeholder="Event title (e.g. throttle blip)" style="width:100%;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.15);background:#0d1420;color:#fff" />
+    <textarea id="tagNoteInput" placeholder="Optional note" style="width:100%;min-height:84px;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.15);background:#0d1420;color:#fff"></textarea>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button id="cancelTagBtn" class="secondary">Cancel</button><button id="submitTagBtn">Save Tag</button></div>
+    <div class="tiny" id="tagConfirmMsg"></div>
+  </div>
+</div>
 <script type="module">
 import * as THREE from 'https://unpkg.com/three@0.162.0/build/three.module.js';
 
@@ -5755,11 +5821,11 @@ function renderDashboardState(){
         ? 'Negotiating Bluetooth link and preparing live polling.'
         : (unsupported ? 'This environment does not expose the required native Bluetooth bridge.' : 'Pair with OBDLink MX+ and arm live read-only telemetry.');
   document.getElementById('connectVehicleMeta').textContent = connectMeta;
-  setButtonState('connectVehicleBtn', connected ? 'success' : phoneBridge.status === 'failed' ? 'danger' : phoneBridge.status === 'connecting' ? 'warning' : 'accent', connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Unavailable' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Standby', connected, phoneBridge.status === 'connecting', connected);
+  setButtonState('connectVehicleBtn', connected ? 'success' : phoneBridge.status === 'failed' ? 'danger' : phoneBridge.status === 'connecting' ? 'warning' : 'accent', connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Retry' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Connect', connected, phoneBridge.status === 'connecting', connected);
 
-  setButtonState('startSessionBtn', active ? 'success' : 'accent', active ? 'Active' : 'Ready', Boolean(active), false, Boolean(active));
+  setButtonState('startSessionBtn', active ? 'success' : connected ? 'accent' : 'neutral', active ? 'Active' : connected ? 'Ready' : 'Connect First', Boolean(active), false, Boolean(active));
   setButtonState('stopSessionBtn', active ? 'danger' : 'warning', active ? 'Available' : 'Idle', Boolean(active), false, false);
-  setButtonState('startCaptureBtn', captureRecording ? 'success' : connected && active ? 'accent' : 'neutral', captureRecording ? 'Recording' : connected && active ? 'Ready' : 'Requires Link', captureRecording, captureRecording, captureRecording);
+  setButtonState('startCaptureBtn', captureRecording ? 'success' : isConnectedForActions() && active ? 'accent' : 'neutral', captureRecording ? 'Recording' : isConnectedForActions() && active ? 'Ready' : 'Requires Connection', captureRecording, captureRecording, captureRecording);
   setButtonState('stopCaptureBtn', captureRecording ? 'danger' : 'warning', captureRecording ? 'Available' : 'Idle', captureRecording, false, false);
   setButtonState('tagEventBtn', active && connected ? 'warning' : 'neutral', captureRecording ? 'Live Tagging' : active && connected ? 'Ready' : 'Session Needed', Boolean(active && connected), captureRecording, false);
   setButtonState('reportsBtn', 'neutral', active ? 'Review' : 'Available', Boolean(active), false, false);
@@ -5813,8 +5879,8 @@ function renderBluetoothCard(){
   updateBadge('btStatusBadge', 'btStatusText', tone, statusLabel);
   document.getElementById('btError').textContent = phoneBridge.failure_message || phoneBridge.last_error || 'No Bluetooth errors';
   const detailRows = [
-    { label: 'Selected transport', value: bridgeDebug.selected_transport || 'unknown' },
-    { label: 'Native bridge available', value: bridgeDebug.native_bridge_available ? 'true' : 'false' },
+    { label: 'Connection method', value: bridgeDebug.selected_transport === 'PHONE-LIVE' ? 'Native phone bridge' : 'Unavailable in this browser' },
+    { label: 'Native bridge available', value: bridgeDebug.native_bridge_available ? 'Yes' : 'No' },
     { label: 'Bluetooth link', value: phoneBridge.bluetooth_connected ? 'Connected' : 'Idle' },
     { label: 'Polling state', value: `${phoneBridge.polling_active ? 'Active' : 'Inactive'} (${phoneBridge.polling_state || 'inactive'})` },
     { label: 'First live read', value: phoneBridge.first_live_read_received ? 'Received' : 'Pending' },
@@ -5867,7 +5933,10 @@ function renderTimeline(){
   `).join('') || '<div class="empty-state">No timeline events yet.</div>';
 }
 async function ensureSession(){ if (state && state.active_session) return state.active_session; await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})}); await fetchState(); return state.active_session; }
-async function createSession(){ await ensureSession(); }
+async function createSession(){
+  if(!isConnectedForActions()){ alert('Connect Vehicle first and wait for live telemetry.'); return; }
+  await ensureSession();
+}
 async function pollLiveSensorsOnce(){
   if(livePollingInFlight){return;}
   if((phoneBridge.status||'disconnected')!=='connected' || !phoneBridge.transport_supported){stopLivePolling();return;}
@@ -5898,9 +5967,32 @@ function startLivePolling(){ if(livePollingHandle){return;} logBridge('polling-a
 function stopLivePolling(){ if(livePollingHandle){ clearInterval(livePollingHandle); livePollingHandle=null; } }
 function syncLivePolling(){ if((phoneBridge.status||'disconnected')==='connected' && phoneBridge.transport_supported && state?.active_session && (phoneBridge.polling_state||'inactive')!=='inactive'){ startLivePolling(); return; } stopLivePolling(); }
 async function stopSession(){ stopLivePolling(); await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
-async function startCapture(){ await ensureSession(); await fetch('/capture/start',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId,preset:'cold_start_capture'})}); await fetchState(); }
+async function startCapture(){
+  if(!isConnectedForActions()){ alert('Start Capture is locked until connection is confirmed with live telemetry.'); return; }
+  await ensureSession();
+  const res = await fetch('/capture/start',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId,preset:'cold_start_capture'})});
+  if(!res.ok){ const data = await res.json().catch(()=>({})); alert(data.detail || 'Unable to start capture.'); }
+  await fetchState();
+}
 async function stopCapture(){ await fetch('/capture/stop',{method:'POST'}); await fetchState(); }
-async function tagEvent(){ if (!state.active_session) { alert('Vehicle Check missing: start Vehicle Check first.'); return; } await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:'idle'})}); await fetchState(); }
+function openTagModal(){ document.getElementById('tagConfirmMsg').textContent=''; document.getElementById('tagTitleInput').value=''; document.getElementById('tagNoteInput').value=''; document.getElementById('tagEventModal').style.display='flex'; }
+function closeTagModal(){ document.getElementById('tagEventModal').style.display='none'; }
+async function tagEvent(){
+  if (!state.active_session) { alert('Vehicle Check missing: start Vehicle Check first.'); return; }
+  if (!isConnectedForActions()) { alert('Tagging events requires a confirmed live connection.'); return; }
+  const rawTitle=(document.getElementById('tagTitleInput').value||'').trim().toLowerCase();
+  const note=(document.getElementById('tagNoteInput').value||'').trim();
+  const safeTags=['engine start','engine stop','idle','throttle blip','brake press','headlights on','headlights off'];
+  const tag=safeTags.includes(rawTitle)?rawTitle:'idle';
+  const res=await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag,note})});
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok){ document.getElementById('tagConfirmMsg').textContent=data.detail||'Unable to tag event.'; return; }
+  document.getElementById('tagConfirmMsg').textContent='Event tagged successfully.';
+  await fetchState();
+}
+function isConnectedForActions(){
+  return (phoneBridge.status||'disconnected')==='connected' && Boolean(phoneBridge.first_live_read_received);
+}
 async function connectVehicle(){
   const transport = detectTransport();
   logBridge('selected-transport',{selected: bridgeDebug.selected_transport, native_bridge_available: bridgeDebug.native_bridge_available});
@@ -5918,8 +6010,10 @@ async function connectVehicle(){
       logBridge('connection-failure', { error: connectPayload.fallback_reason });
     }
   }
-  await ensureSession();
-  await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(connectPayload) });
+  const connectRes = await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(connectPayload) });
+  if(!connectRes.ok){
+    alert('Connection request failed. Please retry.');
+  }
   await fetchState();
   if(connectPayload.status==='connected'){ startLivePolling(); }
 }
@@ -5932,8 +6026,10 @@ document.getElementById('startSessionBtn').onclick = createSession;
 document.getElementById('stopSessionBtn').onclick = stopSession;
 document.getElementById('startCaptureBtn').onclick = startCapture;
 document.getElementById('stopCaptureBtn').onclick = stopCapture;
-document.getElementById('tagEventBtn').onclick = tagEvent;
-document.getElementById('reportsBtn').onclick = () => alert('Reports view is available in the report framework section.');
+document.getElementById('tagEventBtn').onclick = openTagModal;
+document.getElementById('cancelTagBtn').onclick = closeTagModal;
+document.getElementById('submitTagBtn').onclick = tagEvent;
+document.getElementById('reportsBtn').onclick = () => window.location.href = '/dashboard/reports';
 document.getElementById('liveGaugesBtn').onclick = () => window.location.href = '/dashboard/gauges';
 document.getElementById('askAiBtn').onclick = () => openAiWithPrompt('');
 document.getElementById('componentExplainBtn').onclick = explainSelected;
@@ -5943,3 +6039,8 @@ fetchState();
 </body>
 </html>
     """
+
+
+@app.get("/dashboard/reports", response_class=HTMLResponse)
+def dashboard_reports() -> str:
+    return """<!doctype html><html><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width, initial-scale=1'/><title>Reports</title><style>body{margin:0;background:#0b0f14;color:#eef3fb;font-family:Inter,Segoe UI,sans-serif} .wrap{max-width:900px;margin:0 auto;padding:16px;display:grid;gap:12px}.card{background:#121a25;border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:14px}.tiny{color:#9fb0c2;font-size:.92rem}</style></head><body><div class='wrap'><div class='card'><h1 style='margin:0 0 8px'>Reports</h1><div class='tiny'>Review export tiers for the current vehicle check. This page never uses localhost-only links.</div></div><div class='card'><a href='/dashboard'>← Back to Dashboard</a></div></div></body></html>"""
