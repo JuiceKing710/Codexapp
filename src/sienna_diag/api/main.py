@@ -352,6 +352,15 @@ def _timeline_event_exists(session_id: str, event_type: str) -> bool:
     return any(item.event_type == event_type for item in store.get_timeline_events(session_id))
 
 
+def _bridge_failure_message(snapshot: dict) -> str | None:
+    if snapshot.get("status") == "failed":
+        reason = snapshot.get("fallback_reason") or snapshot.get("last_error") or "unknown"
+        if reason in {"native-service-unavailable", "unsupported-environment-native-bridge-missing"}:
+            return "Live Bluetooth requires the native mobile bridge. This browser/runtime cannot open the adapter directly."
+        return f"Bluetooth connection failed: {reason}"
+    return None
+
+
 def _build_phone_bridge_snapshot(active: dict | None = None, reads: list[dict] | None = None) -> dict:
     resolved_active = active
     if resolved_active is None and store.active_session_id:
@@ -376,6 +385,7 @@ def _build_phone_bridge_snapshot(active: dict | None = None, reads: list[dict] |
         "bluetooth_connected": phone_bridge_state.get("status") == "connected",
         "polling_active": polling_active,
         "first_live_read_received": latest_live_read is not None,
+        "transport_supported": bool(phone_bridge_state.get("supports_native_bluetooth")),
         "current_mode": current_mode,
         "current_mode_reason": current_mode_reason,
         "current_source_mode": latest_live_read.get("source_mode") if latest_live_read else phone_bridge_state.get("source_mode"),
@@ -386,6 +396,7 @@ def _build_phone_bridge_snapshot(active: dict | None = None, reads: list[dict] |
         "last_successful_live_read": latest_live_read,
         "ai_monitoring_active": ai_monitoring_active,
     })
+    snapshot["failure_message"] = _bridge_failure_message(snapshot)
     return snapshot
 
 
@@ -790,30 +801,35 @@ def phone_bridge_state_get() -> dict:
 def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
     previous_status = phone_bridge_state.get("status")
     previous_polling_state = phone_bridge_state.get("polling_state")
+    effective_status = payload.status
+    effective_fallback_reason = payload.fallback_reason
+    if payload.source_mode == "PHONE-LIVE" and not payload.supports_native_bluetooth:
+        effective_status = "failed"
+        effective_fallback_reason = effective_fallback_reason or "native-service-unavailable"
     reads: list[dict] = []
     if store.active_session_id:
         reads = [item.model_dump() for item in store.get_reads(store.active_session_id)]
     has_live_read = _latest_phone_live_read(reads) is not None
 
-    _touch_phone_bridge(status=payload.status, error=payload.fallback_reason if payload.status == "failed" else None)
+    _touch_phone_bridge(status=effective_status, error=effective_fallback_reason if effective_status == "failed" else None)
     phone_bridge_state["platform"] = payload.platform
     phone_bridge_state["adapter_name"] = payload.adapter_name
     phone_bridge_state["permission_state"] = payload.permission_state or "unknown"
     phone_bridge_state["source_mode"] = payload.source_mode
     phone_bridge_state["supports_native_bluetooth"] = payload.supports_native_bluetooth
-    phone_bridge_state["fallback_reason"] = payload.fallback_reason
+    phone_bridge_state["fallback_reason"] = effective_fallback_reason
     phone_bridge_state["backend_status"] = (
         "connection-failed"
-        if payload.status == "failed"
-        else ("awaiting-live-read" if payload.status == "connected" and not has_live_read else "phone-managed")
+        if effective_status == "failed"
+        else ("awaiting-live-read" if effective_status == "connected" and not has_live_read else "phone-managed")
     )
-    phone_bridge_state["polling_state"] = "starting" if payload.status == "connected" else "inactive"
-    phone_bridge_state["last_backend_acceptance_status"] = "pending" if payload.status == "connected" and not has_live_read else phone_bridge_state.get("last_backend_acceptance_status")
-    phone_bridge_state["last_ingest_status"] = "idle" if payload.status == "connected" else phone_bridge_state.get("last_ingest_status")
-    phone_bridge_state["last_ingest_error"] = None if payload.status == "connected" else phone_bridge_state.get("last_ingest_error")
-    phone_bridge_state["live_monitoring_state"] = "active" if payload.status == "connected" and has_live_read else ("waiting_for_first_live_read" if payload.status == "connected" else "inactive")
-    phone_bridge_state["command_learning_status"] = "active" if payload.status == "connected" else "idle"
-    if store.active_session_id and payload.status == "connected":
+    phone_bridge_state["polling_state"] = "starting" if effective_status == "connected" else "inactive"
+    phone_bridge_state["last_backend_acceptance_status"] = "pending" if effective_status == "connected" and not has_live_read else phone_bridge_state.get("last_backend_acceptance_status")
+    phone_bridge_state["last_ingest_status"] = "idle" if effective_status == "connected" else phone_bridge_state.get("last_ingest_status")
+    phone_bridge_state["last_ingest_error"] = None if effective_status == "connected" else phone_bridge_state.get("last_ingest_error")
+    phone_bridge_state["live_monitoring_state"] = "active" if effective_status == "connected" and has_live_read else ("waiting_for_first_live_read" if effective_status == "connected" else "inactive")
+    phone_bridge_state["command_learning_status"] = "active" if effective_status == "connected" else "idle"
+    if store.active_session_id and effective_status == "connected":
         if previous_status != "connected":
             store.add_timeline_event(DiagnosticTimelineEvent(
                 session_id=store.active_session_id,
@@ -2754,6 +2770,7 @@ import * as THREE from 'https://unpkg.com/three@0.162.0/build/three.module.js';
 let state = null;
 let selectedVehicleId = 'toyota_sienna_2006';
 let phoneBridge = { status: 'disconnected', source_mode: 'PHONE-LIVE' };
+const bridgeDebug = { selected_transport: 'none', native_bridge_available: false, last_error: null };
 let vehicleRenderer = null;
 let selectedMesh = null;
 let livePollingHandle = null;
@@ -2765,17 +2782,34 @@ const SENSOR_TO_PID = { rpm:'010C', coolant_temp:'0105', control_module_voltage:
 const LIVE_SENSOR_ORDER = ['rpm', 'coolant_temp', 'control_module_voltage', 'vehicle_speed'];
 const LIVE_TELEMETRY_KEYS = ['rpm', 'coolant_temp', 'control_module_voltage', 'vehicle_speed', 'throttle_position'];
 const TOYOTA_PREMIUM_NAME = '2006 Toyota Sienna FWD V6 3.3L';
-function getMobileBluetoothService(){ return window.MobileBluetoothService || null; }
-function normalizeConnectPayload(payload){
-  const serviceAvailable = Boolean(getMobileBluetoothService());
+function logBridge(event, details={}){
+  console.info(`[bridge] ${event}`, details);
+}
+function detectTransport(){
+  const service = window.MobileBluetoothService || null;
+  const hasNativeBridge = Boolean(service && typeof service.connectToAdapter === 'function' && typeof service.readPid === 'function');
+  const platform = /iphone|ipad|ipod/.test(navigator.userAgent.toLowerCase()) ? 'ios' : /android/.test(navigator.userAgent.toLowerCase()) ? 'android' : 'browser';
+  const supported = hasNativeBridge;
+  const reason = supported ? null : 'unsupported-environment-native-bridge-missing';
+  bridgeDebug.selected_transport = hasNativeBridge ? 'PHONE-LIVE' : 'unsupported';
+  bridgeDebug.native_bridge_available = hasNativeBridge;
+  if(reason){ bridgeDebug.last_error = reason; }
+  return { service, hasNativeBridge, supported, platform, reason };
+}
+function getMobileBluetoothService(){ return detectTransport().service; }
+function normalizeConnectPayload(payload, transport){
+  const resolved = transport || detectTransport();
+  const serviceAvailable = resolved.hasNativeBridge;
+  const requestedStatus = payload?.status || 'failed';
+  const safeStatus = (requestedStatus === 'connected' && serviceAvailable) ? 'connected' : (requestedStatus === 'connecting' && serviceAvailable ? 'connecting' : 'failed');
   return {
-    platform: payload?.platform || 'unknown',
+    platform: payload?.platform || resolved.platform || 'unknown',
     adapter_name: payload?.adapter_name || payload?.adapterName || 'OBDLink MX+',
-    status: payload?.status || (serviceAvailable ? 'connected' : 'failed'),
+    status: safeStatus,
     permission_state: payload?.permission_state || payload?.permissionState || null,
     source_mode: payload?.source_mode || payload?.sourceMode || 'PHONE-LIVE',
     supports_native_bluetooth: payload?.supports_native_bluetooth ?? payload?.supportsNativeBluetooth ?? serviceAvailable,
-      fallback_reason: payload?.fallback_reason || payload?.fallbackReason || (serviceAvailable ? null : 'native-service-unavailable'),
+    fallback_reason: payload?.fallback_reason || payload?.fallbackReason || (serviceAvailable ? null : resolved.reason || 'native-service-unavailable'),
   };
 }
 function escapeHtml(value){
@@ -3007,14 +3041,16 @@ function renderDashboardState(){
   const active = state?.active_session;
   const profile = getVehicleProfileById(active?.vehicle_id || selectedVehicleId);
   const connected = (phoneBridge.status || 'disconnected') === 'connected';
-  const captureRecording = state?.capture_status === 'recording';
+  const captureRecording = state?.capture_status === 'recording' && connected;
   const waitingForLiveRead = connected && !phoneBridge.first_live_read_received;
-  const liveReadActive = captureRecording || phoneBridge.ai_monitoring_active || (state?.recent_reads || []).some((read) => LIVE_TELEMETRY_KEYS.includes(read.pid_key) && isFreshRead(read));
+  const recentLiveRead = (state?.recent_reads || []).some((read) => LIVE_TELEMETRY_KEYS.includes(read.pid_key) && isFreshRead(read));
+  const liveReadActive = connected && (phoneBridge.ai_monitoring_active || recentLiveRead);
   const aiReady = Boolean(active);
+  const unsupported = phoneBridge.transport_supported === false || phoneBridge.fallback_reason === 'unsupported-environment-native-bridge-missing';
   const bluetoothTone = connected ? 'success' : phoneBridge.status === 'failed' ? 'danger' : phoneBridge.status === 'connecting' ? 'warning' : 'neutral';
-  const bluetoothLabel = connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Retry Required' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Not Connected';
+  const bluetoothLabel = connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Unavailable' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Not Connected';
   const streamTone = liveReadActive ? 'accent' : waitingForLiveRead ? 'warning' : 'neutral';
-  const streamLabel = liveReadActive ? 'Streaming' : waitingForLiveRead ? 'Priming' : 'Idle';
+  const streamLabel = liveReadActive ? 'Streaming' : waitingForLiveRead ? 'Waiting first PID' : 'Idle';
   const aiTone = aiReady ? (state?.ai_monitoring?.active ? 'accent' : 'success') : 'neutral';
   const aiLabel = aiReady ? (state?.ai_monitoring?.active ? 'Monitoring' : 'Ready') : 'Offline';
   const protocolLabel = formatMode(active?.protocol || profile?.protocol_hint || 'protocol pending');
@@ -3030,31 +3066,32 @@ function renderDashboardState(){
   updateIndicator('statusStreaming', 'statusStreamingValue', streamTone, streamLabel);
   updateIndicator('statusAiAssist', 'statusAiAssistValue', aiTone, aiLabel);
 
-  updateBadge('sessionBadge', 'sessionBadgeText', active ? 'success' : 'neutral', active ? 'Vehicle Check Active' : 'Vehicle Check Idle');
+  const sessionActuallyActive = Boolean(active && connected);
+  updateBadge('sessionBadge', 'sessionBadgeText', sessionActuallyActive ? 'success' : 'neutral', sessionActuallyActive ? 'Vehicle Check Active' : 'Vehicle Check Idle');
   updateBadge('captureBadge', 'captureBadgeText', captureRecording ? 'danger' : state?.capture_status === 'stopped' ? 'warning' : 'neutral', captureRecording ? 'Capture Recording' : state?.capture_status === 'stopped' ? 'Capture Stopped' : 'Capture Idle', captureRecording);
   updateBadge('modeBadge', 'modeBadgeText', connected ? 'accent' : 'neutral', formatMode(state?.current_mode || phoneBridge.current_mode || 'standby'));
   const who = state?.current_user?.display_name || 'Demo Tester';
   document.getElementById('userBadgeText').textContent = `Signed in: ${who}`;
-  updateBadge('diagnosticStateBadge', 'diagnosticStateText', captureRecording ? 'danger' : active ? 'success' : connected ? 'accent' : 'warning', captureRecording ? 'Recording live capture' : active ? 'Vehicle check active' : connected ? 'Connected and ready' : 'Awaiting connection', captureRecording);
+  updateBadge('diagnosticStateBadge', 'diagnosticStateText', captureRecording ? 'danger' : sessionActuallyActive ? 'success' : connected ? 'accent' : 'warning', captureRecording ? 'Recording live capture' : sessionActuallyActive ? 'Vehicle check active' : connected ? 'Connected and ready' : 'Awaiting connection', captureRecording);
   updateBadge('aiPanelBadge', 'aiPanelBadgeText', state?.ai_monitoring?.active ? 'accent' : aiReady ? 'success' : 'neutral', state?.ai_monitoring?.active ? 'Live monitoring active' : aiReady ? 'AI ready for diagnostics' : 'Awaiting vehicle check');
 
   renderTelemetry();
 
   const connectMeta = connected
-    ? `OBDLink bridge active. ${liveReadActive ? 'Live telemetry is streaming.' : 'Waiting for live PID traffic.'}`
+    ? `OBDLink bridge active. ${liveReadActive ? 'Live telemetry is streaming.' : 'Connected, waiting for first successful PID.'}`
     : phoneBridge.status === 'failed'
-      ? `Connection did not complete. ${phoneBridge.fallback_reason || 'Retry the Bluetooth handshake.'}`
+      ? (phoneBridge.failure_message || `Connection did not complete. ${phoneBridge.fallback_reason || 'Retry the Bluetooth handshake.'}`)
       : phoneBridge.status === 'connecting'
         ? 'Negotiating Bluetooth link and preparing live polling.'
-        : 'Pair with OBDLink MX+ and arm live read-only telemetry.';
+        : (unsupported ? 'This environment does not expose the required native Bluetooth bridge.' : 'Pair with OBDLink MX+ and arm live read-only telemetry.');
   document.getElementById('connectVehicleMeta').textContent = connectMeta;
-  setButtonState('connectVehicleBtn', connected ? 'success' : phoneBridge.status === 'failed' ? 'danger' : phoneBridge.status === 'connecting' ? 'warning' : 'accent', connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Retry' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Standby', connected, phoneBridge.status === 'connecting', connected);
+  setButtonState('connectVehicleBtn', connected ? 'success' : phoneBridge.status === 'failed' ? 'danger' : phoneBridge.status === 'connecting' ? 'warning' : 'accent', connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Unavailable' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Standby', connected, phoneBridge.status === 'connecting', connected);
 
   setButtonState('startSessionBtn', active ? 'success' : 'accent', active ? 'Active' : 'Ready', Boolean(active), false, Boolean(active));
   setButtonState('stopSessionBtn', active ? 'danger' : 'warning', active ? 'Available' : 'Idle', Boolean(active), false, false);
-  setButtonState('startCaptureBtn', captureRecording ? 'success' : 'accent', captureRecording ? 'Recording' : 'Ready', captureRecording, captureRecording, captureRecording);
-  setButtonState('stopCaptureBtn', captureRecording ? 'danger' : 'warning', captureRecording ? 'Armed' : 'Idle', captureRecording, captureRecording, false);
-  setButtonState('tagEventBtn', active ? 'warning' : 'neutral', captureRecording ? 'Live Tagging' : active ? 'Ready' : 'Session Needed', Boolean(active), captureRecording, false);
+  setButtonState('startCaptureBtn', captureRecording ? 'success' : connected && active ? 'accent' : 'neutral', captureRecording ? 'Recording' : connected && active ? 'Ready' : 'Requires Link', captureRecording, captureRecording, captureRecording);
+  setButtonState('stopCaptureBtn', captureRecording ? 'danger' : 'warning', captureRecording ? 'Available' : 'Idle', captureRecording, false, false);
+  setButtonState('tagEventBtn', active && connected ? 'warning' : 'neutral', captureRecording ? 'Live Tagging' : active && connected ? 'Ready' : 'Session Needed', Boolean(active && connected), captureRecording, false);
   setButtonState('reportsBtn', 'neutral', active ? 'Review' : 'Available', Boolean(active), false, false);
   setButtonState('liveGaugesBtn', connected ? 'accent' : 'neutral', liveReadActive ? 'Live' : connected ? 'Ready' : 'Standby', connected, liveReadActive, connected);
   setButtonState('askAiBtn', state?.ai_monitoring?.active ? 'accent' : aiReady ? 'success' : 'accent', state?.ai_monitoring?.active ? 'Monitoring' : aiReady ? 'Ready' : 'Standby', Boolean(state?.ai_monitoring?.active || aiReady), false, false);
@@ -3102,9 +3139,12 @@ async function updateVehicleImage(){
 function renderBluetoothCard(){
   const status = phoneBridge.status || 'disconnected';
   const tone = status === 'connected' ? 'success' : status === 'failed' ? 'danger' : status === 'connecting' ? 'warning' : 'neutral';
-  updateBadge('btStatusBadge', 'btStatusText', tone, formatMode(status));
-  document.getElementById('btError').textContent = phoneBridge.last_error || 'No Bluetooth errors';
+  const statusLabel = status === 'failed' ? 'Unavailable' : formatMode(status);
+  updateBadge('btStatusBadge', 'btStatusText', tone, statusLabel);
+  document.getElementById('btError').textContent = phoneBridge.failure_message || phoneBridge.last_error || 'No Bluetooth errors';
   const detailRows = [
+    { label: 'Selected transport', value: bridgeDebug.selected_transport || 'unknown' },
+    { label: 'Native bridge available', value: bridgeDebug.native_bridge_available ? 'true' : 'false' },
     { label: 'Bluetooth link', value: phoneBridge.bluetooth_connected ? 'Connected' : 'Idle' },
     { label: 'Polling state', value: `${phoneBridge.polling_active ? 'Active' : 'Inactive'} (${phoneBridge.polling_state || 'inactive'})` },
     { label: 'First live read', value: phoneBridge.first_live_read_received ? 'Received' : 'Pending' },
@@ -3115,6 +3155,7 @@ function renderBluetoothCard(){
     { label: 'Backend acceptance', value: phoneBridge.backend_acceptance_status || 'idle' },
   ];
   if(phoneBridge.fallback_reason){ detailRows.push({ label: 'Fallback reason', value: phoneBridge.fallback_reason }); }
+  if(phoneBridge.last_error){ detailRows.push({ label: 'Last error', value: phoneBridge.last_error }); }
   if((state.current_mode || phoneBridge.current_mode) === 'MOCK'){ detailRows.push({ label: 'Mock mode reason', value: phoneBridge.mock_reason || state.current_mode_reason || 'Unknown' }); }
   document.getElementById('btDebug').innerHTML = detailRows.map((row) => `<div class="detail-row"><span class="detail-label">${escapeHtml(row.label)}</span><span class="detail-value">${escapeHtml(row.value)}</span></div>`).join('');
 }
@@ -3157,15 +3198,61 @@ function renderTimeline(){
 }
 async function ensureSession(){ if (state && state.active_session) return state.active_session; await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})}); await fetchState(); return state.active_session; }
 async function createSession(){ await ensureSession(); }
-async function pollLiveSensorsOnce(){ if(livePollingInFlight){return;} if((phoneBridge.status||'disconnected')!=='connected'){stopLivePolling();return;} const service=getMobileBluetoothService(); if(!service || typeof service.readPid !== 'function'){ await fetchState(); return; } const active=await ensureSession(); livePollingInFlight=true; try { const nativeReads=await Promise.allSettled(LIVE_SENSOR_ORDER.map(sensor=>readNativePid(sensor))); const ingestJobs=nativeReads.filter(result=>result.status==='fulfilled'&&result.value).map(result=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,...result.value,polling:true})})); if(ingestJobs.length){ await Promise.allSettled(ingestJobs); } } finally { livePollingInFlight=false; await fetchState(); } }
-function startLivePolling(){ if(livePollingHandle){return;} pollLiveSensorsOnce(); livePollingHandle=setInterval(()=>{pollLiveSensorsOnce();},500); }
+async function pollLiveSensorsOnce(){
+  if(livePollingInFlight){return;}
+  if((phoneBridge.status||'disconnected')!=='connected' || !phoneBridge.transport_supported){stopLivePolling();return;}
+  const transport = detectTransport();
+  if(!transport.hasNativeBridge){
+    bridgeDebug.last_error = transport.reason;
+    logBridge('polling-blocked', transport);
+    await fetchState();
+    return;
+  }
+  const active=await ensureSession();
+  livePollingInFlight=true;
+  logBridge('polling-start', { session_id: active?.session_id });
+  try {
+    const nativeReads=await Promise.allSettled(LIVE_SENSOR_ORDER.map(sensor=>readNativePid(sensor)));
+    const successful=nativeReads.filter(result=>result.status==='fulfilled'&&result.value);
+    if(successful.length){
+      logBridge('first-pid-read-candidate', { count: successful.length });
+    }
+    const ingestJobs=successful.map(result=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,...result.value,polling:true})}));
+    if(ingestJobs.length){ await Promise.allSettled(ingestJobs); }
+  } finally {
+    livePollingInFlight=false;
+    await fetchState();
+  }
+}
+function startLivePolling(){ if(livePollingHandle){return;} logBridge('polling-armed',{interval:500}); pollLiveSensorsOnce(); livePollingHandle=setInterval(()=>{pollLiveSensorsOnce();},500); }
 function stopLivePolling(){ if(livePollingHandle){ clearInterval(livePollingHandle); livePollingHandle=null; } }
-function syncLivePolling(){ if((phoneBridge.status||'disconnected')==='connected' && state?.active_session && (phoneBridge.polling_state||'inactive')!=='inactive'){ startLivePolling(); return; } stopLivePolling(); }
+function syncLivePolling(){ if((phoneBridge.status||'disconnected')==='connected' && phoneBridge.transport_supported && state?.active_session && (phoneBridge.polling_state||'inactive')!=='inactive'){ startLivePolling(); return; } stopLivePolling(); }
 async function stopSession(){ stopLivePolling(); await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
 async function startCapture(){ await ensureSession(); await fetch('/capture/start',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId,preset:'cold_start_capture'})}); await fetchState(); }
 async function stopCapture(){ await fetch('/capture/stop',{method:'POST'}); await fetchState(); }
 async function tagEvent(){ if (!state.active_session) { alert('Vehicle Check missing: start Vehicle Check first.'); return; } await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:'idle'})}); await fetchState(); }
-async function connectVehicle(){ const service=getMobileBluetoothService(); let connectPayload; try { connectPayload = normalizeConnectPayload(service && typeof service.connectToAdapter==='function' ? await service.connectToAdapter() : null); } catch (error) { connectPayload = normalizeConnectPayload({status:'failed',fallback_reason:error?.message || 'native-connect-failed'}); } await ensureSession(); await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(connectPayload) }); await fetchState(); if(connectPayload.status==='connected'){ startLivePolling(); } }
+async function connectVehicle(){
+  const transport = detectTransport();
+  logBridge('selected-transport',{selected: bridgeDebug.selected_transport, native_bridge_available: bridgeDebug.native_bridge_available});
+  let connectPayload;
+  if(!transport.hasNativeBridge){
+    connectPayload = normalizeConnectPayload({status:'failed', source_mode:'PHONE-LIVE', supports_native_bluetooth:false, fallback_reason:transport.reason}, transport);
+    logBridge('connection-failed', { reason: connectPayload.fallback_reason });
+  } else {
+    try {
+      logBridge('connection-attempt-started',{ platform: transport.platform });
+      connectPayload = normalizeConnectPayload(await transport.service.connectToAdapter(), transport);
+      logBridge(connectPayload.status === 'connected' ? 'connection-success' : 'connection-failure', connectPayload);
+    } catch (error) {
+      connectPayload = normalizeConnectPayload({status:'failed',fallback_reason:error?.message || 'native-connect-failed'}, transport);
+      logBridge('connection-failure', { error: connectPayload.fallback_reason });
+    }
+  }
+  await ensureSession();
+  await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(connectPayload) });
+  await fetchState();
+  if(connectPayload.status==='connected'){ startLivePolling(); }
+}
 async function syncHighlight(action,component,system,source='user'){ await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,component,system,source})}); }
 async function explainSelected(){ const comp=document.getElementById('componentExplainBtn').dataset.component; if(!comp){return;} const res=await fetch(`/vehicle-visualization/explain?component=${encodeURIComponent(comp)}`); const data=await res.json(); alert(`${data.component.replace(/_/g,' ')}: ${data.explanation}`); }
 function openAiWithPrompt(prompt){ window.location.href = `/dashboard/ai?prompt=${encodeURIComponent(prompt || '')}`; }
@@ -3191,19 +3278,2311 @@ fetchState();
 @app.get('/dashboard/gauges', response_class=HTMLResponse)
 def gauge_dashboard() -> str:
     return """
-<!doctype html><html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Live Gauges</title>
+<!doctype html>
+<html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Live Gauges</title>
 <style>
-body{margin:0;font-family:Segoe UI,system-ui,sans-serif;background:#edf2f7;color:#0f172a;} .wrap{max-width:1024px;margin:0 auto;padding:14px;display:grid;gap:12px;} .card{background:#fff;border:1px solid #d4dde7;border-radius:14px;padding:14px;} .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;} .gauge-grid{display:grid;gap:10px;} .gauge{border:1px solid #d4dde7;border-radius:12px;padding:10px;background:#fcfdff;} .tiny{font-size:.8rem;color:#475569;} button,select,input{width:100%;border-radius:12px;border:1px solid #d4dde7;padding:12px;} button{background:#0f766e;color:#fff;font-weight:700;} button.secondary{background:#fff;color:#0f172a;}
-</style></head><body><div class="wrap"><div class="card"><h1 style="margin:0">Live Gauges</h1><div class="tiny">Dedicated 4-gauge page with side controls and 500ms live polling.</div></div>
-<div class="card"><div class="grid2"><input id="presetName" value="Default" placeholder="Preset name" /><div class="grid2"><button id="savePresetBtn" class="secondary">Save Preset</button><button id="loadPresetBtn" class="secondary">Load Preset</button></div></div><div class="gauge-grid" id="gaugeGrid" style="margin-top:10px;"></div></div>
-<div class="card"><div class="grid2"><button id="startPollingBtn">Start Live Polling</button><button id="stopPollingBtn" class="secondary">Stop Live Polling</button></div><button id="backBtn" class="secondary" style="margin-top:8px;">Back to Main Dashboard</button></div>
-</div>
+:root{--bg:#060b14;--panel:#0d1424;--border:rgba(108,130,166,.35);--text:#d8e4ff;--muted:#8ea5cc;--accent:#28d7ff;--ok:#3ef8a6;--warn:#ffb347;--danger:#ff5f86}*{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,system-ui,sans-serif;background:radial-gradient(circle at 30% 10%,#12203a,#060b14 55%);color:var(--text)}.wrap{max-width:1100px;margin:0 auto;padding:14px;display:grid;gap:12px}.card{background:linear-gradient(160deg,rgba(17,27,46,.92),rgba(10,16,30,.92));border:1px solid var(--border);border-radius:16px;padding:14px;box-shadow:0 10px 24px rgba(0,0,0,.28)}.hdr{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}.tiny{font-size:.84rem;color:var(--muted)}.gauge-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}@media (min-width:980px){.gauge-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}.gauge{position:relative;aspect-ratio:1/1;border-radius:20px;padding:10px;border:1px solid rgba(90,125,181,.35);background:radial-gradient(circle at 50% 35%,rgba(31,50,84,.8),rgba(10,18,34,.95));display:grid;place-items:center;overflow:hidden}.gauge svg{width:100%;height:100%}.g-label{position:absolute;top:10px;font-size:.78rem;color:#9ab1d7;letter-spacing:.04em;text-transform:uppercase}.g-value{position:absolute;top:42%;transform:translateY(-50%);font-size:1.2rem;font-weight:700;text-shadow:0 0 14px rgba(40,215,255,.45)}.g-meta{position:absolute;bottom:12px;font-size:.75rem;color:#8ca0c3;text-align:center;padding:0 8px}.g-disconnected .g-value{color:#6f83a9;text-shadow:none}.controls{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center}button,select{border-radius:12px;border:1px solid var(--border);padding:10px;background:#0d182d;color:var(--text)}button{cursor:pointer;background:linear-gradient(135deg,#11739e,#16a0d8);font-weight:700}button.secondary{background:#101a31}
+</style></head>
+<body><div class="wrap"><div class="card hdr"><div><h1 style="margin:0">Live Gauges</h1><div class="tiny">Default cluster loaded: RPM, Coolant Temp, Battery Voltage, Wheel Speed.</div></div><div id="statusText" class="tiny">Transport status: checking...</div></div><div class="card"><div class="gauge-grid" id="gaugeGrid"></div></div><div class="card"><div class="controls"><select id="presetSelect"><option value="default">Default Preset</option></select><button id="loadPresetBtn" class="secondary">Load Preset</button><button id="backBtn" class="secondary">Back</button></div><div class="tiny" style="margin-top:8px">Customize gauges remains secondary by design; the live cluster is always primary.</div></div></div>
 <script>
-let state=null; let pollingHandle=null; let pollingInFlight=false; let phoneBridge={status:'disconnected'};
-const SENSOR_TO_PID={rpm:'010C',coolant_temp:'0105',control_module_voltage:'0142',intake_air_temp:'010F',vehicle_speed:'010D',throttle_position:'0111'};
-const GAUGE_SENSORS=['rpm','coolant_temp','control_module_voltage','vehicle_speed','throttle_position','intake_air_temp'];
-let gauges=[0,1,2,3].map(i=>({slot:i+1,sensor:GAUGE_SENSORS[i]||'rpm',label:`Gauge ${i+1}`,min:0,max:8000,unit:'',warn:4500,critical:6000}));
-function getMobileBluetoothService(){ return window.MobileBluetoothService || null; }
+const DEFAULT_GAUGES=[{key:'rpm',label:'RPM',unit:'rpm',pid:'010C',min:0,max:7000,warn:5200,critical:6200},{key:'coolant_temp',label:'Coolant Temp',unit:'°C',pid:'0105',min:20,max:120,warn:102,critical:112},{key:'control_module_voltage',label:'Battery Voltage',unit:'V',pid:'0142',min:10,max:16,warn:11.4,critical:10.8},{key:'vehicle_speed',label:'Wheel Speed',unit:'km/h',pid:'010D',min:0,max:180,warn:130,critical:155}];
+let state=null;let phoneBridge={status:'disconnected'};let polling=null;let pollingInFlight=false;let gauges=[...DEFAULT_GAUGES];
+function getService(){return window.MobileBluetoothService||null;}function pct(v,min,max){if(v===null||v===undefined||v==='')return 0;const n=Number(v);if(!Number.isFinite(n))return 0;return Math.max(0,Math.min(1,(n-min)/(max-min)));}function tone(v,g){if(v===null||v===undefined||v==='')return '#6f83a9';const n=Number(v);if(!Number.isFinite(n))return '#6f83a9';if(n>=g.critical)return 'var(--danger)';if(n>=g.warn)return 'var(--warn)';return 'var(--ok)';}function latest(key){const reads=(state?.recent_reads||[]).slice().reverse();return reads.find(r=>r.pid_key===key)||null;}
+function gaugeSvg(g,read){const raw=read?.value??null;const n=Number(raw);const ok=Number.isFinite(n);const ratio=pct(ok?n:null,g.min,g.max);const ang=2*Math.PI*ratio;const r=44;const x=50+r*Math.sin(ang),y=50-r*Math.cos(ang);const large=ratio>0.5?1:0;const arc=ratio?`M50 6 A${r} ${r} 0 ${large} 1 ${x} ${y}`:'';const color=tone(ok?n:null,g);const disconnected=(phoneBridge.status!=='connected');const value=disconnected?'--':(ok?`${n.toFixed(g.unit==='V'?1:0)} ${g.unit}`:'--');const meta=disconnected?(phoneBridge.failure_message||'Disconnected / no live transport'):(read?`range ${g.min}-${g.max} ${g.unit}`:'Waiting for first PID read');return `<div class="gauge ${disconnected?'g-disconnected':''}"><div class="g-label">${g.label}</div><svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="44" stroke="rgba(92,119,162,.32)" stroke-width="8" fill="none"/><path d="${arc}" stroke="${color}" stroke-width="8" fill="none" stroke-linecap="round" style="filter:drop-shadow(0 0 6px ${color});"/><circle cx="50" cy="50" r="2.8" fill="${color}"/></svg><div class="g-value">${value}</div><div class="g-meta">${meta}</div></div>`;}
+function render(){document.getElementById('gaugeGrid').innerHTML=gauges.map(g=>gaugeSvg(g,latest(g.key))).join('');document.getElementById('statusText').textContent=`Transport status: ${(phoneBridge.status||'disconnected')} · ${(phoneBridge.polling_state||'inactive')}`;}
+async function fetchState(){const res=await fetch('/dashboard/state');state=await res.json();phoneBridge={...phoneBridge,...state.phone_bridge};render();syncPolling();}
+async function ensureSession(){if(state?.active_session)return state.active_session;await fetch('/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vehicle_id:'toyota_sienna_2006'})});await fetchState();return state.active_session;}
+async function readPid(g){const svc=getService();if(!svc||typeof svc.readPid!=='function')return null;try{const n=await svc.readPid(g.pid);if(!n)return null;const raw=n.raw_response||n.rawResponse||null;if(!raw)return null;return {command:g.pid,pid_key:g.key,source_mode:n.source_mode||'PHONE-LIVE',source_hint:n.source_hint||'iso9141_2',raw_response:raw,value:n.value??null,unit:n.unit??g.unit,latency_ms:n.latency_ms??null,polling:true};}catch{return null;}}
+async function pollOnce(){if(pollingInFlight)return;if((phoneBridge.status||'disconnected')!=='connected')return;const svc=getService();if(!svc||typeof svc.readPid!=='function')return;const sess=await ensureSession();pollingInFlight=true;try{const vals=await Promise.allSettled(gauges.map(readPid));const jobs=vals.filter(v=>v.status==='fulfilled'&&v.value).map(v=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sess.session_id,vehicle_id:sess.vehicle_id,...v.value})}));if(jobs.length)await Promise.allSettled(jobs);}finally{pollingInFlight=false;await fetchState();}}
+function syncPolling(){if((phoneBridge.status||'disconnected')==='connected'&&(phoneBridge.polling_state||'inactive')!=='inactive'){if(!polling){polling=setInterval(pollOnce,500);pollOnce();}}else if(polling){clearInterval(polling);polling=null;}}
+document.getElementById('backBtn').onclick=()=>window.location.href='/dashboard';document.getElementById('loadPresetBtn').onclick=()=>{gauges=[...DEFAULT_GAUGES];render();};fetchState();
+</script></body></html>
+    """
+
+
+@app.get('/dashboard/ai', response_class=HTMLResponse)
+def ai_mechanic_page() -> str:
+    return """
+<!doctype html><html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>AI Mechanic</title>
+<style>:root{--bg:#060b14;--panel:#0d1424;--border:rgba(108,130,166,.35);--text:#d8e4ff;--muted:#8ea5cc;--accent:#28d7ff;--chip:#16223c}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0%,#14284a,#060b14 58%);color:var(--text);font-family:Inter,Segoe UI,system-ui,sans-serif}.wrap{max-width:1120px;margin:0 auto;padding:14px;display:grid;gap:12px}.card{background:linear-gradient(160deg,rgba(17,27,46,.92),rgba(10,16,30,.92));border:1px solid var(--border);border-radius:16px;padding:14px;box-shadow:0 10px 24px rgba(0,0,0,.28)}.header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}.badge{padding:6px 10px;border-radius:999px;border:1px solid rgba(255,98,122,.45);background:rgba(255,82,120,.14);font-size:.72rem;font-weight:700;letter-spacing:.03em}.status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px}.status{padding:10px;border-radius:12px;background:#0e1a31;border:1px solid var(--border)}.chat{min-height:360px;max-height:55vh;overflow:auto;display:grid;gap:10px;padding:4px}.msg{padding:10px 12px;border-radius:12px;max-width:92%}.user{justify-self:end;background:linear-gradient(135deg,#1a4f7b,#136892)}.ai{justify-self:start;background:#101b33;border:1px solid var(--border)}.empty{padding:16px;border:1px dashed rgba(123,156,206,.4);border-radius:12px;color:var(--muted)}.bar{display:grid;grid-template-columns:1fr auto auto auto auto;gap:8px}input,button{border-radius:12px;border:1px solid var(--border);padding:10px;background:#0d182d;color:var(--text)}button{cursor:pointer;background:linear-gradient(135deg,#11739e,#16a0d8);font-weight:700}button.secondary{background:#101a31}.chips{display:flex;flex-wrap:wrap;gap:8px}.chip{padding:8px 10px;border-radius:999px;border:1px solid var(--border);background:var(--chip);color:#c9daf8;cursor:pointer;font-size:.82rem}.tiny{font-size:.82rem;color:var(--muted)}@media (max-width:720px){.bar{grid-template-columns:1fr auto auto;}.hide-mobile{display:none}}</style>
+</head><body><div class="wrap"><div class="card header"><div><h1 style="margin:0">AI Mechanic</h1><div class="tiny">Premium diagnostic copilot for codes, symptoms, and live-data interpretation.</div></div><div class="badge">READ-ONLY DIAGNOSTIC ADVISOR</div></div><div class="card"><div class="status-grid"><div class="status"><div class="tiny">Vehicle</div><strong id="ctxVehicle">Loading...</strong></div><div class="status"><div class="tiny">Connection</div><strong id="ctxConnection">Checking...</strong></div><div class="status"><div class="tiny">Live Data</div><strong id="ctxLive">Waiting</strong></div><div class="status"><div class="tiny">AI Context</div><strong id="ctxAi">Preparing</strong></div><div class="status"><div class="tiny">Microphone</div><strong id="ctxMic">Idle</strong></div></div></div><div class="card"><div id="chat" class="chat"><div id="emptyState" class="empty">Ask about codes, symptoms, sensors, or repairs. Guidance uses current vehicle context when available, and live telemetry context when connected.</div></div></div><div class="card"><div class="chips" id="chips"></div><div class="bar" style="margin-top:10px"><input id="question" placeholder="Ask AI Mechanic anything about this vehicle session" /><button id="sendBtn">Send</button><button id="micBtn" class="secondary">🎤</button><button id="stopMicBtn" class="secondary" style="display:none">Stop</button><button id="speakBtn" class="secondary hide-mobile">🔊</button></div></div><div class="card"><button id="backBtn" class="secondary">Back to Main Dashboard</button></div></div>
+<script>
+let state=null,lastAnswer='';let recog=null;const synth=window.speechSynthesis;const QUICK=['What does this code mean?','Is it safe to drive?','What should I test next?','Explain this simply','What changed in live data?'];
+function addMsg(role,text){const box=document.createElement('div');box.className=`msg ${role==='You'?'user':'ai'}`;box.innerHTML=`<strong>${role}</strong><div>${text}</div><div class='tiny'>${new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}</div>`;document.getElementById('chat').appendChild(box);document.getElementById('emptyState')?.remove();box.scrollIntoView({block:'end'});}async function refreshContext(){const res=await fetch('/dashboard/state');state=await res.json();const pb=state.phone_bridge||{};document.getElementById('ctxVehicle').textContent=state.active_session?.vehicle||'No active vehicle check';document.getElementById('ctxConnection').textContent=(pb.status||'disconnected');document.getElementById('ctxLive').textContent=pb.first_live_read_received?'Live feed active':'No live PID stream';document.getElementById('ctxAi').textContent=state.ai_monitoring?.active?'Context synced':'Session-only context';}
+function setPrompt(v){document.getElementById('question').value=v;document.getElementById('question').focus();}
+async function ask(){const q=document.getElementById('question').value.trim();if(!q)return;addMsg('You',q);document.getElementById('question').value='';const res=await fetch('/ai/mechanic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,source:'user'})});const data=await res.json();lastAnswer=data.answer;addMsg('AI Mechanic',data.answer);if(data.visualization_hook){await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...data.visualization_hook,source:'ai_mechanic'})});}}
+function initSpeech(){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){document.getElementById('ctxMic').textContent='Unavailable';document.getElementById('micBtn').disabled=true;return;}recog=new SR();recog.lang='en-US';recog.interimResults=true;recog.onstart=()=>{document.getElementById('ctxMic').textContent='Listening';document.getElementById('stopMicBtn').style.display='block';};recog.onend=()=>{document.getElementById('ctxMic').textContent='Idle';document.getElementById('stopMicBtn').style.display='none';};recog.onerror=()=>{document.getElementById('ctxMic').textContent='Error';};recog.onresult=(e)=>{let t='';for(let i=e.resultIndex;i<e.results.length;i++){t+=e.results[i][0].transcript;}document.getElementById('question').value=t.trim();};}
+function play(){if(!lastAnswer||!synth)return;const u=new SpeechSynthesisUtterance(lastAnswer);synth.speak(u);}document.getElementById('sendBtn').onclick=ask;document.getElementById('micBtn').onclick=()=>recog&&recog.start();document.getElementById('stopMicBtn').onclick=()=>recog&&recog.stop();document.getElementById('speakBtn').onclick=play;document.getElementById('backBtn').onclick=()=>window.location.href='/dashboard';document.getElementById('chips').innerHTML=QUICK.map(q=>`<button class='chip'>${q}</button>`).join('');document.querySelectorAll('.chip').forEach((el)=>el.onclick=()=>setPrompt(el.textContent));const qp=new URLSearchParams(window.location.search).get('prompt');if(qp){setPrompt(qp);}initSpeech();refreshContext();
+</script></body></html>
+    """
+
+
+
+
+@app.get("/health")
+def health() -> dict:
+    bridge_snapshot = _build_phone_bridge_snapshot()
+    return {
+        "ok": True,
+        "app_id": settings.app_id,
+        "display_name": settings.app_display_name,
+        "mode": "read-only",
+        "adapter_mode": adapter.mode_status(),
+        "current_mode": bridge_snapshot["current_mode"],
+        "connection_status": adapter.connection_status(),
+        "phone_bridge": bridge_snapshot,
+    }
+
+
+@app.get("/vehicles")
+def list_vehicles() -> dict:
+    return {"vehicles": [item.model_dump() for item in store.list_vehicles()]}
+
+
+@app.post("/sessions")
+def create_session(payload: SessionCreateRequest | None = None) -> dict:
+    vehicle_id = payload.vehicle_id if payload else None
+    try:
+        session = store.create_session(vehicle_id=vehicle_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Vehicle profile not found")
+    return session.model_dump()
+
+
+@app.get("/sessions")
+def list_sessions() -> dict:
+    sessions = [s.model_dump() for s in store.sessions.values()]
+    return {"active_session_id": store.active_session_id, "sessions": sessions}
+
+
+@app.post("/sessions/active/stop")
+def stop_active_session() -> dict:
+    session = store.close_active_session()
+    if session is None:
+        return {"status": "no_active_session"}
+    stop_capture()
+    return {"status": "stopped", "session_id": session.session_id}
+
+
+@app.get("/sessions/active")
+def get_active_session() -> dict:
+    try:
+        session = store.get_active_session()
+    except KeyError:
+        raise HTTPException(status_code=404, detail="No active session")
+    return session.model_dump()
+
+
+@app.get("/sessions/{session_id}")
+def get_session(session_id: str) -> dict:
+    try:
+        session = store.get_session(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    events = [event.model_dump() for event in store.get_events(session_id)]
+    reads = [read.model_dump() for read in store.get_reads(session_id)]
+    return {"session": session.model_dump(), "events": events, "reads": reads}
+
+
+@app.get("/sessions/{session_id}/reads")
+def get_reads(session_id: str) -> dict:
+    try:
+        store.get_session(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"reads": [read.model_dump() for read in store.get_reads(session_id)]}
+
+
+@app.post("/sessions/{session_id}/events")
+def tag_event(session_id: str, payload: EventTag) -> dict:
+    if payload.session_id != session_id:
+        raise HTTPException(status_code=400, detail="session_id mismatch")
+
+    try:
+        event = store.add_event(payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return event.model_dump()
+
+
+@app.post("/obd/read", response_model=OBDReadResponse)
+def obd_read(payload: OBDReadRequest) -> OBDReadResponse:
+    try:
+        session = store.get_session(payload.session_id) if payload.session_id else store.get_active_session()
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return _run_safe_read(session.session_id, payload.command, payload.source_hint)
+
+
+@app.post("/obd/read/quick/{read_key}")
+def quick_read(read_key: str) -> OBDReadResponse:
+    if read_key not in SAFE_QUICK_READS:
+        raise HTTPException(status_code=404, detail="Unknown quick-read key")
+    try:
+        active = store.get_active_session()
+    except KeyError:
+        raise HTTPException(status_code=404, detail="No active session")
+
+    source_hint = _resolve_source_hint(active.protocol)
+    return obd_read(OBDReadRequest(command=SAFE_QUICK_READS[read_key], source_hint=source_hint))
+
+
+@app.post("/capture/start")
+def capture_start(payload: CaptureStartRequest | None = None) -> dict:
+    request = payload or CaptureStartRequest()
+    try:
+        return start_capture(vehicle_id=request.vehicle_id, preset=request.preset)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Vehicle profile not found")
+
+
+@app.post("/capture/stop")
+def capture_stop() -> dict:
+    return stop_capture()
+
+
+@app.post("/capture/tag")
+def capture_tag(payload: CaptureTagRequest) -> dict:
+    if payload.tag not in SAFE_EVENT_TAGS:
+        raise HTTPException(status_code=400, detail="Unsupported event tag")
+    if capture_status != "recording":
+        raise HTTPException(status_code=400, detail="Capture is not recording")
+    try:
+        session = store.get_active_session()
+    except KeyError:
+        raise HTTPException(status_code=404, detail="No active session")
+
+    event = EventTag(
+        session_id=session.session_id,
+        ts=datetime.now(timezone.utc),
+        tag=payload.tag,
+        note=payload.note,
+    )
+    return store.add_event(event).model_dump()
+
+
+@app.get("/phone/bridge/state")
+def phone_bridge_state_get() -> dict:
+    return _build_phone_bridge_snapshot()
+
+
+@app.post("/phone/bridge/connect")
+def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
+    previous_status = phone_bridge_state.get("status")
+    previous_polling_state = phone_bridge_state.get("polling_state")
+    effective_status = payload.status
+    effective_fallback_reason = payload.fallback_reason
+    if payload.source_mode == "PHONE-LIVE" and not payload.supports_native_bluetooth:
+        effective_status = "failed"
+        effective_fallback_reason = effective_fallback_reason or "native-service-unavailable"
+    reads: list[dict] = []
+    if store.active_session_id:
+        reads = [item.model_dump() for item in store.get_reads(store.active_session_id)]
+    has_live_read = _latest_phone_live_read(reads) is not None
+
+    _touch_phone_bridge(status=effective_status, error=effective_fallback_reason if effective_status == "failed" else None)
+    phone_bridge_state["platform"] = payload.platform
+    phone_bridge_state["adapter_name"] = payload.adapter_name
+    phone_bridge_state["permission_state"] = payload.permission_state or "unknown"
+    phone_bridge_state["source_mode"] = payload.source_mode
+    phone_bridge_state["supports_native_bluetooth"] = payload.supports_native_bluetooth
+    phone_bridge_state["fallback_reason"] = effective_fallback_reason
+    phone_bridge_state["backend_status"] = (
+        "connection-failed"
+        if effective_status == "failed"
+        else ("awaiting-live-read" if effective_status == "connected" and not has_live_read else "phone-managed")
+    )
+    phone_bridge_state["polling_state"] = "starting" if effective_status == "connected" else "inactive"
+    phone_bridge_state["last_backend_acceptance_status"] = "pending" if effective_status == "connected" and not has_live_read else phone_bridge_state.get("last_backend_acceptance_status")
+    phone_bridge_state["last_ingest_status"] = "idle" if effective_status == "connected" else phone_bridge_state.get("last_ingest_status")
+    phone_bridge_state["last_ingest_error"] = None if effective_status == "connected" else phone_bridge_state.get("last_ingest_error")
+    phone_bridge_state["live_monitoring_state"] = "active" if effective_status == "connected" and has_live_read else ("waiting_for_first_live_read" if effective_status == "connected" else "inactive")
+    phone_bridge_state["command_learning_status"] = "active" if effective_status == "connected" else "idle"
+    if store.active_session_id and effective_status == "connected":
+        if previous_status != "connected":
+            store.add_timeline_event(DiagnosticTimelineEvent(
+                session_id=store.active_session_id,
+                event_type="vehicle_connected",
+                title="Vehicle connected",
+                detail=f"{payload.adapter_name} connected through hybrid mobile app.",
+            ))
+        if previous_polling_state == "inactive":
+            store.add_timeline_event(DiagnosticTimelineEvent(
+                session_id=store.active_session_id,
+                event_type="polling_started",
+                title="Polling started",
+                detail=f"Phone-live polling armed for {len(phone_bridge_state['configured_gauge_pids'])} gauges at {phone_bridge_state['polling_interval_ms']} ms.",
+                metadata={"polling_interval_ms": phone_bridge_state["polling_interval_ms"], "gauge_pids": phone_bridge_state["configured_gauge_pids"]},
+            ))
+    return _build_phone_bridge_snapshot()
+
+
+@app.post("/phone/bridge/disconnect")
+def phone_bridge_disconnect() -> dict:
+    _touch_phone_bridge(status="disconnected", error=None)
+    phone_bridge_state["backend_status"] = "disconnected"
+    phone_bridge_state["polling_state"] = "inactive"
+    phone_bridge_state["live_monitoring_state"] = "inactive"
+    phone_bridge_state["command_learning_status"] = "idle"
+    if store.active_session_id:
+        store.add_timeline_event(DiagnosticTimelineEvent(
+            session_id=store.active_session_id,
+            event_type="vehicle_disconnected",
+            title="Vehicle disconnected",
+            detail="Phone-managed Bluetooth disconnected.",
+        ))
+    return _build_phone_bridge_snapshot()
+
+
+@app.post("/phone/bridge/read")
+def phone_bridge_read(payload: PhoneLiveReadPayload) -> dict:
+    if payload.source_mode not in PHONE_LIVE_SOURCE_MODES:
+        detail = "Phone bridge reads must be labeled PHONE-LIVE or BROWSER-DEV"
+        _mark_ingest_failure("invalid-source-mode", detail)
+        raise HTTPException(status_code=400, detail=detail)
+
+    try:
+        session = _resolve_session_for_phone(payload)
+    except KeyError:
+        detail = "Session not found"
+        _mark_ingest_failure("session-missing", detail)
+        raise HTTPException(status_code=404, detail=detail)
+
+    prior_reads = [item.model_dump() for item in store.get_reads(session.session_id)]
+    had_live_read = _latest_phone_live_read(prior_reads) is not None
+
+    pid_meta = PHONE_LIVE_PID_LABELS.get(payload.command.upper())
+    if pid_meta is None:
+        detail = "Unsupported PID for phone-live endpoint"
+        _mark_ingest_failure("unsupported-pid", detail)
+        raise HTTPException(status_code=400, detail=detail)
+
+    mode_label = "PHONE-LIVE" if payload.source_mode == "PHONE-LIVE" else "BROWSER-DEV"
+
+    history_item = ReadHistoryItem(
+        session_id=session.session_id,
+        vehicle=session.vehicle,
+        vehicle_id=session.vehicle_id,
+        command=payload.command.upper(),
+        raw_response=payload.raw_response,
+        source_mode=mode_label,
+        pid_key=payload.pid_key or pid_meta["pid_key"],
+        value=payload.value,
+        parsed_value=payload.value,
+        unit=payload.unit or pid_meta["unit"],
+        raw_command=payload.command.upper(),
+        polling=payload.polling,
+        ts=payload.ts,
+    )
+    store.add_read(history_item)
+
+    phone_bridge_state["last_command"] = payload.command.upper()
+    phone_bridge_state["last_response"] = payload.raw_response
+    phone_bridge_state["last_latency_ms"] = payload.latency_ms
+    phone_bridge_state["source_mode"] = mode_label
+    phone_bridge_state["backend_status"] = payload.backend_status or "accepted"
+    phone_bridge_state["last_backend_acceptance_status"] = "accepted"
+    phone_bridge_state["last_ingest_status"] = "accepted"
+    phone_bridge_state["last_ingest_error"] = payload.error
+    phone_bridge_state["polling_state"] = "active" if payload.polling else phone_bridge_state.get("polling_state", "inactive")
+    phone_bridge_state["live_monitoring_state"] = "active"
+    if payload.command.upper() == "0902":
+        phone_bridge_state["last_vin_command"] = payload.command.upper()
+        phone_bridge_state["last_vin_response"] = payload.raw_response
+        parsed_vin = payload.value if isinstance(payload.value, str) and len(str(payload.value)) == 17 else _decode_mode09_vin(payload.raw_response)
+        if parsed_vin:
+            phone_bridge_state["vin_parse_status"] = "parsed"
+            phone_bridge_state["vin"] = parsed_vin
+            store.assign_session_vin(session.session_id, parsed_vin, "auto_vin")
+            store.add_timeline_event(DiagnosticTimelineEvent(
+                session_id=session.session_id,
+                event_type="vin_detected",
+                title="VIN detected",
+                detail=f"VIN detected automatically: {parsed_vin}",
+                metadata={"source": "auto_vin"},
+            ))
+        else:
+            phone_bridge_state["vin_parse_status"] = "failed-manual-selection-required"
+            store.assign_session_vin(session.session_id, None, "manual")
+            store.add_timeline_event(DiagnosticTimelineEvent(
+                session_id=session.session_id,
+                event_type="connection_issue",
+                title="VIN parse issue",
+                detail="VIN parse failed; manual vehicle selection required.",
+            ))
+    _touch_phone_bridge(status="connected", error=payload.error)
+    if not had_live_read:
+        store.add_timeline_event(DiagnosticTimelineEvent(
+            session_id=session.session_id,
+            event_type="first_live_read_received",
+            title="First live read received",
+            detail=f"{payload.command.upper()} was accepted from the phone-live bridge and attached to the active vehicle check.",
+            metadata={"pid": payload.command.upper(), "polling": payload.polling},
+        ))
+        if not _timeline_event_exists(session.session_id, "live_monitoring_active"):
+            store.add_timeline_event(DiagnosticTimelineEvent(
+                session_id=session.session_id,
+                event_type="live_monitoring_active",
+                title="Live monitoring active",
+                detail="AI live monitoring activated after the first successful phone-live read.",
+            ))
+    _record_learning(
+        session_id=session.session_id,
+        vehicle_id=session.vehicle_id,
+        source_type="obd_request_response",
+        raw_command=payload.command.upper(),
+        raw_response=payload.raw_response,
+        parsed_response={"pid_key": history_item.pid_key, "value": history_item.value, "unit": history_item.unit},
+        protocol=session.protocol,
+        mode=mode_label,
+        risk_classification="safe" if payload.command.upper() in LIVE_POLLING_SUPPORTED_PIDS + ["0902"] else "unknown",
+        notes="polling" if payload.polling else "manual",
+    )
+
+    current_reads = [item.model_dump() for item in store.get_reads(session.session_id)]
+    current_events = [item.model_dump() for item in store.get_events(session.session_id)]
+    bridge_snapshot = _build_phone_bridge_snapshot(active=session.model_dump(), reads=current_reads)
+    context = _build_ai_context(
+        active=session.model_dump(),
+        reads=current_reads,
+        events=current_events,
+        memory=store.get_vehicle_memory(session.vehicle_id),
+        bridge_snapshot=bridge_snapshot,
+    )
+    proactive_alerts = _run_proactive_monitoring(session.session_id, session.vehicle_id, context)
+
+    return {
+        "status": "accepted",
+        "session_id": session.session_id,
+        "vehicle_id": session.vehicle_id,
+        "mode": mode_label,
+        "read": history_item.model_dump(),
+        "backend_acceptance_status": phone_bridge_state["last_backend_acceptance_status"],
+        "current_mode": bridge_snapshot["current_mode"],
+        "first_live_read_received": bridge_snapshot["first_live_read_received"],
+        "live_monitoring_active": bridge_snapshot["ai_monitoring_active"],
+        "ai_alerts_generated": proactive_alerts,
+        "bridge_state": bridge_snapshot,
+    }
+
+
+
+
+@app.post("/phone/vehicle/assign")
+def phone_vehicle_assign(payload: SessionCreateRequest) -> dict:
+    if not store.active_session_id:
+        session = store.create_session(vehicle_id=payload.vehicle_id)
+    else:
+        session = store.get_active_session()
+        if payload.vehicle_id and payload.vehicle_id != session.vehicle_id:
+            session = store.create_session(vehicle_id=payload.vehicle_id)
+    session = store.assign_session_vin(session.session_id, session.vin, "manual")
+    store.add_timeline_event(DiagnosticTimelineEvent(
+        session_id=session.session_id,
+        event_type="manual_vehicle_selected",
+        title="Manual vehicle selected",
+        detail=f"Manual vehicle assignment: {session.vehicle}",
+        source="user",
+    ))
+    phone_bridge_state["vin_parse_status"] = "manual-selection"
+    return session.model_dump()
+
+
+@app.post("/learning/ingest")
+def learning_ingest(payload: CommandLearningIngestRequest) -> dict:
+    session = _resolve_session_for_phone(PhoneLiveReadPayload(
+        session_id=payload.session_id,
+        vehicle_id=payload.vehicle_id,
+        command="010C",
+        raw_response=payload.raw_response or "",
+        pid_key="rpm",
+    ))
+    record = _record_learning(
+        session_id=session.session_id,
+        vehicle_id=session.vehicle_id,
+        source_type=payload.source_type,
+        raw_command=payload.raw_command,
+        raw_response=payload.raw_response,
+        parsed_response=payload.parsed_response,
+        protocol=payload.protocol or session.protocol,
+        mode=payload.mode,
+        before_state_snapshot=payload.before_state_snapshot,
+        after_state_snapshot=payload.after_state_snapshot,
+        tags=payload.tags,
+        confidence_score=payload.confidence_score,
+        risk_classification=payload.risk_classification,
+        manually_approved_for_replay=payload.manually_approved_for_replay,
+        replay_succeeded=payload.replay_succeeded,
+        notes=payload.notes,
+    )
+    if payload.source_type == "can_passive":
+        phone_bridge_state["passive_can_capture_status"] = "available"
+    return {"status": "accepted", "record": record.model_dump()}
+
+
+@app.get("/learning/library")
+def learning_library() -> dict:
+    return {"command_library": store.command_library}
+
+
+@app.get("/learning/session/{session_id}")
+def learning_session(session_id: str) -> dict:
+    store.get_session(session_id)
+    return {"records": [r.model_dump() for r in store.get_learning_records(session_id)]}
+
+
+@app.post("/learning/replay/approve")
+def replay_approve(payload: ReplayApprovalRequest) -> dict:
+    store.get_session(payload.session_id)
+    approval = store.set_replay_approval(payload.session_id, payload.raw_command, payload.approve, payload.notes)
+    return {"status": "ok", "approval": approval, "raw_command": payload.raw_command.upper()}
+
+
+@app.post("/learning/replay/execute")
+def replay_execute(payload: ReplayExecuteRequest) -> dict:
+    _ = payload
+    raise HTTPException(
+        status_code=403,
+        detail="Replay execution is permanently blocked in AI Mechanic read-only safety mode",
+    )
+
+@app.post("/review/local")
+def review_local(payload: ReviewRequest) -> dict:
+    try:
+        store.get_session(payload.session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return local_llama_review(payload.summary)
+
+
+@app.post("/review/openai")
+def review_openai(payload: ReviewRequest) -> dict:
+    try:
+        store.get_session(payload.session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    result = openai_second_opinion(payload.summary)
+    return result.model_dump()
+
+
+@app.post("/preprocess")
+def preprocess_logs(payload: PreprocessRequest) -> dict:
+    return run_preprocessing(Path(payload.input_path), Path(payload.output_dir))
+
+
+def _resolve_vehicle_image(manual_vehicle_id: str | None = None) -> dict:
+    active = store.get_session(store.active_session_id).model_dump() if store.active_session_id else None
+    resolution = vehicle_image_library.resolve(
+        vin=phone_bridge_state.get("vin") if active else None,
+        vin_parse_status=phone_bridge_state.get("vin_parse_status"),
+        manual_vehicle_id=manual_vehicle_id,
+        active_vehicle_id=active.get("vehicle_id") if active else None,
+        assignment_source=active.get("assignment_source") if active else None,
+    )
+    return {
+        "vehicle_id": resolution.vehicle_id,
+        "year": resolution.year,
+        "make": resolution.make,
+        "model": resolution.model,
+        "trim": resolution.trim,
+        "image_asset_path": resolution.image_asset_path,
+        "fallback_image_asset_path": resolution.fallback_image_asset_path,
+        "model_3d_ref": resolution.model_3d_ref,
+        "resolved_from": resolution.resolved_from,
+        "lookup_key_used": resolution.lookup_key_used,
+    }
+
+
+@app.get("/vehicle-image/current")
+def current_vehicle_image(manual_vehicle_id: str | None = None) -> dict:
+    return _resolve_vehicle_image(manual_vehicle_id)
+
+
+def _compute_vehicle_health_score(reads: list[dict], alerts: list[dict]) -> dict:
+    latest = _latest_values(reads, ["rpm", "coolant_temp", "control_module_voltage"])
+    score = 100
+    factors = []
+
+    dtc_count = sum(1 for item in reads if item.get("command") in {"03", "07"})
+    if dtc_count:
+        penalty = min(30, dtc_count * 8)
+        score -= penalty
+        factors.append(f"DTC activity penalty -{penalty}")
+
+    coolant = latest.get("coolant_temp", {}).get("value")
+    if isinstance(coolant, (int, float)) and coolant >= 108:
+        score -= 18
+        factors.append("Coolant temperature elevated")
+
+    voltage = latest.get("control_module_voltage", {}).get("value")
+    if isinstance(voltage, (int, float)) and (voltage < 12.2 or voltage > 15.1):
+        score -= 14
+        factors.append("Control module voltage unstable")
+
+    rpm = latest.get("rpm", {}).get("value")
+    if isinstance(rpm, (int, float)) and rpm > 3500:
+        score -= 6
+        factors.append("RPM outlier observed")
+
+    if alerts:
+        penalty = min(20, len(alerts) * 5)
+        score -= penalty
+        factors.append(f"AI alert activity penalty -{penalty}")
+
+    score = max(0, min(100, int(score)))
+    status = "good" if score >= 80 else ("watch" if score >= 60 else "service recommended")
+    return {"score": score, "status": status, "factors": factors}
+
+
+def _vehicle_intelligence_core_snapshot(
+    active: dict | None,
+    reads: list[dict],
+    events: list[dict],
+    alerts: list[dict],
+    bridge_snapshot: dict,
+    ai_monitoring: dict,
+) -> dict:
+    latest = _latest_values(reads, ["rpm", "coolant_temp", "fuel_level", "control_module_voltage", "vehicle_speed", "throttle_position", "intake_air_temp"])
+    dtc_stored = [r for r in reads if r.get("command") == "03" or r.get("pid_key") == "dtc_stored"][-10:]
+    dtc_pending = [r for r in reads if r.get("command") == "07" or r.get("pid_key") == "dtc_pending"][-10:]
+    freeze = [r for r in reads if r.get("pid_key") == "freeze_frame" or r.get("command") == "020C"][-5:]
+    readiness = [r for r in reads if r.get("pid_key") == "readiness_status" or r.get("command") == "0101"][-5:]
+    plan = store.get_guided_diagnosis_plan(active["session_id"]) if active else None
+    results = store.get_guided_diagnosis_results(active["session_id"]) if active else []
+    return {
+        "vehicle_identity_manager": {
+            "vin": active.get("vin") if active else None,
+            "vin_source": active.get("assignment_source") if active else None,
+            "active_vehicle_profile": active,
+        },
+        "live_telemetry_engine": {
+            "polling_interval_ms": 500,
+            "current_values": latest,
+            "rolling_sensor_history": reads[-120:],
+            "reconnect_state": bridge_snapshot.get("status"),
+            "current_mode": bridge_snapshot.get("current_mode"),
+            "polling_state": bridge_snapshot.get("polling_state"),
+            "polling_active": bridge_snapshot.get("polling_active"),
+            "first_live_read_received": bridge_snapshot.get("first_live_read_received"),
+            "last_live_pid_command": bridge_snapshot.get("last_live_pid_command"),
+            "last_live_pid_response": bridge_snapshot.get("last_live_pid_response"),
+            "backend_acceptance_status": bridge_snapshot.get("backend_acceptance_status"),
+            "ai_monitoring": ai_monitoring,
+        },
+        "diagnostic_state_engine": {
+            "stored_dtcs": dtc_stored,
+            "pending_dtcs": dtc_pending,
+            "freeze_frame_data": freeze,
+            "readiness_monitors": readiness,
+            "vehicle_health_score": _compute_vehicle_health_score(reads, alerts),
+        },
+        "timeline_engine": {
+            "events": events[-200:],
+            "ai_alerts": alerts[-120:],
+        },
+        "command_learning_engine": {
+            "command_library": store.command_library,
+            "session_records": store.get_learning_records(active["session_id"]) if active else [],
+        },
+        "ai_test_assistant": {
+            "guided_plan": plan,
+            "submitted_results": results[-50:],
+        },
+    }
+
+
+@app.get("/vehicle-visualization/state")
+def vehicle_visualization_state_view() -> dict:
+    return {
+        "component_groups": VEHICLE_COMPONENT_GROUPS,
+        "highlight": vehicle_visualization_state.copy(),
+    }
+
+
+@app.post("/vehicle-visualization/highlight")
+def vehicle_visualization_highlight(payload: VehicleVisualizationHighlightRequest) -> dict:
+    if payload.action == "highlight_component" and not payload.component:
+        raise HTTPException(status_code=400, detail="component is required for highlight_component")
+    if payload.action == "highlight_system" and not payload.system:
+        raise HTTPException(status_code=400, detail="system is required for highlight_system")
+
+    component = payload.component.strip().lower() if payload.component else None
+    system = payload.system.strip().lower() if payload.system else None
+    system_alias = {"cooling": "cooling_system", "electrical": "electrical_system", "fuel": "fuel_system"}
+    if system:
+        system = system_alias.get(system, system)
+
+    vehicle_visualization_state.update({
+        "action": payload.action,
+        "component": component,
+        "system": system,
+        "source": payload.source,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"status": "ok", "highlight": vehicle_visualization_state.copy()}
+
+
+@app.get("/vehicle-visualization/explain")
+def vehicle_visualization_explain(component: str) -> dict:
+    normalized = component.strip().lower()
+    explanation = COMPONENT_EXPLANATIONS.get(normalized, "Component detail not available yet. Use AI Mechanic for deeper diagnostic context.")
+    return {"component": normalized, "explanation": explanation}
+
+
+@app.get("/dashboard/state")
+def dashboard_state() -> dict:
+    active = None
+    if store.active_session_id:
+        active = store.get_session(store.active_session_id).model_dump()
+
+    reads = []
+    events = []
+    if active:
+        reads = [item.model_dump() for item in store.get_reads(active["session_id"])]
+        events = [item.model_dump() for item in store.get_events(active["session_id"])]
+
+    report_tiers = [
+        {"id": "customer_summary", "label": "Customer Summary", "description": "Plain-language, customer-facing visit summary."},
+        {"id": "technician_detail", "label": "Technician Detail", "description": "Diagnostic details with observations and data context."},
+        {"id": "ai_training_export", "label": "AI Training Export", "description": "Structured export scaffold for model training review."},
+    ]
+
+    learning_records = [item.model_dump() for item in store.get_learning_records(active["session_id"])] if active else []
+    alerts = [item.model_dump() for item in store.get_ai_alerts(active["session_id"])] if active else []
+    bridge_snapshot = _build_phone_bridge_snapshot(active=active, reads=reads)
+    ai_monitoring = _build_ai_monitoring_snapshot(bridge_snapshot, alerts)
+    core_snapshot = _vehicle_intelligence_core_snapshot(active, reads, events, alerts, bridge_snapshot, ai_monitoring)
+
+    current_user = store.get_user(store._default_user_id(None))
+    current_profile = store.get_user_profile(current_user.user_id)
+    return {
+        "app_id": settings.app_id,
+        "display_name": settings.app_display_name,
+        "current_user": current_user.model_dump(),
+        "current_profile": current_profile.model_dump(),
+        "vehicles": [item.model_dump() for item in store.list_vehicles()],
+        "active_session": active,
+        "adapter_mode": adapter.mode_status(),
+        "current_mode": bridge_snapshot["current_mode"],
+        "current_mode_reason": bridge_snapshot["current_mode_reason"],
+        "connection_status": adapter.connection_status(),
+        "phone_bridge": bridge_snapshot,
+        "capture_status": capture_status,
+        "capture_preset": capture_preset,
+        "capture_presets": CAPTURE_PRESETS,
+        "event_tags": SAFE_EVENT_TAGS,
+        "quick_reads": SAFE_QUICK_READS,
+        "recent_reads": reads[-40:],
+        "recent_events": events[-40:],
+        "last_successful_read": reads[-1] if reads else None,
+        "report_tiers": report_tiers,
+        "polling_supported_pids": LIVE_POLLING_SUPPORTED_PIDS,
+        "learning_records": learning_records[-40:],
+        "learning_library": store.command_library,
+        "vehicle_image": _resolve_vehicle_image(active.get("vehicle_id") if active else None),
+        "ai_monitoring": ai_monitoring,
+        "vehicle_visualization": {"component_groups": VEHICLE_COMPONENT_GROUPS, "highlight": vehicle_visualization_state.copy()},
+        "ai_alerts": [item.model_dump() for item in store.get_ai_alerts(active["session_id"])] if active else [],
+        "diagnostic_timeline": [item.model_dump() for item in store.get_timeline_events(active["session_id"])] if active else [],
+        "ai_response_history": [item.model_dump() for item in store.get_ai_responses(active["session_id"])] if active else [],
+        "ai_debug": {
+            "last_ai_request": store.last_ai_request,
+            "last_ai_response_timestamp": store.last_ai_response_timestamp,
+        },
+        "vehicle_intelligence_core": core_snapshot,
+        "vehicle_health_score": core_snapshot.get("diagnostic_state_engine", {}).get("vehicle_health_score"),
+        "report_integration_hooks": {
+            "ai_summary": True,
+            "notable_live_data_alerts": True,
+            "timeline_highlights": True,
+            "plain_english_recommendations": True,
+        },
+    }
+
+
+
+
+@app.get("/ai/memory/{vehicle_id}")
+def ai_memory(vehicle_id: str) -> dict:
+    return {"vehicle_id": vehicle_id, "memory": store.get_vehicle_memory(vehicle_id)}
+
+
+@app.post("/ai/memory/{vehicle_id}")
+def ai_memory_update(vehicle_id: str, payload: dict) -> dict:
+    memory = store.update_vehicle_memory(vehicle_id, payload)
+    return {"status": "updated", "vehicle_id": vehicle_id, "memory": memory}
+
+
+@app.get("/ai/knowledge")
+def ai_knowledge() -> dict:
+    return {"knowledge_library": store.knowledge_library}
+
+
+def _latest_values(reads: list[dict], keys: list[str]) -> dict:
+    result = {}
+    for key in keys:
+        for item in reversed(reads):
+            if item.get("pid_key") == key:
+                result[key] = {
+                    "value": item.get("value"),
+                    "unit": item.get("unit"),
+                    "source_mode": item.get("source_mode"),
+                    "ts": item.get("ts"),
+                }
+                break
+    return result
+
+
+def _build_ai_context(active: dict | None, reads: list[dict], events: list[dict], memory: dict, bridge_snapshot: dict) -> dict:
+    live_keys = ["rpm", "coolant_temp", "fuel_level", "control_module_voltage", "vehicle_speed", "throttle_position", "intake_air_temp"]
+    latest_values = _latest_values(reads, live_keys)
+    recent_live = [
+        r
+        for r in reads
+        if r.get("pid_key") in set(live_keys + ["dtc_stored", "dtc_pending", "readiness_status", "freeze_frame", "vin"])
+    ][-25:]
+    dtc_stored = [r for r in reads if r.get("command") == "03" or r.get("pid_key") == "dtc_stored"][-8:]
+    dtc_pending = [r for r in reads if r.get("command") == "07" or r.get("pid_key") == "dtc_pending"][-8:]
+    freeze_frames = [r for r in reads if r.get("pid_key") == "freeze_frame" or r.get("command") == "020C"][-5:]
+    readiness = [r for r in reads if r.get("pid_key") == "readiness_status" or r.get("command") == "0101"][-5:]
+
+    return {
+        "current_vehicle": active.get("vehicle") if active else None,
+        "vehicle_id": active.get("vehicle_id") if active else "toyota_sienna_2006",
+        "vin": active.get("vin") if active else None,
+        "vehicle_assignment_source": active.get("assignment_source") if active else "manual",
+        "current_mode": bridge_snapshot.get("current_mode"),
+        "active_vehicle_check": active.get("session_id") if active else None,
+        "stored_dtcs": dtc_stored,
+        "pending_dtcs": dtc_pending,
+        "freeze_frame_data": freeze_frames,
+        "readiness_monitor_status": readiness,
+        "recent_live_sensor_readings": recent_live,
+        "current_4_gauge_values": latest_values,
+        "event_tags": events[-15:],
+        "prior_vehicle_history": memory.get("prior_vehicle_checks", []),
+        "technician_notes": memory.get("notes", []),
+        "report_summaries": memory.get("report_summaries", []),
+        "confidence_tags": memory.get("confidence_tags", []),
+        "timeline_events": store.get_timeline_events(active["session_id"])[-60:] if active else [],
+        "component_mappings": store.knowledge_library.get("component_mappings", {}),
+        "unresolved_issues": memory.get("unresolved_issues", []),
+        "false_positives": memory.get("false_positives", []),
+        "safety_guardrails": {
+            "read_only": True,
+            "blocked": [
+                "actuator commands",
+                "replay execution",
+                "code clearing",
+                "vehicle control actions",
+            ],
+        },
+        "vehicle_component_groups": VEHICLE_COMPONENT_GROUPS,
+    }
+
+
+def _resolve_visualization_request(payload: AIMechanicQuestionRequest) -> dict | None:
+    component = payload.memory_updates.get("highlight_component")
+    system = payload.memory_updates.get("highlight_system") or payload.memory_updates.get("system")
+    system_alias = {
+        "cooling": "cooling_system",
+        "electrical": "electrical_system",
+        "fuel": "fuel_system",
+    }
+    normalized_system = system.strip().lower() if isinstance(system, str) and system.strip() else None
+    if normalized_system:
+        normalized_system = system_alias.get(normalized_system, normalized_system)
+    if isinstance(component, str) and component.strip():
+        return {"action": "highlight_component", "component": component.strip().lower(), "system": normalized_system}
+    if normalized_system:
+        return {"action": "highlight_system", "system": normalized_system}
+    return None
+
+
+def _run_proactive_monitoring(session_id: str, vehicle_id: str, context: dict) -> list[dict]:
+    alerts: list[AIAlertRecord] = []
+    gauge = context.get("current_4_gauge_values", {})
+    existing_alert_keys = {
+        (item.title, item.trigger_reason)
+        for item in store.get_ai_alerts(session_id)
+    }
+
+    coolant = gauge.get("coolant_temp", {}).get("value")
+    rpm = gauge.get("rpm", {}).get("value")
+    voltage = gauge.get("control_module_voltage", {}).get("value")
+
+    if isinstance(coolant, (int, float)) and coolant >= 108:
+        alerts.append(AIAlertRecord(
+            session_id=session_id,
+            vehicle_id=vehicle_id,
+            title="Coolant temperature is rising unusually",
+            explanation="Engine coolant temperature is above expected warm range.",
+            trigger_reason=f"coolant_temp={coolant}°C",
+            confidence="likely",
+            suggested_next_step="Monitor fan operation and check coolant level before further driving.",
+            related_sensors=["coolant_temp"],
+        ))
+
+    if isinstance(rpm, (int, float)) and 550 <= rpm <= 1100:
+        recent = [r.get("value") for r in context.get("recent_live_sensor_readings", []) if r.get("pid_key") == "rpm" and isinstance(r.get("value"), (int, float))][-8:]
+        if len(recent) >= 4 and (max(recent) - min(recent)) > 220:
+            alerts.append(AIAlertRecord(
+                session_id=session_id,
+                vehicle_id=vehicle_id,
+                title="RPM appears unstable at idle",
+                explanation="RPM variability in recent idle samples is wider than expected.",
+                trigger_reason=f"idle rpm spread={max(recent)-min(recent):.1f}",
+                confidence="suspected",
+                suggested_next_step="Check for vacuum leaks and review fuel trim behavior.",
+                related_sensors=["rpm"],
+            ))
+
+    if isinstance(voltage, (int, float)) and (voltage < 12.2 or voltage > 15.1):
+        alerts.append(AIAlertRecord(
+            session_id=session_id,
+            vehicle_id=vehicle_id,
+            title="Control module voltage outside expected range",
+            explanation="Battery/charging voltage is outside normal operating window.",
+            trigger_reason=f"control_module_voltage={voltage}V",
+            confidence="likely",
+            suggested_next_step="Inspect battery terminals and charging system output.",
+            related_sensors=["control_module_voltage"],
+        ))
+
+    new_alerts: list[dict] = []
+    for alert in alerts:
+        alert_key = (alert.title, alert.trigger_reason)
+        if alert_key in existing_alert_keys:
+            continue
+        existing_alert_keys.add(alert_key)
+        store.add_ai_alert(alert)
+        timeline_event = store.add_timeline_event(DiagnosticTimelineEvent(
+            session_id=session_id,
+            event_type="ai_alert_created",
+            title=alert.title,
+            detail=alert.explanation,
+            source="ai",
+            related_sensors=alert.related_sensors,
+            related_codes=alert.related_codes,
+            linked_ai_alert_id=alert.alert_id,
+            metadata={"confidence": alert.confidence, "proactive": True},
+        ))
+        _ = timeline_event
+        new_alerts.append(alert.model_dump())
+    return new_alerts
+
+
+@app.post("/ai/guided-diagnosis/run")
+def run_guided_diagnosis(payload: GuidedDiagnosisRunRequest) -> dict:
+    if payload.session_id:
+        session = store.get_session(payload.session_id)
+    elif store.active_session_id:
+        session = store.get_active_session()
+    else:
+        raise HTTPException(status_code=404, detail="Start a vehicle check before running guided diagnosis")
+
+    reads = [item.model_dump() for item in store.get_reads(session.session_id)]
+    coolant = _latest_values(reads, ["coolant_temp"]).get("coolant_temp", {}).get("value")
+
+    ranked_causes = [
+        {"cause": "Air/fuel imbalance", "confidence": "suspected"},
+        {"cause": "Ignition performance issue", "confidence": "suspected"},
+        {"cause": "Cooling system instability" if isinstance(coolant, (int, float)) and coolant > 105 else "Charging system instability", "confidence": "monitor only"},
+    ]
+    recommended_tests = [
+        {"step_id": "gd-1", "name": "Warm idle baseline", "instruction": "Observe idle RPM for 60 seconds.", "expected_sensor_values": {"rpm": "650-850"}},
+        {"step_id": "gd-2", "name": "Cooling trend check", "instruction": "Monitor coolant temp for 3 minutes at idle.", "expected_sensor_values": {"coolant_temp": "85-102°C"}},
+        {"step_id": "gd-3", "name": "Charging stability check", "instruction": "Monitor control module voltage with headlights on.", "expected_sensor_values": {"control_module_voltage": "13.2-14.8V"}},
+    ]
+    plan = {
+        "session_id": session.session_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "symptom": payload.symptom or "general diagnostic",
+        "ranked_possible_causes": ranked_causes,
+        "recommended_tests": recommended_tests,
+        "dynamic_tree_state": "open",
+    }
+    store.set_guided_diagnosis_plan(session.session_id, plan)
+    store.add_timeline_event(DiagnosticTimelineEvent(
+        session_id=session.session_id,
+        event_type="ai_advice_generated",
+        title="Run Guided Diagnosis created plan",
+        detail=f"Plan generated with {len(recommended_tests)} read-only test steps.",
+        source="ai",
+        metadata={"feature": "run_guided_diagnosis"},
+    ))
+    return {"status": "ok", "plan": plan, "read_only_enforced": True}
+
+
+@app.post("/ai/guided-diagnosis/result")
+def submit_guided_diagnosis_result(payload: GuidedDiagnosisResultSubmitRequest) -> dict:
+    store.get_session(payload.session_id)
+    result = {
+        "step_id": payload.step_id,
+        "observed_result": payload.observed_result,
+        "notes": payload.notes,
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+    }
+    store.add_guided_diagnosis_result(payload.session_id, result)
+    store.add_timeline_event(DiagnosticTimelineEvent(
+        session_id=payload.session_id,
+        event_type="user_tag_event",
+        title="Guided diagnosis result submitted",
+        detail=f"{payload.step_id}: {payload.observed_result}",
+        source="user",
+        metadata={"feature": "run_guided_diagnosis", "step_id": payload.step_id},
+    ))
+
+    existing_plan = store.get_guided_diagnosis_plan(payload.session_id)
+    if existing_plan:
+        existing_plan["dynamic_tree_state"] = "updated_after_result"
+        existing_plan["last_result_step"] = payload.step_id
+        store.set_guided_diagnosis_plan(payload.session_id, existing_plan)
+
+    return {
+        "status": "accepted",
+        "result": result,
+        "updated_plan": store.get_guided_diagnosis_plan(payload.session_id),
+    }
+
+
+@app.get("/diagnostic-timeline/{session_id}")
+def diagnostic_timeline(session_id: str) -> dict:
+    store.get_session(session_id)
+    return {"session_id": session_id, "timeline": [item.model_dump() for item in store.get_timeline_events(session_id)]}
+
+
+@app.get("/ai/alerts/{session_id}")
+def ai_alerts(session_id: str) -> dict:
+    store.get_session(session_id)
+    return {"session_id": session_id, "alerts": [item.model_dump() for item in store.get_ai_alerts(session_id)]}
+
+
+@app.post("/ai/mechanic")
+def ai_mechanic(payload: AIMechanicQuestionRequest) -> dict:
+    question = payload.question.strip()
+    memory_updates = payload.memory_updates or {}
+
+    active = store.get_session(store.active_session_id).model_dump() if store.active_session_id else None
+    if not active:
+        return {
+            "answer": "Start a vehicle check first so AI Mechanic can use live context.",
+            "context": {},
+            "response_basis": "general_knowledge",
+            "read_only_enforced": True,
+            "visualization_hook": _resolve_visualization_request(payload),
+        }
+
+    reads = [item.model_dump() for item in store.get_reads(active["session_id"])]
+    events = [item.model_dump() for item in store.get_events(active["session_id"])]
+
+    vehicle_id = active.get("vehicle_id")
+    memory = store.get_vehicle_memory(vehicle_id)
+    if active.get("vin"):
+        memory_updates.setdefault("vin", active["vin"])
+    if memory_updates:
+        memory = store.update_vehicle_memory(vehicle_id, memory_updates)
+
+    bridge_snapshot = _build_phone_bridge_snapshot(active=active, reads=reads)
+    context = _build_ai_context(active=active, reads=reads, events=events, memory=memory, bridge_snapshot=bridge_snapshot)
+    proactive_alerts = _run_proactive_monitoring(active["session_id"], vehicle_id, context)
+
+    response_basis = "live_data" if context.get("recent_live_sensor_readings") else ("stored_history" if memory.get("prior_vehicle_checks") else "general_knowledge")
+    if not question:
+        answer = "Ask your question by text or microphone. I can proactively monitor live data and provide read-only diagnostic advice."
+    else:
+        answer = (
+            f"Confirmed facts: active vehicle is {context.get('current_vehicle') or 'not selected'}, "
+            f"VIN is {context.get('vin') or 'not available'}, and mode is {context.get('current_mode')}. "
+            "Likely causes: based on DTCs + live data patterns in this check only. "
+            "Suggested next checks: I will recommend safe read-only tests and observations. "
+            "Uncertainty: any conclusion with limited evidence will be labeled suspected/likely/monitor only. "
+            f"Question received: {question}"
+        )
+
+    request_record = {
+        "question": question,
+        "session_id": active["session_id"],
+        "vehicle_id": vehicle_id,
+        "used_live_data": bool(context.get("recent_live_sensor_readings")),
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+    }
+    store.last_ai_request = request_record
+
+    response_record = store.add_ai_response(AIResponseRecord(
+        session_id=active["session_id"],
+        vehicle_id=vehicle_id,
+        question=question,
+        answer=answer,
+        response_basis=response_basis,
+        used_live_data=bool(context.get("recent_live_sensor_readings")),
+        proactive=False,
+        context_summary={
+            "stored_dtcs": len(context.get("stored_dtcs", [])),
+            "pending_dtcs": len(context.get("pending_dtcs", [])),
+            "recent_live_points": len(context.get("recent_live_sensor_readings", [])),
+        },
+    ))
+
+    timeline = store.add_timeline_event(DiagnosticTimelineEvent(
+        session_id=active["session_id"],
+        event_type="ai_advice_generated",
+        title="AI advice generated",
+        detail=f"AI Mechanic answered: {question or 'quick-open'}",
+        source="ai",
+        linked_ai_response_id=response_record.response_id,
+        metadata={"response_basis": response_basis, "used_live_data": bool(context.get("recent_live_sensor_readings"))},
+    ))
+
+    return {
+        "answer": answer,
+        "context": context,
+        "response_basis": response_basis,
+        "read_only_enforced": True,
+        "visualization_hook": _resolve_visualization_request(payload),
+        "conversation_history": [r.model_dump() for r in store.get_ai_responses(active["session_id"])][-20:],
+        "proactive_alerts": proactive_alerts,
+        "timeline_event_id": timeline.timeline_event_id,
+        "debug": {
+            "last_ai_request": store.last_ai_request,
+            "last_ai_response_timestamp": store.last_ai_response_timestamp,
+            "used_live_data": bool(context.get("recent_live_sensor_readings")),
+            "request_kind": "user-requested" if payload.source == "user" else "proactive",
+            "linked_timeline_event_id": timeline.timeline_event_id,
+        },
+    }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard() -> str:
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Zeb's OBD AI Dashboard</title>
+  <style>
+    :root {
+      --bg: #0B0F14;
+      --panel: #141B23;
+      --panel-elevated: #19222C;
+      --panel-strong: #1F2A35;
+      --accent: #00E5FF;
+      --accent-soft: rgba(0,229,255,0.18);
+      --success: #32D74B;
+      --warning: #FF9F0A;
+      --danger: #FF453A;
+      --text: #F5F7FA;
+      --text-secondary: #A7B0BA;
+      --border: rgba(255,255,255,0.08);
+      --border-strong: rgba(255,255,255,0.14);
+      --shadow-lg: 0 22px 48px rgba(0,0,0,0.34);
+      --shadow-md: 0 14px 30px rgba(0,0,0,0.26);
+      --radius-lg: 24px;
+      --radius-md: 20px;
+      --radius-sm: 16px;
+    }
+
+    * { box-sizing: border-box; }
+    html { color-scheme: dark; background: var(--bg); }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(0,229,255,0.14), transparent 28%),
+        radial-gradient(circle at top right, rgba(50,215,75,0.07), transparent 20%),
+        linear-gradient(180deg, #091018 0%, #0B0F14 52%, #0A0E13 100%);
+      position: relative;
+      overflow-x: hidden;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.38;
+      background:
+        linear-gradient(transparent 0, transparent calc(100% - 1px), rgba(255,255,255,0.02) calc(100% - 1px)),
+        linear-gradient(90deg, transparent 0, transparent calc(100% - 1px), rgba(255,255,255,0.02) calc(100% - 1px));
+      background-size: 100% 120px, 120px 100%;
+      mask-image: radial-gradient(circle at center, black 40%, transparent 88%);
+    }
+    ::selection { background: rgba(0,229,255,0.28); color: var(--text); }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .wrap {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 18px 14px 42px;
+      display: grid;
+      gap: 16px;
+      position: relative;
+      z-index: 1;
+    }
+    .card {
+      position: relative;
+      overflow: hidden;
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(25,34,44,0.98) 0%, rgba(20,27,35,0.96) 100%);
+      box-shadow: var(--shadow-lg);
+      padding: 18px;
+      animation: panelIn 0.55s ease both;
+    }
+    .card::after {
+      content: "";
+      position: absolute;
+      inset: 1px;
+      border-radius: calc(var(--radius-lg) - 1px);
+      border: 1px solid rgba(255,255,255,0.02);
+      pointer-events: none;
+    }
+    .hero-card {
+      padding: 22px;
+      background:
+        radial-gradient(circle at top right, rgba(0,229,255,0.12), transparent 34%),
+        linear-gradient(155deg, rgba(25,34,44,0.99) 0%, rgba(16,21,28,0.98) 100%);
+    }
+    .hero-grid,
+    .inspection-grid,
+    .support-grid {
+      display: grid;
+      gap: 16px;
+    }
+    .hero-main,
+    .hero-panel,
+    .inspection-sidebar {
+      display: grid;
+      gap: 14px;
+    }
+    .hero-title,
+    .metric-value,
+    .info-title {
+      font-family: "Eurostile", "Avenir Next", "Segoe UI", sans-serif;
+    }
+    .section-kicker,
+    .field-label,
+    .status-label,
+    .metric-label,
+    .detail-label {
+      text-transform: uppercase;
+      letter-spacing: 0.16em;
+      font-size: 0.72rem;
+      color: var(--text-secondary);
+    }
+    .section-kicker { color: var(--accent); }
+    .section-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .section-title {
+      margin: 6px 0 0;
+      font-size: 1.16rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+    .section-copy,
+    .hero-copy,
+    .tiny,
+    .panel-note {
+      color: var(--text-secondary);
+      line-height: 1.55;
+    }
+    .tiny { font-size: 0.84rem; }
+    .hero-title {
+      margin: 6px 0 0;
+      font-size: clamp(1.7rem, 5vw, 2.7rem);
+      line-height: 1.08;
+      letter-spacing: 0.02em;
+    }
+    .hero-copy {
+      margin: 0;
+      max-width: 60ch;
+      font-size: 0.96rem;
+    }
+    .hero-panel {
+      align-content: space-between;
+      padding: 18px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(11,15,20,0.72) 0%, rgba(16,21,28,0.94) 100%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+    }
+    .hero-badges,
+    .ai-quick {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .badge,
+    .component-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: var(--text);
+      min-height: 40px;
+    }
+    .badge-dot,
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(167,176,186,0.44);
+      box-shadow: 0 0 0 0 rgba(0,229,255,0);
+      flex: 0 0 auto;
+    }
+    .badge[data-tone="accent"] .badge-dot,
+    .status-indicator[data-tone="accent"] .status-dot,
+    .component-pill[data-tone="accent"] .status-dot {
+      background: var(--accent);
+      box-shadow: 0 0 0 6px rgba(0,229,255,0.14);
+    }
+    .badge[data-tone="success"] .badge-dot,
+    .status-indicator[data-tone="success"] .status-dot,
+    .component-pill[data-tone="success"] .status-dot {
+      background: var(--success);
+      box-shadow: 0 0 0 6px rgba(50,215,75,0.12);
+    }
+    .badge[data-tone="warning"] .badge-dot,
+    .status-indicator[data-tone="warning"] .status-dot,
+    .component-pill[data-tone="warning"] .status-dot {
+      background: var(--warning);
+      box-shadow: 0 0 0 6px rgba(255,159,10,0.13);
+    }
+    .badge[data-tone="danger"] .badge-dot,
+    .status-indicator[data-tone="danger"] .status-dot,
+    .component-pill[data-tone="danger"] .status-dot {
+      background: var(--danger);
+      box-shadow: 0 0 0 6px rgba(255,69,58,0.14);
+    }
+    .status-strip,
+    .telemetry-grid,
+    .action-grid,
+    .tool-grid {
+      display: grid;
+      gap: 12px;
+    }
+    .status-strip {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .status-indicator {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-height: 74px;
+      padding: 12px 14px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(11,15,20,0.42);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+    }
+    .status-value {
+      display: block;
+      margin-top: 4px;
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .telemetry-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .metric-card {
+      position: relative;
+      min-height: 118px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(25,34,44,0.98) 0%, rgba(15,20,26,0.94) 100%);
+      box-shadow: var(--shadow-md);
+      padding: 16px;
+      overflow: hidden;
+    }
+    .metric-card::before {
+      content: "";
+      position: absolute;
+      inset: auto 16px 16px 16px;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(0,229,255,0.42), transparent);
+      opacity: 0.6;
+    }
+    .metric-card[data-live="true"] {
+      border-color: rgba(0,229,255,0.24);
+      box-shadow:
+        var(--shadow-md),
+        0 0 0 1px rgba(0,229,255,0.05),
+        0 0 24px rgba(0,229,255,0.08);
+    }
+    .metric-value {
+      margin-top: 16px;
+      font-size: clamp(1.45rem, 5vw, 2.02rem);
+      font-weight: 700;
+      line-height: 1.05;
+    }
+    .metric-meta {
+      margin-top: 14px;
+      font-size: 0.82rem;
+      color: var(--text-secondary);
+    }
+    .inspection-grid {
+      align-items: start;
+    }
+    .vehicle-stage {
+      position: relative;
+      padding: 12px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border);
+      background:
+        radial-gradient(circle at top, rgba(0,229,255,0.08), transparent 50%),
+        linear-gradient(180deg, rgba(9,13,18,0.98) 0%, rgba(14,18,24,0.96) 100%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+      min-height: 260px;
+    }
+    .vehicle-stage::after {
+      content: "";
+      position: absolute;
+      inset: 12px;
+      border-radius: calc(var(--radius-md) - 6px);
+      border: 1px solid rgba(255,255,255,0.03);
+      pointer-events: none;
+    }
+    .vehicle-canvas {
+      width: 100%;
+      height: min(58vw, 380px);
+      min-height: 240px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,0.06);
+      background:
+        radial-gradient(circle at top, rgba(0,229,255,0.10), transparent 42%),
+        linear-gradient(180deg, #05080D 0%, #101720 100%);
+      touch-action: manipulation;
+      overflow: hidden;
+    }
+    .vehicle-fallback {
+      display: none;
+      width: 100%;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.02);
+    }
+    .info-panel {
+      display: grid;
+      gap: 12px;
+      padding: 16px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(17,23,30,0.92) 0%, rgba(13,17,22,0.95) 100%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+    }
+    .info-title {
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      color: var(--text);
+    }
+    button,
+    select,
+    input {
+      font: inherit;
+    }
+    button {
+      width: 100%;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      cursor: pointer;
+      transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+      -webkit-tap-highlight-color: transparent;
+    }
+    button:hover {
+      transform: translateY(-1px);
+      border-color: rgba(0,229,255,0.22);
+      box-shadow:
+        0 16px 30px rgba(0,0,0,0.24),
+        0 0 0 1px rgba(0,229,255,0.04);
+    }
+    button:active { transform: translateY(0); }
+    button[disabled] {
+      cursor: not-allowed;
+      opacity: 0.58;
+      box-shadow: none;
+      transform: none;
+    }
+    select {
+      width: 100%;
+      min-height: 54px;
+      border-radius: 16px;
+      padding: 14px 44px 14px 14px;
+      border: 1px solid var(--border-strong);
+      background:
+        linear-gradient(135deg, rgba(17,23,30,1) 0%, rgba(13,17,22,0.98) 100%);
+      color: var(--text);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+      appearance: none;
+    }
+    button:focus-visible,
+    select:focus-visible,
+    input:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .action-banner,
+    .action-tile,
+    .tool-tile,
+    .panel-button,
+    .quick-chip {
+      border-radius: var(--radius-md);
+      box-shadow: var(--shadow-md);
+      box-shadow: 0 16px 30px rgba(0,0,0,0.22);
+    }
+    .action-banner,
+    .action-tile,
+    .tool-tile,
+    .panel-button {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 18px;
+      text-align: left;
+      background: linear-gradient(180deg, rgba(25,34,44,0.98) 0%, rgba(16,21,28,0.96) 100%);
+      min-height: 82px;
+    }
+    .action-banner[data-tone="accent"],
+    .action-tile[data-tone="accent"],
+    .tool-tile[data-tone="accent"] {
+      border-color: rgba(0,229,255,0.24);
+      background: linear-gradient(135deg, rgba(0,229,255,0.10) 0%, rgba(18,26,34,0.96) 48%, rgba(13,17,22,0.98) 100%);
+    }
+    .action-banner[data-tone="success"],
+    .action-tile[data-tone="success"],
+    .tool-tile[data-tone="success"] {
+      border-color: rgba(50,215,75,0.26);
+      background: linear-gradient(135deg, rgba(50,215,75,0.12) 0%, rgba(17,25,21,0.96) 52%, rgba(13,17,22,0.98) 100%);
+    }
+    .action-banner[data-tone="danger"],
+    .action-tile[data-tone="danger"],
+    .tool-tile[data-tone="danger"] {
+      border-color: rgba(255,69,58,0.26);
+      background: linear-gradient(135deg, rgba(255,69,58,0.11) 0%, rgba(29,18,18,0.96) 52%, rgba(13,17,22,0.98) 100%);
+    }
+    .action-banner[data-tone="warning"],
+    .action-tile[data-tone="warning"],
+    .tool-tile[data-tone="warning"] {
+      border-color: rgba(255,159,10,0.24);
+      background: linear-gradient(135deg, rgba(255,159,10,0.10) 0%, rgba(31,22,14,0.96) 52%, rgba(13,17,22,0.98) 100%);
+    }
+    .action-banner[data-active="true"],
+    .action-tile[data-active="true"],
+    .tool-tile[data-active="true"] {
+      box-shadow:
+        0 20px 34px rgba(0,0,0,0.28),
+        0 0 0 1px rgba(255,255,255,0.03),
+        0 0 26px rgba(0,229,255,0.08);
+    }
+    .action-banner[data-pulse="true"],
+    .action-tile[data-pulse="true"],
+    .tool-tile[data-pulse="true"],
+    .badge[data-pulse="true"] {
+      animation: pulseGlow 2.2s ease-in-out infinite;
+    }
+    .action-grid,
+    .tool-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .action-tile,
+    .tool-tile {
+      flex-direction: column;
+      align-items: flex-start;
+      justify-content: space-between;
+      min-height: 138px;
+    }
+    .tool-tile {
+      min-height: 120px;
+      padding: 16px;
+    }
+    .tool-tile[data-feature="signature"] {
+      border-color: rgba(0,229,255,0.28);
+      background:
+        radial-gradient(circle at top right, rgba(0,229,255,0.14), transparent 36%),
+        linear-gradient(180deg, rgba(25,34,44,0.99) 0%, rgba(14,18,24,0.96) 100%);
+      box-shadow:
+        0 18px 34px rgba(0,0,0,0.28),
+        0 0 0 1px rgba(0,229,255,0.05),
+        0 0 26px rgba(0,229,255,0.10);
+    }
+    .tile-lead {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      width: 100%;
+    }
+    .tile-copy {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      min-width: 0;
+    }
+    .tile-title {
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      color: var(--text);
+    }
+    .tile-meta {
+      font-size: 0.84rem;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+    .tile-state {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.05);
+      color: var(--text);
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.10em;
+    }
+    .tile-icon {
+      display: grid;
+      place-items: center;
+      width: 50px;
+      height: 50px;
+      border-radius: 16px;
+      border: 1px solid var(--border);
+      background: rgba(8,12,18,0.54);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+      color: var(--text);
+      flex: 0 0 auto;
+    }
+    .tile-icon svg { width: 22px; height: 22px; }
+    .action-banner[data-tone="accent"] .tile-icon,
+    .action-tile[data-tone="accent"] .tile-icon,
+    .tool-tile[data-tone="accent"] .tile-icon,
+    .panel-button[data-tone="accent"] .tile-icon {
+      color: var(--accent);
+      border-color: rgba(0,229,255,0.22);
+      background: rgba(0,229,255,0.12);
+    }
+    .action-banner[data-tone="success"] .tile-icon,
+    .action-tile[data-tone="success"] .tile-icon,
+    .tool-tile[data-tone="success"] .tile-icon,
+    .panel-button[data-tone="success"] .tile-icon {
+      color: var(--success);
+      border-color: rgba(50,215,75,0.22);
+      background: rgba(50,215,75,0.10);
+    }
+    .action-banner[data-tone="danger"] .tile-icon,
+    .action-tile[data-tone="danger"] .tile-icon,
+    .tool-tile[data-tone="danger"] .tile-icon,
+    .panel-button[data-tone="danger"] .tile-icon {
+      color: var(--danger);
+      border-color: rgba(255,69,58,0.22);
+      background: rgba(255,69,58,0.10);
+    }
+    .action-banner[data-tone="warning"] .tile-icon,
+    .action-tile[data-tone="warning"] .tile-icon,
+    .tool-tile[data-tone="warning"] .tile-icon,
+    .panel-button[data-tone="warning"] .tile-icon {
+      color: var(--warning);
+      border-color: rgba(255,159,10,0.22);
+      background: rgba(255,159,10,0.10);
+    }
+    .panel-button {
+      min-height: 76px;
+      padding: 14px 16px;
+    }
+    .panel-button--ghost {
+      background: linear-gradient(180deg, rgba(18,24,30,0.96) 0%, rgba(12,16,21,0.96) 100%);
+    }
+    .quick-chip {
+      width: auto;
+      min-height: 42px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(10,14,20,0.82);
+      color: var(--text);
+      border: 1px solid var(--border);
+      font-size: 0.88rem;
+      line-height: 1.2;
+    }
+    .ai-panel {
+      margin-top: 16px;
+      padding: 18px;
+      border-radius: var(--radius-md);
+      border: 1px solid rgba(0,229,255,0.20);
+      background:
+        radial-gradient(circle at top right, rgba(0,229,255,0.14), transparent 35%),
+        linear-gradient(180deg, rgba(19,27,35,0.99) 0%, rgba(12,16,21,0.96) 100%);
+      box-shadow:
+        0 18px 36px rgba(0,0,0,0.28),
+        0 0 0 1px rgba(0,229,255,0.04),
+        0 0 28px rgba(0,229,255,0.10);
+    }
+    .support-grid {
+      gap: 16px;
+    }
+    .info-card {
+      display: grid;
+      gap: 14px;
+      min-height: 100%;
+    }
+    .detail-list,
+    .alert-list,
+    .timeline-list {
+      display: grid;
+      gap: 10px;
+    }
+    .detail-row,
+    .timeline-item,
+    .alert-item {
+      display: grid;
+      gap: 6px;
+      padding: 12px 14px;
+      border-radius: 16px;
+      border: 1px solid var(--border);
+      background: rgba(10,14,20,0.62);
+    }
+    .detail-row {
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+    }
+    .detail-value {
+      color: var(--text);
+      font-weight: 600;
+      text-align: right;
+      word-break: break-word;
+    }
+    .alert-head,
+    .timeline-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .confidence-pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .confidence-pill[data-tone="danger"] {
+      color: #FFD0CC;
+      border-color: rgba(255,69,58,0.24);
+      background: rgba(255,69,58,0.10);
+    }
+    .confidence-pill[data-tone="warning"] {
+      color: #FFE1B2;
+      border-color: rgba(255,159,10,0.24);
+      background: rgba(255,159,10,0.10);
+    }
+    .confidence-pill[data-tone="success"] {
+      color: #CFF6D5;
+      border-color: rgba(50,215,75,0.24);
+      background: rgba(50,215,75,0.10);
+    }
+    .timeline-item {
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+    }
+    .timeline-dot {
+      width: 10px;
+      height: 10px;
+      margin-top: 6px;
+      border-radius: 999px;
+      background: var(--accent);
+      box-shadow: 0 0 0 6px rgba(0,229,255,0.10);
+    }
+    .empty-state {
+      padding: 14px;
+      border-radius: 16px;
+      border: 1px dashed var(--border);
+      color: var(--text-secondary);
+      background: rgba(255,255,255,0.02);
+    }
+    .pulse-dot {
+      display: inline-flex;
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--danger);
+      box-shadow: 0 0 0 0 rgba(255,69,58,0.38);
+      animation: recordingPulse 1.8s ease-in-out infinite;
+    }
+
+    @media (min-width: 760px) {
+      .telemetry-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    }
+    @media (min-width: 900px) {
+      .hero-grid { grid-template-columns: minmax(0, 1.7fr) minmax(290px, 0.95fr); }
+      .inspection-grid { grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.95fr); }
+      .support-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+    @media (max-width: 760px) {
+      .status-strip,
+      .action-grid,
+      .tool-grid {
+        grid-template-columns: 1fr;
+      }
+      .section-head {
+        flex-direction: column;
+      }
+      .action-banner {
+        align-items: flex-start;
+      }
+    }
+    @media (max-width: 520px) {
+      .hero-card,
+      .card { padding: 16px; }
+      .hero-panel,
+      .metric-card,
+      .info-panel,
+      .ai-panel { padding: 15px; }
+      .tile-icon { width: 46px; height: 46px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        animation: none !important;
+        transition: none !important;
+        scroll-behavior: auto !important;
+      }
+    }
+
+    @keyframes panelIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes pulseGlow {
+      0%, 100% { box-shadow: 0 18px 34px rgba(0,0,0,0.28), 0 0 0 1px rgba(255,255,255,0.03), 0 0 0 rgba(0,229,255,0.0); }
+      50% { box-shadow: 0 18px 34px rgba(0,0,0,0.32), 0 0 0 1px rgba(255,255,255,0.03), 0 0 22px rgba(0,229,255,0.12); }
+    }
+    @keyframes recordingPulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255,69,58,0.34); }
+      50% { box-shadow: 0 0 0 8px rgba(255,69,58,0); }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="card hero-card">
+      <div class="hero-grid">
+        <div class="hero-main">
+          <div>
+            <div class="section-kicker">Vehicle Command Center</div>
+            <h1 class="hero-title" id="headerVehicleName">2006 Toyota Sienna FWD V6 3.3L</h1>
+            <p class="hero-copy" id="headerVehicleDetail">Safe read-only diagnostics with a live command surface for Bluetooth status, OBD streaming, capture, and AI guidance.</p>
+          </div>
+          <div class="status-strip" aria-live="polite">
+            <div class="status-indicator" id="statusBluetooth" data-tone="warning">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span>
+                <span class="status-label">Bluetooth</span>
+                <span class="status-value" id="statusBluetoothValue">Not Connected</span>
+              </span>
+            </div>
+            <div class="status-indicator" id="statusStreaming" data-tone="neutral">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span>
+                <span class="status-label">OBD Data</span>
+                <span class="status-value" id="statusStreamingValue">Idle</span>
+              </span>
+            </div>
+            <div class="status-indicator" id="statusAiAssist" data-tone="neutral">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span>
+                <span class="status-label">AI Assist</span>
+                <span class="status-value" id="statusAiAssistValue">Offline</span>
+              </span>
+            </div>
+          </div>
+        </div>
+        <aside class="hero-panel">
+          <div>
+            <label class="field-label" for="vehicleSelect">Vehicle Profile</label>
+            <select id="vehicleSelect" aria-label="Select current vehicle profile"></select>
+            <div class="panel-note tiny" id="vehicleProfileNote">Select the active vehicle profile for safe read-only diagnostics.</div>
+          </div>
+          <div class="hero-badges" aria-live="polite">
+            <span class="badge" id="sessionBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="sessionBadgeText">Vehicle Check Idle</span></span>
+            <span class="badge" id="captureBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="captureBadgeText">Capture Idle</span></span>
+            <span class="badge" id="modeBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="modeBadgeText">Standby</span></span>
+            <span class="badge" id="userBadge" data-tone="accent"><span class="badge-dot" aria-hidden="true"></span><span id="userBadgeText">Signed in: Demo Tester</span></span>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="telemetry-grid" aria-label="Mini live telemetry strip">
+      <article class="metric-card" id="metricCardRpm" data-live="false">
+        <div class="metric-label">RPM</div>
+        <div class="metric-value" id="metricRpmValue">--</div>
+        <div class="metric-meta" id="metricRpmMeta">Awaiting live data</div>
+      </article>
+      <article class="metric-card" id="metricCardVoltage" data-live="false">
+        <div class="metric-label">Battery Voltage</div>
+        <div class="metric-value" id="metricVoltageValue">--</div>
+        <div class="metric-meta" id="metricVoltageMeta">Awaiting live data</div>
+      </article>
+      <article class="metric-card" id="metricCardCoolant" data-live="false">
+        <div class="metric-label">Coolant Temp</div>
+        <div class="metric-value" id="metricCoolantValue">--</div>
+        <div class="metric-meta" id="metricCoolantMeta">Awaiting live data</div>
+      </article>
+      <article class="metric-card" id="metricCardThrottle" data-live="false">
+        <div class="metric-label">Throttle Position</div>
+        <div class="metric-value" id="metricThrottleValue">--</div>
+        <div class="metric-meta" id="metricThrottleMeta">Awaiting live data</div>
+      </article>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Featured Module</div>
+          <h2 class="section-title">3D Vehicle Inspection</h2>
+          <div class="section-copy">Tap a component to inspect and explain. The viewer remains advisory and read-only at all times.</div>
+        </div>
+        <span class="badge" id="inspectionBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="inspectionBadgeText">No highlighted component</span></span>
+      </div>
+      <div class="inspection-grid">
+        <div class="vehicle-stage">
+          <div id="vehicleCanvas" class="vehicle-canvas" aria-label="3D vehicle model viewer"></div>
+          <img id="vehicleImageAsset" class="vehicle-fallback" alt="Fallback vehicle image" />
+        </div>
+        <div class="inspection-sidebar">
+          <div class="info-panel">
+            <div class="field-label">Highlighted Component</div>
+            <div class="component-pill" id="componentStatusPill" data-tone="neutral">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span id="highlightedComponentName">No highlighted component</span>
+            </div>
+            <button id="componentExplainBtn" class="panel-button panel-button--ghost" data-tone="accent" disabled>
+              <span class="tile-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 18h.01"></path>
+                  <path d="M9.09 9a3 3 0 1 1 5.82 1c0 2-3 2-3 4"></path>
+                </svg>
+              </span>
+              <span class="tile-copy">
+                <span class="tile-title">Explain Component</span>
+                <span class="tile-meta">Tap a component to inspect and explain</span>
+              </span>
+              <span class="tile-state" id="componentExplainState">Select Part</span>
+            </button>
+          </div>
+          <div class="info-panel">
+            <div class="field-label">Inspection Source</div>
+            <div class="info-title" id="vehicleImageLabel">Vehicle placeholder</div>
+            <div class="tiny" id="vehicleImageSource">Loading vehicle source...</div>
+          </div>
+          <div class="info-panel">
+            <div class="field-label">Safety Envelope</div>
+            <div class="tiny">No control commands, no actuations, no code clearing, and no unsafe programming paths. Visual inspection is strictly read-only.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Primary Command Center</div>
+          <h2 class="section-title">Diagnostic Actions</h2>
+          <div class="section-copy">Connect the adapter, launch a vehicle check, and control capture without breaking the current diagnostic flow.</div>
+        </div>
+        <span class="badge" id="diagnosticStateBadge" data-tone="warning"><span class="badge-dot" aria-hidden="true"></span><span id="diagnosticStateText">Awaiting connection</span></span>
+      </div>
+
+      <button id="connectVehicleBtn" class="action-banner" data-tone="accent" data-active="false" data-pulse="false">
+        <span class="tile-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 7V5a3 3 0 0 1 6 0v2"></path>
+            <path d="M6 11h12"></path>
+            <path d="M8 11v4a4 4 0 0 0 8 0v-4"></path>
+          </svg>
+        </span>
+        <span class="tile-copy">
+          <span class="tile-title">Connect Vehicle</span>
+          <span class="tile-meta" id="connectVehicleMeta">Pair with OBDLink MX+ and arm live read-only telemetry.</span>
+        </span>
+        <span class="tile-state" id="connectVehicleState">Standby</span>
+      </button>
+
+      <div class="action-grid" style="margin-top:12px;">
+        <button id="startSessionBtn" class="action-tile" data-tone="accent" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 12h4l2-5 4 10 2-5h4"></path>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Start Vehicle Check</span>
+              <span class="tile-meta">Run system-wide diagnostic scan</span>
+            </span>
+          </span>
+          <span class="tile-state" id="startSessionState">Ready</span>
+        </button>
+
+        <button id="stopSessionBtn" class="action-tile" data-tone="danger" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <rect x="7" y="7" width="10" height="10" rx="1.8"></rect>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">End Vehicle Check</span>
+              <span class="tile-meta">Close the active diagnostic session</span>
+            </span>
+          </span>
+          <span class="tile-state" id="stopSessionState">Idle</span>
+        </button>
+
+        <button id="startCaptureBtn" class="action-tile" data-tone="success" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="7"></circle>
+                <path d="M12 3v3"></path>
+                <path d="M12 18v3"></path>
+                <path d="M3 12h3"></path>
+                <path d="M18 12h3"></path>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Start Capture</span>
+              <span class="tile-meta">Record live data stream</span>
+            </span>
+          </span>
+          <span class="tile-state" id="startCaptureState">Ready</span>
+        </button>
+
+        <button id="stopCaptureBtn" class="action-tile" data-tone="danger" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="8"></circle>
+                <rect x="9" y="9" width="6" height="6" rx="1.2" fill="currentColor" stroke="none"></rect>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Stop Capture</span>
+              <span class="tile-meta">End active recording safely</span>
+            </span>
+          </span>
+          <span class="tile-state" id="stopCaptureState">Idle</span>
+        </button>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Secondary Tools</div>
+          <h2 class="section-title">Analysis and Workflow Utilities</h2>
+          <div class="section-copy">Fast access to event tagging, saved outputs, live gauges, and the AI diagnostic assistant.</div>
+        </div>
+      </div>
+
+      <div class="tool-grid">
+        <button id="tagEventBtn" class="tool-tile" data-tone="warning" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 13l-7 7-9-9V4h7z"></path>
+                <circle cx="8.5" cy="8.5" r="1"></circle>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Tag Event</span>
+              <span class="tile-meta">Bookmark a notable moment</span>
+            </span>
+          </span>
+          <span class="tile-state" id="tagEventState">Session Needed</span>
+        </button>
+
+        <button id="reportsBtn" class="tool-tile" data-tone="neutral" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M8 6h8"></path>
+                <path d="M8 10h8"></path>
+                <path d="M8 14h5"></path>
+                <path d="M6 3h12a2 2 0 0 1 2 2v14l-4-2-4 2-4-2-4 2V5a2 2 0 0 1 2-2z"></path>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Reports</span>
+              <span class="tile-meta">View saved diagnostic summaries</span>
+            </span>
+          </span>
+          <span class="tile-state" id="reportsState">Available</span>
+        </button>
+
+        <button id="liveGaugesBtn" class="tool-tile" data-tone="accent" data-active="false" data-pulse="false">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 16a8 8 0 1 1 16 0"></path>
+                <path d="M12 12l4-4"></path>
+                <path d="M12 16h.01"></path>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Live Gauges</span>
+              <span class="tile-meta">Monitor sensor data in real time</span>
+            </span>
+          </span>
+          <span class="tile-state" id="liveGaugesState">Standby</span>
+        </button>
+
+        <button id="askAiBtn" class="tool-tile" data-tone="accent" data-active="true" data-pulse="false" data-feature="signature">
+          <span class="tile-lead">
+            <span class="tile-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3l7 4v5c0 5-3.4 8.6-7 9-3.6-.4-7-4-7-9V7z"></path>
+                <path d="M9.5 11.5a2.5 2.5 0 0 1 5 0c0 1.6-2.5 1.8-2.5 3.5"></path>
+                <path d="M12 18h.01"></path>
+              </svg>
+            </span>
+            <span class="tile-copy">
+              <span class="tile-title">Ask AI Mechanic</span>
+              <span class="tile-meta">Voice and diagnostic assistant</span>
+            </span>
+          </span>
+          <span class="tile-state" id="askAiState">Standby</span>
+        </button>
+      </div>
+
+      <div class="ai-panel">
+        <div class="section-head" style="margin-bottom:12px;">
+          <div>
+            <div class="section-kicker">AI Mechanic</div>
+            <h2 class="section-title">Diagnostic Guidance Layer</h2>
+            <div class="section-copy">Ask about codes, sensors, symptoms, and repairs. Guidance stays read-only and grounded in the current vehicle context when a vehicle check is active.</div>
+          </div>
+          <span class="badge" id="aiPanelBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="aiPanelBadgeText">Awaiting vehicle check</span></span>
+        </div>
+        <div class="ai-quick">
+          <button class="quick-chip" onclick="openAiWithPrompt('What does this code mean?')">What does this code mean?</button>
+          <button class="quick-chip" onclick="openAiWithPrompt('Is it safe to drive?')">Is it safe to drive?</button>
+          <button class="quick-chip" onclick="openAiWithPrompt('What should I test next?')">What should I test next?</button>
+          <button class="quick-chip" onclick="openAiWithPrompt('Explain this in simple language')">Explain this in simple language</button>
+          <button class="quick-chip" onclick="openAiWithPrompt('What changed in live data?')">What changed in live data?</button>
+          <button class="quick-chip" onclick="openAiWithPrompt('What should I watch right now?')">What should I watch right now?</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="support-grid">
+      <div class="card info-card" id="bluetoothCard">
+        <div>
+          <div class="section-kicker">Connection Telemetry</div>
+          <h2 class="section-title">Bluetooth and Bridge Status</h2>
+        </div>
+        <span class="badge" id="btStatusBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="btStatusText">Disconnected</span></span>
+        <div class="tiny" id="btError">No Bluetooth errors</div>
+        <div id="btDebug" class="detail-list"></div>
+      </div>
+
+      <div class="card info-card">
+        <div>
+          <div class="section-kicker">Proactive Monitoring</div>
+          <h2 class="section-title">AI Alerts</h2>
+        </div>
+        <div class="tiny" id="aiAlertSummary">No active alerts.</div>
+        <div id="aiAlertList" class="alert-list"></div>
+      </div>
+
+      <div class="card info-card">
+        <div>
+          <div class="section-kicker">Traceability</div>
+          <h2 class="section-title">Diagnostic Timeline</h2>
+        </div>
+        <div id="timelineList" class="timeline-list"></div>
+      </div>
+    </section>
+  </div>
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.162.0/build/three.module.js';
+
+let state = null;
+let selectedVehicleId = 'toyota_sienna_2006';
+let phoneBridge = { status: 'disconnected', source_mode: 'PHONE-LIVE' };
+const bridgeDebug = { selected_transport: 'none', native_bridge_available: false, last_error: null };
+let vehicleRenderer = null;
+let selectedMesh = null;
+let livePollingHandle = null;
+let livePollingInFlight = false;
+let renderedVehicleKey = '';
+let lastVehicleImageSelection = null;
+let lastVehicleImageRequestId = 0;
+const SENSOR_TO_PID = { rpm:'010C', coolant_temp:'0105', control_module_voltage:'0142', vehicle_speed:'010D' };
+const LIVE_SENSOR_ORDER = ['rpm', 'coolant_temp', 'control_module_voltage', 'vehicle_speed'];
+const LIVE_TELEMETRY_KEYS = ['rpm', 'coolant_temp', 'control_module_voltage', 'vehicle_speed', 'throttle_position'];
+const TOYOTA_PREMIUM_NAME = '2006 Toyota Sienna FWD V6 3.3L';
+function logBridge(event, details={}){
+  console.info(`[bridge] ${event}`, details);
+}
+function detectTransport(){
+  const service = window.MobileBluetoothService || null;
+  const hasNativeBridge = Boolean(service && typeof service.connectToAdapter === 'function' && typeof service.readPid === 'function');
+  const platform = /iphone|ipad|ipod/.test(navigator.userAgent.toLowerCase()) ? 'ios' : /android/.test(navigator.userAgent.toLowerCase()) ? 'android' : 'browser';
+  const supported = hasNativeBridge;
+  const reason = supported ? null : 'unsupported-environment-native-bridge-missing';
+  bridgeDebug.selected_transport = hasNativeBridge ? 'PHONE-LIVE' : 'unsupported';
+  bridgeDebug.native_bridge_available = hasNativeBridge;
+  if(reason){ bridgeDebug.last_error = reason; }
+  return { service, hasNativeBridge, supported, platform, reason };
+}
+function getMobileBluetoothService(){ return detectTransport().service; }
+function normalizeConnectPayload(payload, transport){
+  const resolved = transport || detectTransport();
+  const serviceAvailable = resolved.hasNativeBridge;
+  const requestedStatus = payload?.status || 'failed';
+  const safeStatus = (requestedStatus === 'connected' && serviceAvailable) ? 'connected' : (requestedStatus === 'connecting' && serviceAvailable ? 'connecting' : 'failed');
+  return {
+    platform: payload?.platform || resolved.platform || 'unknown',
+    adapter_name: payload?.adapter_name || payload?.adapterName || 'OBDLink MX+',
+    status: safeStatus,
+    permission_state: payload?.permission_state || payload?.permissionState || null,
+    source_mode: payload?.source_mode || payload?.sourceMode || 'PHONE-LIVE',
+    supports_native_bluetooth: payload?.supports_native_bluetooth ?? payload?.supportsNativeBluetooth ?? serviceAvailable,
+    fallback_reason: payload?.fallback_reason || payload?.fallbackReason || (serviceAvailable ? null : resolved.reason || 'native-service-unavailable'),
+  };
+}
+function escapeHtml(value){
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+}
+function formatLabel(value){
+  return String(value ?? '')
+    .replace(/_/g, ' ')
+    .replace(/\\b\\w/g, (char) => char.toUpperCase());
+}
+function formatMode(value){
+  return String(value || 'standby')
+    .toLowerCase()
+    .replace(/_/g, ' ')
+    .replace(/\\b\\w/g, (char) => char.toUpperCase());
+}
+function shortId(value){
+  if(!value){ return 'None'; }
+  return `${String(value).slice(0, 8)}...`;
+}
+function getVehicleProfileById(vehicleId){
+  return (state?.vehicles || []).find((vehicle) => vehicle.vehicle_id === vehicleId) || null;
+}
+function getSelectedVehicleProfile(){
+  return getVehicleProfileById(selectedVehicleId);
+}
+function getVehicleDisplayName(){
+  const activeVehicleId = state?.active_session?.vehicle_id || selectedVehicleId;
+  if(activeVehicleId === 'toyota_sienna_2006'){ return TOYOTA_PREMIUM_NAME; }
+  return getVehicleProfileById(activeVehicleId)?.label || state?.active_session?.vehicle || 'Vehicle not selected';
+}
+function getLatestRead(pidKey){
+  const reads = state?.recent_reads || [];
+  for(let index = reads.length - 1; index >= 0; index -= 1){
+    if(reads[index].pid_key === pidKey){ return reads[index]; }
+  }
+  return null;
+}
+function getTelemetryAge(ts){
+  if(!ts){ return null; }
+  const ageMs = Date.now() - Date.parse(ts);
+  if(!Number.isFinite(ageMs) || ageMs < 0){ return null; }
+  return ageMs;
+}
+function isFreshRead(read){
+  const ageMs = getTelemetryAge(read?.ts);
+  return ageMs !== null && ageMs <= 15000;
+}
+function formatAge(ts){
+  const ageMs = getTelemetryAge(ts);
+  if(ageMs === null){ return 'Timestamp unavailable'; }
+  if(ageMs < 2000){ return 'Updated just now'; }
+  const seconds = Math.round(ageMs / 1000);
+  if(seconds < 60){ return `Updated ${seconds}s ago`; }
+  return `Updated ${Math.round(seconds / 60)}m ago`;
+}
+function formatSourceLabel(source){
+  if(!source){ return 'Source pending'; }
+  if(source === 'PHONE-LIVE'){ return 'Phone live'; }
+  if(source === 'LOCAL-HARDWARE'){ return 'Local hardware'; }
+  if(source === 'BROWSER-DEV'){ return 'Browser bridge'; }
+  return formatMode(source);
+}
+function formatMetricValue(read, fallbackUnit, precision){
+  if(!read || read.value === null || read.value === undefined || read.value === ''){ return { value: '--', meta: 'Awaiting live data', live: false }; }
+  const numeric = Number(read.value);
+  const hasNumeric = Number.isFinite(numeric);
+  const value = hasNumeric ? numeric.toFixed(precision) : String(read.value);
+  const unit = read.unit || fallbackUnit || '';
+  return {
+    value: unit ? `${value} ${unit}` : value,
+    meta: `${formatSourceLabel(read.source_mode)} · ${formatAge(read.ts)}`,
+    live: isFreshRead(read),
+  };
+}
+function applyTone(id, tone){
+  const element = document.getElementById(id);
+  if(element){ element.dataset.tone = tone; }
+}
+function updateIndicator(rootId, valueId, tone, value){
+  applyTone(rootId, tone);
+  const target = document.getElementById(valueId);
+  if(target){ target.textContent = value; }
+}
+function updateBadge(rootId, textId, tone, value, pulse=false){
+  const badge = document.getElementById(rootId);
+  if(badge){
+    badge.dataset.tone = tone;
+    badge.dataset.pulse = pulse ? 'true' : 'false';
+  }
+  const text = document.getElementById(textId);
+  if(text){ text.textContent = value; }
+}
+function setButtonState(buttonId, tone, stateText, active=false, pulse=false, ariaPressed=false){
+  const button = document.getElementById(buttonId);
+  if(!button){ return; }
+  button.dataset.tone = tone;
+  button.dataset.active = active ? 'true' : 'false';
+  button.dataset.pulse = pulse ? 'true' : 'false';
+  button.setAttribute('aria-pressed', ariaPressed ? 'true' : 'false');
+  const stateEl = button.querySelector('.tile-state');
+  if(stateEl){ stateEl.textContent = stateText; }
+}
 async function readNativePid(sensor){
   const service = getMobileBluetoothService();
   if(!service || typeof service.readPid !== 'function'){ return null; }
@@ -3227,121 +5606,339 @@ async function readNativePid(sensor){
     };
   } catch (error) {
     phoneBridge = { ...phoneBridge, last_error: error?.message || 'native-read-failed' };
+    renderBluetoothCard();
     return null;
   }
 }
-function gaugeEditor(idx,g){return `<div class="gauge"><h4>${g.label}</h4><div class="grid2"><select data-field="sensor" data-idx="${idx}">${GAUGE_SENSORS.map(s=>`<option value="${s}" ${g.sensor===s?'selected':''}>${s}</option>`).join('')}</select><input data-field="label" data-idx="${idx}" value="${g.label}" placeholder="Label" /><input data-field="unit" data-idx="${idx}" value="${g.unit}" placeholder="Unit" /><input data-field="warn" data-idx="${idx}" type="number" value="${g.warn}" placeholder="Warn" /><input data-field="critical" data-idx="${idx}" type="number" value="${g.critical}" placeholder="Critical" /></div><div class="tiny" id="gaugeLive${idx}">Disconnected</div></div>`;}
-function renderGauges(){const grid=document.getElementById('gaugeGrid');grid.innerHTML=gauges.map((g,i)=>gaugeEditor(i,g)).join('');grid.querySelectorAll('input,select').forEach(el=>el.onchange=(e)=>{const i=Number(e.target.dataset.idx);const f=e.target.dataset.field;gauges[i][f]=e.target.type==='number'?Number(e.target.value):e.target.value;});const reads=(state&&state.recent_reads?state.recent_reads:[]).slice().reverse();gauges.forEach((g,i)=>{const found=reads.find(r=>r.pid_key===g.sensor||r.command===SENSOR_TO_PID[g.sensor]);document.getElementById(`gaugeLive${i}`).textContent=found?`${g.label}: ${found.value ?? found.raw_response} ${g.unit || found.unit || ''} [${found.source_mode}]`:`${g.label}: ${(phoneBridge.status==='connected')?'Waiting for 500ms polling':'Disconnected'}`;});}
-async function fetchState(){const res=await fetch('/dashboard/state');state=await res.json();phoneBridge={...phoneBridge,...state.phone_bridge};renderGauges();syncGaugePolling();}
+function webglAvailable(){ try { const c=document.createElement('canvas'); return !!window.WebGLRenderingContext && !!(c.getContext('webgl') || c.getContext('experimental-webgl')); } catch { return false; } }
 
+function buildGenericVehicleViewer(){
+  const host=document.getElementById('vehicleCanvas');
+  if(!host || !webglAvailable()){ showFallbackImage('WebGL unavailable - static fallback image in use'); return; }
+  const scene=new THREE.Scene(); scene.background=new THREE.Color(0x05080d);
+  const camera=new THREE.PerspectiveCamera(52, host.clientWidth/host.clientHeight, 0.1, 100); camera.position.set(5.5,3.2,6.6);
+  const renderer=new THREE.WebGLRenderer({antialias:false,alpha:false,powerPreference:'low-power'}); renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2)); renderer.setSize(host.clientWidth,host.clientHeight); host.innerHTML=''; host.appendChild(renderer.domElement);
+  scene.add(new THREE.AmbientLight(0xffffff,0.76));
+  const key=new THREE.DirectionalLight(0xffffff,0.88); key.position.set(4,7,6); scene.add(key);
+  const fill=new THREE.PointLight(0x00e5ff,0.45,18); fill.position.set(-3,3,4); scene.add(fill);
+  const root=new THREE.Group(); scene.add(root);
+  const partMap={};
+  function addPart(name,system,geo,color,pos,scale){ const mat=new THREE.MeshStandardMaterial({color,roughness:0.72,metalness:0.08,transparent:true,opacity:1}); const m=new THREE.Mesh(geo,mat); m.position.set(...pos); m.scale.set(...scale); m.userData={component:name,system,baseColor:color}; root.add(m); partMap[name]=m; return m; }
+  addPart('engine_block','engine',new THREE.BoxGeometry(1.35,0.72,1.05),0x5b6774,[-0.85,0.35,0.2],[1,1,1]);
+  addPart('thermostat','cooling_system',new THREE.SphereGeometry(0.16,12,10),0x1c9aae,[-0.4,0.75,0.35],[1,1,1]);
+  addPart('radiator','cooling_system',new THREE.BoxGeometry(0.18,0.86,1.26),0x216578,[1.45,0.38,0],[1,1,1]);
+  addPart('intake_manifold','intake',new THREE.BoxGeometry(1.2,0.28,0.72),0x426070,[-0.82,0.9,0.14],[1,1,1]);
+  addPart('throttle_body','intake',new THREE.CylinderGeometry(0.12,0.12,0.36,10),0x3b8797,[0.18,0.84,0.58],[1,1,1]);
+  addPart('exhaust_manifold','exhaust',new THREE.BoxGeometry(0.88,0.2,0.26),0x7d6338,[-1.25,0.08,0.78],[1,1,1]);
+  addPart('catalytic_converter','exhaust',new THREE.CylinderGeometry(0.17,0.17,0.65,12),0xa87434,[0.72,-0.18,0.88],[1,1,1]);
+  addPart('fuel_rail','fuel_system',new THREE.BoxGeometry(0.9,0.1,0.12),0x5f657f,[-0.85,0.64,-0.36],[1,1,1]);
+  addPart('fuel_pump','fuel_system',new THREE.CylinderGeometry(0.11,0.11,0.24,10),0x6d7396,[-2.2,-0.3,0],[1,1,1]);
+  addPart('battery','electrical_system',new THREE.BoxGeometry(0.58,0.36,0.42),0x357757,[0.92,0.42,-0.72],[1,1,1]);
+  addPart('alternator','electrical_system',new THREE.CylinderGeometry(0.17,0.17,0.3,12),0x4d9b72,[0.15,0.24,-0.58],[1,1,1]);
+  addPart('transmission_case','transmission',new THREE.BoxGeometry(1.3,0.62,0.9),0x6c7683,[-2.05,0.08,0],[1,1,1]);
+  const body=new THREE.Mesh(new THREE.BoxGeometry(5.1,1.2,2.25),new THREE.MeshStandardMaterial({color:0x243241,roughness:0.82,metalness:0.12,transparent:true,opacity:0.95})); body.position.y=0.6; root.add(body);
+  [[-1.7,-0.05,1.2],[-1.7,-0.05,-1.2],[1.7,-0.05,1.2],[1.7,-0.05,-1.2]].forEach(p=>{const w=new THREE.Mesh(new THREE.CylinderGeometry(0.47,0.47,0.3,16),new THREE.MeshStandardMaterial({color:0x0b1120,roughness:0.95})); w.rotation.z=Math.PI/2; w.position.set(...p); root.add(w);});
+
+  const raycaster=new THREE.Raycaster(); const pointer=new THREE.Vector2();
+  function applyHighlight(action,component,system){
+    Object.values(partMap).forEach(m=>{m.material.color.setHex(m.userData.baseColor); m.material.opacity=1;});
+    selectedMesh=null;
+    if(action==='highlight_component' && partMap[component]){selectedMesh=partMap[component]; selectedMesh.material.color.set('#00E5FF'); Object.values(partMap).forEach(m=>{if(m!==selectedMesh){m.material.opacity=(m.userData.system===selectedMesh.userData.system)?0.42:0.16;}});} 
+    if(action==='highlight_system' && system){Object.values(partMap).forEach(m=>{if(m.userData.system===system){m.material.color.set('#00E5FF'); m.material.opacity=0.94;} else {m.material.opacity=0.16;}});} 
+    const name=component|| (selectedMesh?selectedMesh.userData.component:null) || (system?`${system} system` : null);
+    const hasComponent = Boolean(component);
+    document.getElementById('highlightedComponentName').textContent=name?formatLabel(name):'No highlighted component';
+    document.getElementById('componentExplainBtn').disabled=!hasComponent;
+    document.getElementById('componentExplainBtn').dataset.component=component || '';
+    document.getElementById('componentExplainState').textContent=hasComponent?'Explain':'Select Part';
+    applyTone('componentStatusPill', hasComponent ? 'accent' : system ? 'warning' : 'neutral');
+    updateBadge('inspectionBadge', 'inspectionBadgeText', hasComponent ? 'accent' : system ? 'warning' : 'neutral', hasComponent ? `Focused: ${formatLabel(component)}` : system ? `${formatLabel(system)} selected` : 'No highlighted component');
+  }
+  function pick(ev){ const rect=renderer.domElement.getBoundingClientRect(); pointer.x=((ev.clientX-rect.left)/rect.width)*2-1; pointer.y=-((ev.clientY-rect.top)/rect.height)*2+1; raycaster.setFromCamera(pointer,camera); const hit=raycaster.intersectObjects(Object.values(partMap))[0]; if(!hit){return;} const {component,system}=hit.object.userData; applyHighlight('highlight_component',component,system); syncHighlight('highlight_component',component,system,'user'); }
+  renderer.domElement.addEventListener('pointerdown',pick,{passive:true});
+
+  function animate(){ root.rotation.y += 0.0028; renderer.render(scene,camera); requestAnimationFrame(animate); }
+  animate();
+  window.addEventListener('resize',()=>{ if(!host.clientWidth || !host.clientHeight){return;} camera.aspect=host.clientWidth/host.clientHeight; camera.updateProjectionMatrix(); renderer.setSize(host.clientWidth,host.clientHeight); });
+  vehicleRenderer={applyHighlight};
+}
+
+function showFallbackImage(reason){ const img=document.getElementById('vehicleImageAsset'); img.style.display='block'; const source=document.getElementById('vehicleImageSource'); source.textContent=reason; const host=document.getElementById('vehicleCanvas'); if(host){host.innerHTML='';} }
+
+async function fetchState(){
+  const res = await fetch('/dashboard/state');
+  state = await res.json();
+  phoneBridge = { ...phoneBridge, ...state.phone_bridge };
+  renderVehicles(); renderDashboardState(); renderBluetoothCard(); renderAiAlerts(); renderTimeline(); syncLivePolling();
+  if(vehicleRenderer && state.vehicle_visualization?.highlight){ const h=state.vehicle_visualization.highlight; vehicleRenderer.applyHighlight(h.action,h.component,h.system); }
+}
+function renderVehicles(){
+  const select = document.getElementById('vehicleSelect');
+  const vehicles = state?.vehicles || [];
+  if(!select || !vehicles.length){ return; }
+  if(state?.active_session?.vehicle_id && vehicles.some((vehicle) => vehicle.vehicle_id === state.active_session.vehicle_id)){
+    selectedVehicleId = state.active_session.vehicle_id;
+  } else if(!vehicles.some((vehicle) => vehicle.vehicle_id === selectedVehicleId)){
+    selectedVehicleId = vehicles[0].vehicle_id;
+  }
+  const nextKey = vehicles.map((vehicle) => `${vehicle.vehicle_id}:${vehicle.label}:${vehicle.protocol_hint}`).join('|');
+  if(nextKey !== renderedVehicleKey){
+    select.innerHTML = '';
+    vehicles.forEach((vehicle) => {
+      const option = document.createElement('option');
+      option.value = vehicle.vehicle_id;
+      option.textContent = `${vehicle.label} (${vehicle.protocol_hint})`;
+      if(vehicle.vehicle_id === selectedVehicleId){ option.selected = true; }
+      select.appendChild(option);
+    });
+    renderedVehicleKey = nextKey;
+  }
+  select.value = selectedVehicleId;
+  select.onchange = async (event) => {
+    selectedVehicleId = event.target.value;
+    renderDashboardState();
+    if(lastVehicleImageSelection !== selectedVehicleId){
+      lastVehicleImageSelection = selectedVehicleId;
+      await updateVehicleImage();
+    }
+  };
+  if(lastVehicleImageSelection !== selectedVehicleId){
+    lastVehicleImageSelection = selectedVehicleId;
+    updateVehicleImage();
+  }
+}
+function renderDashboardState(){
+  const active = state?.active_session;
+  const profile = getVehicleProfileById(active?.vehicle_id || selectedVehicleId);
+  const connected = (phoneBridge.status || 'disconnected') === 'connected';
+  const captureRecording = state?.capture_status === 'recording' && connected;
+  const waitingForLiveRead = connected && !phoneBridge.first_live_read_received;
+  const recentLiveRead = (state?.recent_reads || []).some((read) => LIVE_TELEMETRY_KEYS.includes(read.pid_key) && isFreshRead(read));
+  const liveReadActive = connected && (phoneBridge.ai_monitoring_active || recentLiveRead);
+  const aiReady = Boolean(active);
+  const unsupported = phoneBridge.transport_supported === false || phoneBridge.fallback_reason === 'unsupported-environment-native-bridge-missing';
+  const bluetoothTone = connected ? 'success' : phoneBridge.status === 'failed' ? 'danger' : phoneBridge.status === 'connecting' ? 'warning' : 'neutral';
+  const bluetoothLabel = connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Unavailable' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Not Connected';
+  const streamTone = liveReadActive ? 'accent' : waitingForLiveRead ? 'warning' : 'neutral';
+  const streamLabel = liveReadActive ? 'Streaming' : waitingForLiveRead ? 'Waiting first PID' : 'Idle';
+  const aiTone = aiReady ? (state?.ai_monitoring?.active ? 'accent' : 'success') : 'neutral';
+  const aiLabel = aiReady ? (state?.ai_monitoring?.active ? 'Monitoring' : 'Ready') : 'Offline';
+  const protocolLabel = formatMode(active?.protocol || profile?.protocol_hint || 'protocol pending');
+  const profileNote = profile?.notes || 'Safe read-only diagnostic workflow enabled.';
+
+  document.getElementById('headerVehicleName').textContent = getVehicleDisplayName();
+  document.getElementById('headerVehicleDetail').textContent = active
+    ? `${protocolLabel} workflow armed. ${profileNote} Vehicle check ${shortId(active.session_id)} is active and ready for live context.`
+    : `${protocolLabel} workflow armed. ${profileNote} Start a vehicle check to unlock capture, reports, and full AI context.`;
+  document.getElementById('vehicleProfileNote').textContent = profileNote;
+
+  updateIndicator('statusBluetooth', 'statusBluetoothValue', bluetoothTone, bluetoothLabel);
+  updateIndicator('statusStreaming', 'statusStreamingValue', streamTone, streamLabel);
+  updateIndicator('statusAiAssist', 'statusAiAssistValue', aiTone, aiLabel);
+
+  const sessionActuallyActive = Boolean(active && connected);
+  updateBadge('sessionBadge', 'sessionBadgeText', sessionActuallyActive ? 'success' : 'neutral', sessionActuallyActive ? 'Vehicle Check Active' : 'Vehicle Check Idle');
+  updateBadge('captureBadge', 'captureBadgeText', captureRecording ? 'danger' : state?.capture_status === 'stopped' ? 'warning' : 'neutral', captureRecording ? 'Capture Recording' : state?.capture_status === 'stopped' ? 'Capture Stopped' : 'Capture Idle', captureRecording);
+  updateBadge('modeBadge', 'modeBadgeText', connected ? 'accent' : 'neutral', formatMode(state?.current_mode || phoneBridge.current_mode || 'standby'));
+  const who = state?.current_user?.display_name || 'Demo Tester';
+  document.getElementById('userBadgeText').textContent = `Signed in: ${who}`;
+  updateBadge('diagnosticStateBadge', 'diagnosticStateText', captureRecording ? 'danger' : sessionActuallyActive ? 'success' : connected ? 'accent' : 'warning', captureRecording ? 'Recording live capture' : sessionActuallyActive ? 'Vehicle check active' : connected ? 'Connected and ready' : 'Awaiting connection', captureRecording);
+  updateBadge('aiPanelBadge', 'aiPanelBadgeText', state?.ai_monitoring?.active ? 'accent' : aiReady ? 'success' : 'neutral', state?.ai_monitoring?.active ? 'Live monitoring active' : aiReady ? 'AI ready for diagnostics' : 'Awaiting vehicle check');
+
+  renderTelemetry();
+
+  const connectMeta = connected
+    ? `OBDLink bridge active. ${liveReadActive ? 'Live telemetry is streaming.' : 'Connected, waiting for first successful PID.'}`
+    : phoneBridge.status === 'failed'
+      ? (phoneBridge.failure_message || `Connection did not complete. ${phoneBridge.fallback_reason || 'Retry the Bluetooth handshake.'}`)
+      : phoneBridge.status === 'connecting'
+        ? 'Negotiating Bluetooth link and preparing live polling.'
+        : (unsupported ? 'This environment does not expose the required native Bluetooth bridge.' : 'Pair with OBDLink MX+ and arm live read-only telemetry.');
+  document.getElementById('connectVehicleMeta').textContent = connectMeta;
+  setButtonState('connectVehicleBtn', connected ? 'success' : phoneBridge.status === 'failed' ? 'danger' : phoneBridge.status === 'connecting' ? 'warning' : 'accent', connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Unavailable' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Standby', connected, phoneBridge.status === 'connecting', connected);
+
+  setButtonState('startSessionBtn', active ? 'success' : 'accent', active ? 'Active' : 'Ready', Boolean(active), false, Boolean(active));
+  setButtonState('stopSessionBtn', active ? 'danger' : 'warning', active ? 'Available' : 'Idle', Boolean(active), false, false);
+  setButtonState('startCaptureBtn', captureRecording ? 'success' : connected && active ? 'accent' : 'neutral', captureRecording ? 'Recording' : connected && active ? 'Ready' : 'Requires Link', captureRecording, captureRecording, captureRecording);
+  setButtonState('stopCaptureBtn', captureRecording ? 'danger' : 'warning', captureRecording ? 'Available' : 'Idle', captureRecording, false, false);
+  setButtonState('tagEventBtn', active && connected ? 'warning' : 'neutral', captureRecording ? 'Live Tagging' : active && connected ? 'Ready' : 'Session Needed', Boolean(active && connected), captureRecording, false);
+  setButtonState('reportsBtn', 'neutral', active ? 'Review' : 'Available', Boolean(active), false, false);
+  setButtonState('liveGaugesBtn', connected ? 'accent' : 'neutral', liveReadActive ? 'Live' : connected ? 'Ready' : 'Standby', connected, liveReadActive, connected);
+  setButtonState('askAiBtn', state?.ai_monitoring?.active ? 'accent' : aiReady ? 'success' : 'accent', state?.ai_monitoring?.active ? 'Monitoring' : aiReady ? 'Ready' : 'Standby', Boolean(state?.ai_monitoring?.active || aiReady), false, false);
+}
+function renderTelemetry(){
+  const metrics = [
+    { cardId:'metricCardRpm', valueId:'metricRpmValue', metaId:'metricRpmMeta', read:getLatestRead('rpm'), unit:'rpm', precision:0 },
+    { cardId:'metricCardVoltage', valueId:'metricVoltageValue', metaId:'metricVoltageMeta', read:getLatestRead('control_module_voltage'), unit:'V', precision:1 },
+    { cardId:'metricCardCoolant', valueId:'metricCoolantValue', metaId:'metricCoolantMeta', read:getLatestRead('coolant_temp'), unit:'C', precision:0 },
+    { cardId:'metricCardThrottle', valueId:'metricThrottleValue', metaId:'metricThrottleMeta', read:getLatestRead('throttle_position'), unit:'%', precision:0 },
+  ];
+  metrics.forEach((metric) => {
+    const summary = formatMetricValue(metric.read, metric.unit, metric.precision);
+    document.getElementById(metric.valueId).textContent = summary.value;
+    document.getElementById(metric.metaId).textContent = summary.meta;
+    document.getElementById(metric.cardId).dataset.live = summary.live ? 'true' : 'false';
+  });
+}
+async function updateVehicleImage(){
+  const requestId = ++lastVehicleImageRequestId;
+  const res = await fetch(`/vehicle-image/current?manual_vehicle_id=${encodeURIComponent(selectedVehicleId)}`);
+  const image = await res.json();
+  if(requestId !== lastVehicleImageRequestId){ return; }
+  const trim = image.trim ? ` ${image.trim}` : '';
+  const label = `${image.year || ''} ${image.make} ${image.model}${trim}`.replace(/\\s+/g,' ').trim();
+  document.getElementById('vehicleImageLabel').textContent = label || 'Generic vehicle';
+  const sourceMap = {
+    auto_vin: 'Auto VIN detection result',
+    manual_selection: 'Manual vehicle selection fallback',
+    active_session_vehicle: 'Active session vehicle fallback',
+    closest_supported: 'Closest supported vehicle image fallback',
+    generic_placeholder: 'Generic placeholder image',
+  };
+  const img = document.getElementById('vehicleImageAsset');
+  img.src = image.image_asset_path || image.fallback_image_asset_path;
+  img.onerror = () => { img.src = image.fallback_image_asset_path; };
+  if(!vehicleRenderer){ buildGenericVehicleViewer(); }
+  if(!vehicleRenderer){
+    showFallbackImage(`${sourceMap[image.resolved_from] || image.resolved_from} - WebGL fallback image`);
+  } else {
+    img.style.display = 'none';
+    document.getElementById('vehicleImageSource').textContent = '3D view active - tap a component to inspect and explain';
+  }
+}
+function renderBluetoothCard(){
+  const status = phoneBridge.status || 'disconnected';
+  const tone = status === 'connected' ? 'success' : status === 'failed' ? 'danger' : status === 'connecting' ? 'warning' : 'neutral';
+  const statusLabel = status === 'failed' ? 'Unavailable' : formatMode(status);
+  updateBadge('btStatusBadge', 'btStatusText', tone, statusLabel);
+  document.getElementById('btError').textContent = phoneBridge.failure_message || phoneBridge.last_error || 'No Bluetooth errors';
+  const detailRows = [
+    { label: 'Selected transport', value: bridgeDebug.selected_transport || 'unknown' },
+    { label: 'Native bridge available', value: bridgeDebug.native_bridge_available ? 'true' : 'false' },
+    { label: 'Bluetooth link', value: phoneBridge.bluetooth_connected ? 'Connected' : 'Idle' },
+    { label: 'Polling state', value: `${phoneBridge.polling_active ? 'Active' : 'Inactive'} (${phoneBridge.polling_state || 'inactive'})` },
+    { label: 'First live read', value: phoneBridge.first_live_read_received ? 'Received' : 'Pending' },
+    { label: 'Source mode', value: phoneBridge.current_source_mode || phoneBridge.source_mode || 'unknown' },
+    { label: 'Last PID command', value: phoneBridge.last_live_pid_command || 'None' },
+    { label: 'Last PID response', value: phoneBridge.last_live_pid_response || 'None' },
+    { label: 'Ingest status', value: phoneBridge.last_ingest_status || 'idle' },
+    { label: 'Backend acceptance', value: phoneBridge.backend_acceptance_status || 'idle' },
+  ];
+  if(phoneBridge.fallback_reason){ detailRows.push({ label: 'Fallback reason', value: phoneBridge.fallback_reason }); }
+  if(phoneBridge.last_error){ detailRows.push({ label: 'Last error', value: phoneBridge.last_error }); }
+  if((state.current_mode || phoneBridge.current_mode) === 'MOCK'){ detailRows.push({ label: 'Mock mode reason', value: phoneBridge.mock_reason || state.current_mode_reason || 'Unknown' }); }
+  document.getElementById('btDebug').innerHTML = detailRows.map((row) => `<div class="detail-row"><span class="detail-label">${escapeHtml(row.label)}</span><span class="detail-value">${escapeHtml(row.value)}</span></div>`).join('');
+}
+function alertTone(confidence){
+  if(confidence === 'high confidence'){ return 'danger'; }
+  if(confidence === 'likely' || confidence === 'suspected'){ return 'warning'; }
+  return 'success';
+}
 function renderAiAlerts(){
-  const alerts=state.ai_alerts||[];
-  const monitoring=state.ai_monitoring||{active:false,message:'Waiting for live monitoring.'};
-  document.getElementById('aiAlertSummary').textContent=alerts.length?`${alerts.length} proactive alert(s) linked to this vehicle check.`:(monitoring.active?'Live monitoring active.':'No active alerts.');
-  document.getElementById('aiAlertList').innerHTML=alerts.slice(-5).reverse().map(a=>`<div><b>${a.title}</b> (${a.confidence}) — ${a.explanation}. Next: ${a.suggested_next_step}</div>`).join('') || `<div>${monitoring.message}</div>`;
+  const alerts = state.ai_alerts || [];
+  const monitoring = state.ai_monitoring || { active:false, message:'Waiting for live monitoring.' };
+  document.getElementById('aiAlertSummary').textContent = alerts.length
+    ? `${alerts.length} proactive alert(s) linked to this vehicle check.`
+    : (monitoring.active ? 'Live monitoring active.' : 'No active alerts.');
+  document.getElementById('aiAlertList').innerHTML = alerts.slice(-5).reverse().map((alert) => `
+    <div class="alert-item">
+      <div class="alert-head">
+        <strong>${escapeHtml(alert.title)}</strong>
+        <span class="confidence-pill" data-tone="${escapeHtml(alertTone(alert.confidence))}">${escapeHtml(alert.confidence)}</span>
+      </div>
+      <div class="tiny">${escapeHtml(alert.explanation)}</div>
+      <div class="tiny"><span class="detail-label">Next</span> ${escapeHtml(alert.suggested_next_step)}</div>
+    </div>
+  `).join('') || `<div class="empty-state">${escapeHtml(monitoring.message)}</div>`;
 }
 function renderTimeline(){
-  const timeline=state.diagnostic_timeline||[];
-  document.getElementById('timelineList').innerHTML=timeline.slice(-8).reverse().map(t=>`<div>${new Date(t.ts).toLocaleTimeString()} — ${t.title}${t.linked_ai_response_id?` <a href="/dashboard/ai" style="color:#0f766e">AI explanation</a>`:''}</div>`).join('') || '<div>No timeline events yet.</div>';
+  const timeline = state.diagnostic_timeline || [];
+  document.getElementById('timelineList').innerHTML = timeline.slice(-8).reverse().map((item) => `
+    <div class="timeline-item">
+      <span class="timeline-dot" aria-hidden="true"></span>
+      <div>
+        <div class="timeline-top">
+          <strong>${escapeHtml(item.title)}</strong>
+          <span class="tiny">${escapeHtml(new Date(item.ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }))}</span>
+        </div>
+        <div class="tiny">${escapeHtml(item.detail || '')}${item.linked_ai_response_id ? ` <a href="/dashboard/ai">AI explanation</a>` : ''}</div>
+      </div>
+    </div>
+  `).join('') || '<div class="empty-state">No timeline events yet.</div>';
 }
-
-async function ensureSession(){if(state&&state.active_session)return state.active_session;await fetch('/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vehicle_id:'toyota_sienna_2006'})});await fetchState();return state.active_session;}
-async function pollAllGaugesOnce(){if(pollingInFlight){return;}if((phoneBridge.status||'disconnected')!=='connected'){stopGaugePolling();return;}const service=getMobileBluetoothService();if(!service||typeof service.readPid!=='function'){await fetchState();return;}const active=await ensureSession();pollingInFlight=true;try{const nativeReads=await Promise.allSettled(gauges.map(g=>readNativePid(g.sensor)));const ingestJobs=nativeReads.filter(result=>result.status==='fulfilled'&&result.value).map(result=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,...result.value,polling:true})}));if(ingestJobs.length){await Promise.allSettled(ingestJobs);}}finally{pollingInFlight=false;await fetchState();}}
-function startGaugePolling(){if(pollingHandle)return;pollAllGaugesOnce();pollingHandle=setInterval(()=>{pollAllGaugesOnce();},500);} function stopGaugePolling(){if(pollingHandle){clearInterval(pollingHandle);pollingHandle=null;}}
-function syncGaugePolling(){if((phoneBridge.status||'disconnected')==='connected'&&state?.active_session&&(phoneBridge.polling_state||'inactive')!=='inactive'){startGaugePolling();return;}stopGaugePolling();}
-function savePreset(){const name=document.getElementById('presetName').value||'Default';localStorage.setItem(`gaugePreset:${name}`,JSON.stringify(gauges));}
-function loadPreset(){const name=document.getElementById('presetName').value||'Default';const raw=localStorage.getItem(`gaugePreset:${name}`);if(raw){gauges=JSON.parse(raw);renderGauges();}}
-document.getElementById('startPollingBtn').onclick=startGaugePolling; document.getElementById('stopPollingBtn').onclick=stopGaugePolling; document.getElementById('savePresetBtn').onclick=savePreset; document.getElementById('loadPresetBtn').onclick=loadPreset; document.getElementById('backBtn').onclick=()=>window.location.href='/dashboard';
-setInterval(fetchState,1200); fetchState();
-</script></body></html>
-    """
-
-
-@app.get('/dashboard/ai', response_class=HTMLResponse)
-def ai_dashboard() -> str:
-    return """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>AI Mechanic</title>
-<style>
-body{margin:0;font-family:Segoe UI,system-ui,sans-serif;background:#edf2f7;color:#0f172a}
-.wrap{max-width:980px;margin:0 auto;padding:14px;display:grid;gap:12px}
-.card{background:#fff;border:1px solid #d4dde7;border-radius:14px;padding:14px}
-.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
-input,button{width:100%;border-radius:12px;border:1px solid #d4dde7;padding:12px}
-button{background:#0f766e;color:#fff;font-weight:700}
-button.secondary{background:#fff;color:#0f172a}
-.quick{display:flex;flex-wrap:wrap;gap:8px}
-.quick button{width:auto}
-.chat{max-height:330px;overflow:auto;display:grid;gap:8px}
-.bubble{border:1px solid #d4dde7;border-radius:12px;padding:10px;background:#f8fafc}
-.badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#fee2e2;color:#991b1b;font-size:.75rem;font-weight:700}
-.tiny{font-size:.85rem;color:#475569}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="card">
-    <h1 style="margin:0">AI Mechanic</h1>
-    <div class="badge">READ-ONLY DIAGNOSTIC / ADVISORY</div>
-    <div class="tiny" style="margin-top:8px">Voice-enabled assistant for safe live reads, DTC explanations, and memory-supported guidance. Unsafe controls are permanently blocked.</div>
-  </div>
-
-  <div class="card">
-    <div class="row">
-      <button id="micBtn">🎤 Start Listening</button>
-      <button id="stopMicBtn" class="secondary">Stop Listening</button>
-      <button id="speakBtn">🔊 Play Response</button>
-      <button id="stopSpeakBtn" class="secondary">Stop Audio</button>
-    </div>
-    <div class="tiny" id="voiceState" style="margin-top:8px">Voice state: idle</div>
-    <div class="tiny" id="transcriptPreview">Transcript preview: (none)</div>
-  </div>
-
-  <div class="card">
-    <input id="question" placeholder="Speak or type your question" />
-    <button id="sendBtn" style="margin-top:8px">Send</button>
-    <div class="quick" style="margin-top:10px">
-      <button class="secondary" onclick="setPrompt('What does this code mean?')">What does this code mean?</button>
-      <button class="secondary" onclick="setPrompt('Is it safe to drive?')">Is it safe to drive?</button>
-      <button class="secondary" onclick="setPrompt('What should I test next?')">What should I test next?</button>
-      <button class="secondary" onclick="setPrompt('Explain this in simple language')">Explain this in simple language</button>
-      <button class="secondary" onclick="setPrompt('What changed in live data?')">What changed in live data?</button>
-      <button class="secondary" onclick="setPrompt('What should I watch right now?')">What should I watch right now?</button>
-    </div>
-  </div>
-
-  <div class="card">
-    <h3 style="margin-top:0">Conversation</h3>
-    <div class="tiny" id="aiLoading">AI status: idle</div><div id="aiResponse" class="bubble" style="margin-top:8px">Response will appear here.</div><div id="chat" class="chat" style="margin-top:8px"></div>
-  </div>
-
-  <div class="card"><button class="secondary" id="backBtn">Back to Main Dashboard</button></div>
-</div>
-<script>
-let lastAnswer='';
-let recog=null;
-const synth=window.speechSynthesis;
-function pushMsg(role,text){const el=document.createElement('div');el.className='bubble';el.innerHTML=`<b>${role}:</b> ${text}`;document.getElementById('chat').prepend(el);}
-function setPrompt(v){document.getElementById('question').value=v;document.getElementById('transcriptPreview').textContent='Transcript preview: '+v;}
-async function ask(){const q=document.getElementById('question').value.trim();if(!q){return;}document.getElementById('aiLoading').textContent='AI status: thinking...';pushMsg('You',q);const res=await fetch('/ai/mechanic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,source:'user'})});const data=await res.json();lastAnswer=data.answer;document.getElementById('aiResponse').textContent=data.answer;document.getElementById('aiLoading').textContent='AI status: response ready';if(data.visualization_hook){await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...data.visualization_hook,source:'ai_mechanic'})});}pushMsg('AI Mechanic',data.answer+` [source: ${data.response_basis}]`);}
-function speechAvailable(){return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;}
-function initSpeech(){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){document.getElementById('voiceState').textContent='Voice state: unavailable, text fallback active';return;}recog=new SR();recog.lang='en-US';recog.interimResults=true;recog.onstart=()=>document.getElementById('voiceState').textContent='Voice state: listening';recog.onerror=()=>document.getElementById('voiceState').textContent='Voice state: transcription failed, retry or type';recog.onend=()=>document.getElementById('voiceState').textContent='Voice state: idle';recog.onresult=(e)=>{let t='';for(let i=e.resultIndex;i<e.results.length;i++){t+=e.results[i][0].transcript;}document.getElementById('question').value=t.trim();document.getElementById('transcriptPreview').textContent='Transcript preview: '+(t.trim()||'(none)');};}
-function startListening(){if(!recog){const qp=new URLSearchParams(window.location.search).get('prompt'); if(qp){setPrompt(qp);} initSpeech();}if(recog){recog.start();}}
-function stopListening(){if(recog){recog.stop();}}
-function playAnswer(){if(!lastAnswer){return;}if(!synth){pushMsg('System','Voice output unavailable, using text transcript only.');return;}const u=new SpeechSynthesisUtterance(lastAnswer);synth.speak(u);} 
-function stopAnswer(){if(synth){synth.cancel();}}
-
-document.getElementById('sendBtn').onclick=ask;
-document.getElementById('micBtn').onclick=startListening;
-document.getElementById('stopMicBtn').onclick=stopListening;
-document.getElementById('speakBtn').onclick=playAnswer;
-document.getElementById('stopSpeakBtn').onclick=stopAnswer;
-document.getElementById('backBtn').onclick=()=>window.location.href='/dashboard';
-const qp=new URLSearchParams(window.location.search).get('prompt'); if(qp){setPrompt(qp);} initSpeech();
+async function ensureSession(){ if (state && state.active_session) return state.active_session; await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})}); await fetchState(); return state.active_session; }
+async function createSession(){ await ensureSession(); }
+async function pollLiveSensorsOnce(){
+  if(livePollingInFlight){return;}
+  if((phoneBridge.status||'disconnected')!=='connected' || !phoneBridge.transport_supported){stopLivePolling();return;}
+  const transport = detectTransport();
+  if(!transport.hasNativeBridge){
+    bridgeDebug.last_error = transport.reason;
+    logBridge('polling-blocked', transport);
+    await fetchState();
+    return;
+  }
+  const active=await ensureSession();
+  livePollingInFlight=true;
+  logBridge('polling-start', { session_id: active?.session_id });
+  try {
+    const nativeReads=await Promise.allSettled(LIVE_SENSOR_ORDER.map(sensor=>readNativePid(sensor)));
+    const successful=nativeReads.filter(result=>result.status==='fulfilled'&&result.value);
+    if(successful.length){
+      logBridge('first-pid-read-candidate', { count: successful.length });
+    }
+    const ingestJobs=successful.map(result=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,...result.value,polling:true})}));
+    if(ingestJobs.length){ await Promise.allSettled(ingestJobs); }
+  } finally {
+    livePollingInFlight=false;
+    await fetchState();
+  }
+}
+function startLivePolling(){ if(livePollingHandle){return;} logBridge('polling-armed',{interval:500}); pollLiveSensorsOnce(); livePollingHandle=setInterval(()=>{pollLiveSensorsOnce();},500); }
+function stopLivePolling(){ if(livePollingHandle){ clearInterval(livePollingHandle); livePollingHandle=null; } }
+function syncLivePolling(){ if((phoneBridge.status||'disconnected')==='connected' && phoneBridge.transport_supported && state?.active_session && (phoneBridge.polling_state||'inactive')!=='inactive'){ startLivePolling(); return; } stopLivePolling(); }
+async function stopSession(){ stopLivePolling(); await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
+async function startCapture(){ await ensureSession(); await fetch('/capture/start',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId,preset:'cold_start_capture'})}); await fetchState(); }
+async function stopCapture(){ await fetch('/capture/stop',{method:'POST'}); await fetchState(); }
+async function tagEvent(){ if (!state.active_session) { alert('Vehicle Check missing: start Vehicle Check first.'); return; } await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:'idle'})}); await fetchState(); }
+async function connectVehicle(){
+  const transport = detectTransport();
+  logBridge('selected-transport',{selected: bridgeDebug.selected_transport, native_bridge_available: bridgeDebug.native_bridge_available});
+  let connectPayload;
+  if(!transport.hasNativeBridge){
+    connectPayload = normalizeConnectPayload({status:'failed', source_mode:'PHONE-LIVE', supports_native_bluetooth:false, fallback_reason:transport.reason}, transport);
+    logBridge('connection-failed', { reason: connectPayload.fallback_reason });
+  } else {
+    try {
+      logBridge('connection-attempt-started',{ platform: transport.platform });
+      connectPayload = normalizeConnectPayload(await transport.service.connectToAdapter(), transport);
+      logBridge(connectPayload.status === 'connected' ? 'connection-success' : 'connection-failure', connectPayload);
+    } catch (error) {
+      connectPayload = normalizeConnectPayload({status:'failed',fallback_reason:error?.message || 'native-connect-failed'}, transport);
+      logBridge('connection-failure', { error: connectPayload.fallback_reason });
+    }
+  }
+  await ensureSession();
+  await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(connectPayload) });
+  await fetchState();
+  if(connectPayload.status==='connected'){ startLivePolling(); }
+}
+async function syncHighlight(action,component,system,source='user'){ await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,component,system,source})}); }
+async function explainSelected(){ const comp=document.getElementById('componentExplainBtn').dataset.component; if(!comp){return;} const res=await fetch(`/vehicle-visualization/explain?component=${encodeURIComponent(comp)}`); const data=await res.json(); alert(`${data.component.replace(/_/g,' ')}: ${data.explanation}`); }
+function openAiWithPrompt(prompt){ window.location.href = `/dashboard/ai?prompt=${encodeURIComponent(prompt || '')}`; }
+window.openAiWithPrompt = openAiWithPrompt;
+document.getElementById('connectVehicleBtn').onclick = connectVehicle;
+document.getElementById('startSessionBtn').onclick = createSession;
+document.getElementById('stopSessionBtn').onclick = stopSession;
+document.getElementById('startCaptureBtn').onclick = startCapture;
+document.getElementById('stopCaptureBtn').onclick = stopCapture;
+document.getElementById('tagEventBtn').onclick = tagEvent;
+document.getElementById('reportsBtn').onclick = () => alert('Reports view is available in the report framework section.');
+document.getElementById('liveGaugesBtn').onclick = () => window.location.href = '/dashboard/gauges';
+document.getElementById('askAiBtn').onclick = () => openAiWithPrompt('');
+document.getElementById('componentExplainBtn').onclick = explainSelected;
+setInterval(fetchState, 1500);
+fetchState();
 </script>
 </body>
 </html>
