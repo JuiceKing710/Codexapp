@@ -1,0 +1,4 @@
+<key>NSBluetoothAlwaysUsageDescription</key>
+<string>Zeb OBD AI needs Bluetooth access to read live OBD telemetry from OBDLink MX+.</string>
+<key>NSBluetoothPeripheralUsageDescription</key>
+<string>Zeb OBD AI uses Bluetooth for read-only diagnostics.</string>
