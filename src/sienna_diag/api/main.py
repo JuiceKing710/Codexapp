@@ -1227,9 +1227,32 @@ def _vehicle_intelligence_core_snapshot(
             "events": events[-200:],
             "ai_alerts": alerts[-120:],
         },
+        "ai_context_builder": {
+            "active_session": active,
+            "recent_events": events[-40:],
+            "recent_alerts": alerts[-20:],
+            "recent_read_count": len(reads),
+            "confidence_inputs": {
+                "has_live_stream": bool(bridge_snapshot.get("first_live_read_received")),
+                "has_dtcs": bool(dtc_stored or dtc_pending),
+                "alert_count": len(alerts),
+            },
+        },
         "command_learning_engine": {
             "command_library": store.command_library,
             "session_records": store.get_learning_records(active["session_id"]) if active else [],
+            "risk_buckets": ["safe", "unknown", "risky", "confirmed"],
+            "bi_directional_execution_policy": "explicit_approval_required",
+        },
+        "visualization_engine": {
+            "component_groups": VEHICLE_COMPONENT_GROUPS,
+            "highlight": vehicle_visualization_state.copy(),
+            "color_states": {"red": "confirmed failure", "yellow": "suspected issue", "green": "normal"},
+        },
+        "reporting_engine": {
+            "tiers": ["customer_summary", "technician_detail", "ai_training_export"],
+            "latest_alert_count": len(alerts),
+            "latest_timeline_count": len(events),
         },
         "ai_test_assistant": {
             "guided_plan": plan,
@@ -1307,6 +1330,7 @@ def dashboard_state() -> dict:
         "display_name": settings.app_display_name,
         "current_user": current_user.model_dump(),
         "current_profile": current_profile.model_dump(),
+        "app_settings": store.get_app_settings(),
         "vehicles": [item.model_dump() for item in store.list_vehicles()],
         "active_session": active,
         "adapter_mode": adapter.mode_status(),
@@ -1347,6 +1371,17 @@ def dashboard_state() -> dict:
     }
 
 
+
+
+@app.get("/settings")
+def get_settings() -> dict:
+    return {"settings": store.get_app_settings()}
+
+
+@app.post("/settings")
+def update_settings(payload: dict) -> dict:
+    settings = store.update_app_settings(payload)
+    return {"status": "updated", "settings": settings}
 
 
 @app.get("/ai/memory/{vehicle_id}")
@@ -3962,9 +3997,32 @@ def _vehicle_intelligence_core_snapshot(
             "events": events[-200:],
             "ai_alerts": alerts[-120:],
         },
+        "ai_context_builder": {
+            "active_session": active,
+            "recent_events": events[-40:],
+            "recent_alerts": alerts[-20:],
+            "recent_read_count": len(reads),
+            "confidence_inputs": {
+                "has_live_stream": bool(bridge_snapshot.get("first_live_read_received")),
+                "has_dtcs": bool(dtc_stored or dtc_pending),
+                "alert_count": len(alerts),
+            },
+        },
         "command_learning_engine": {
             "command_library": store.command_library,
             "session_records": store.get_learning_records(active["session_id"]) if active else [],
+            "risk_buckets": ["safe", "unknown", "risky", "confirmed"],
+            "bi_directional_execution_policy": "explicit_approval_required",
+        },
+        "visualization_engine": {
+            "component_groups": VEHICLE_COMPONENT_GROUPS,
+            "highlight": vehicle_visualization_state.copy(),
+            "color_states": {"red": "confirmed failure", "yellow": "suspected issue", "green": "normal"},
+        },
+        "reporting_engine": {
+            "tiers": ["customer_summary", "technician_detail", "ai_training_export"],
+            "latest_alert_count": len(alerts),
+            "latest_timeline_count": len(events),
         },
         "ai_test_assistant": {
             "guided_plan": plan,
@@ -4042,6 +4100,7 @@ def dashboard_state() -> dict:
         "display_name": settings.app_display_name,
         "current_user": current_user.model_dump(),
         "current_profile": current_profile.model_dump(),
+        "app_settings": store.get_app_settings(),
         "vehicles": [item.model_dump() for item in store.list_vehicles()],
         "active_session": active,
         "adapter_mode": adapter.mode_status(),
@@ -4082,6 +4141,17 @@ def dashboard_state() -> dict:
     }
 
 
+
+
+@app.get("/settings")
+def get_settings() -> dict:
+    return {"settings": store.get_app_settings()}
+
+
+@app.post("/settings")
+def update_settings(payload: dict) -> dict:
+    settings = store.update_app_settings(payload)
+    return {"status": "updated", "settings": settings}
 
 
 @app.get("/ai/memory/{vehicle_id}")

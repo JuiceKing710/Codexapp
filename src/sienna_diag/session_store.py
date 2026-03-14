@@ -45,6 +45,8 @@ class SessionStore:
         self.users_by_email: dict[str, dict] = {}
         self.users_by_id: dict[str, User] = {}
         self.user_profiles: dict[str, UserProfile] = {}
+
+        self.app_settings_by_user: dict[str, dict] = defaultdict(dict)
         self.knowledge_library: dict[str, dict] = {
             "dtc_definitions": {
                 "P0300": "Random/multiple cylinder misfire detected.",
@@ -74,7 +76,19 @@ class SessionStore:
         demo_user = User(user_id="demo", email="demo@local", display_name="Demo Tester")
         self.users_by_id[demo_user.user_id] = demo_user
         self.user_profiles[demo_user.user_id] = UserProfile(user_id=demo_user.user_id)
+        self.app_settings_by_user[demo_user.user_id] = self._default_app_settings()
         self._seed_vehicles_for_user(demo_user.user_id)
+
+    def _default_app_settings(self) -> dict:
+        return {
+            "units": "metric",
+            "polling_preferences": {"interval_ms": 500, "auto_start_after_connect": True},
+            "alert_preferences": {"proactive_alerts": True, "severity_threshold": "suspected"},
+            "theme": "futuristic-dark",
+            "adapter_settings": {"preferred_adapter": "OBDLink MX+", "reconnect_enabled": True},
+            "voice_options": {"speech_output": True, "speech_input": True},
+            "ai_behavior_controls": {"confidence_display": True, "explain_reasoning": True},
+        }
 
     def _seed_vehicles_for_user(self, user_id: str) -> None:
         if self.vehicles_by_user[user_id]:
@@ -111,6 +125,7 @@ class SessionStore:
         self.users_by_email[key] = {"user_id": user.user_id, "password_hash": password_hash}
         self.users_by_id[user.user_id] = user
         self.user_profiles[user.user_id] = UserProfile(user_id=user.user_id)
+        self.app_settings_by_user[user.user_id] = self._default_app_settings()
         self._seed_vehicles_for_user(user.user_id)
         return user
 
@@ -294,8 +309,17 @@ class SessionStore:
         return {
             "vehicle_profile": self.vehicles_by_user[uid].get(vehicle_id).model_dump() if vehicle_id in self.vehicles_by_user[uid] else None,
             "vin": None,
+            "vehicle_metadata": {},
+            "module_inventory": [],
+            "supported_pids": [],
+            "supported_commands": [],
+            "baseline_sensor_ranges": {},
             "prior_vehicle_checks": [],
             "dtc_history": [],
+            "repair_history": [],
+            "ai_alerts": [],
+            "guided_test_history": [],
+            "recurring_issues": [],
             "sensor_patterns": [],
             "user_symptoms": [],
             "notes": [],
@@ -303,6 +327,12 @@ class SessionStore:
             "unresolved_issues": [],
             "false_positives": [],
             "confidence_tags": [],
+            "change_tracking": {
+                "changed": [],
+                "returned": [],
+                "worsened": [],
+                "improved": [],
+            },
             "last_updated": None,
         }
 
@@ -376,6 +406,26 @@ class SessionStore:
     def get_guided_diagnosis_results(self, session_id: str, user_id: str | None = None) -> list[dict]:
         self.get_session(session_id, user_id=user_id)
         return self.guided_diagnosis_results_by_session.get(session_id, [])
+
+
+    def get_app_settings(self, user_id: str | None = None) -> dict:
+        uid = self._default_user_id(user_id)
+        if uid not in self.app_settings_by_user or not self.app_settings_by_user[uid]:
+            self.app_settings_by_user[uid] = self._default_app_settings()
+        return self.app_settings_by_user[uid]
+
+    def update_app_settings(self, updates: dict, user_id: str | None = None) -> dict:
+        uid = self._default_user_id(user_id)
+        settings = self.get_app_settings(user_id=uid)
+        for key, value in updates.items():
+            if value is None:
+                continue
+            if isinstance(settings.get(key), dict) and isinstance(value, dict):
+                settings[key].update(value)
+            else:
+                settings[key] = value
+        return settings
+
 
 
     @property
