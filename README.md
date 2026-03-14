@@ -260,3 +260,71 @@ New phone bridge routes:
    - mode/source = `PHONE-LIVE`
 8. Confirm gauge cards display current value, timestamp, and source label.
 9. To test disconnect handling, call `POST /phone/bridge/disconnect` and confirm dashboard shows disconnected/offline state.
+
+## Capacitor hybrid-mobile packaging (Phase 4)
+
+A Capacitor wrapper is now included under `mobile/` so production Bluetooth ownership stays inside the installed iOS/Android app.
+
+### Added mobile project files
+
+- `mobile/capacitor.config.ts` - Capacitor app configuration and backend URL wiring.
+- `mobile/package.json` - Capacitor CLI/runtime scripts.
+- `mobile/src/bridge/obdBridge.ts` - Typed native bridge contract used by app JS.
+- `mobile/ios/App/App/ObdBridgePlugin.swift` - iOS CoreBluetooth bridge entry points.
+- `mobile/android/app/src/main/java/com/zeb/obdai/ObdBridgePlugin.kt` - Android Bluetooth bridge entry points.
+- `src/sienna_diag/api/static/mobile-bridge.js` - runtime shim exposing `window.MobileBluetoothService`.
+
+### Native bridge contract
+
+The bridge exposes:
+
+- `connectToAdapter()`
+- `disconnectAdapter()`
+- `getConnectionState()`
+- `readPid(pid)`
+- `readVin()`
+- `reconnectIfNeeded()`
+- `startPolling(config)`
+- `stopPolling()`
+- `getBridgeDiagnostics()`
+
+Browser debug mode remains available, but if the native bridge is unavailable the runtime reports: `Live Bluetooth requires the mobile app`.
+
+### Build and run (iPhone)
+
+```bash
+cd mobile
+npm install
+npx cap sync ios
+npx cap open ios
+```
+
+In Xcode:
+1. Set signing/team.
+2. Add Bluetooth plist entries from `mobile/ios/App/App/Info.plist.additions`.
+3. Set a reachable backend URL in `ZEB_BACKEND_URL` before sync/build.
+4. Run on a physical iPhone and connect OBDLink MX+.
+
+### Build and run (Android)
+
+```bash
+cd mobile
+npm install
+npx cap sync android
+npx cap open android
+```
+
+In Android Studio:
+1. Confirm Bluetooth permissions in `AndroidManifest.xml`.
+2. Build/install on a physical Android device.
+3. Connect OBDLink MX+ and open `/dashboard` through the Capacitor shell.
+
+### Production test flow
+
+1. Press **Connect Vehicle** in the mobile app.
+2. Confirm bridge diagnostics show native bridge available.
+3. Confirm automatic polling starts at 500 ms.
+4. Confirm first successful live read is ingested.
+5. Confirm `current_mode` switches to `PHONE-LIVE`.
+6. Open **Live Gauges** and verify values update.
+7. Confirm AI monitoring/alerts move to active once live reads are present.

@@ -2788,6 +2788,7 @@ def dashboard() -> str:
     <div class="tiny" id="tagConfirmMsg"></div>
   </div>
 </div>
+<script src="/static/mobile-bridge.js"></script>
 <script type="module">
 import * as THREE from 'https://unpkg.com/three@0.162.0/build/three.module.js';
 
@@ -5500,6 +5501,7 @@ def dashboard() -> str:
     <div class="tiny" id="tagConfirmMsg"></div>
   </div>
 </div>
+<script src="/static/mobile-bridge.js"></script>
 <script type="module">
 import * as THREE from 'https://unpkg.com/three@0.162.0/build/three.module.js';
 
