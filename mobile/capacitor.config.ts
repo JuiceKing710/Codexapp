@@ -14,6 +14,14 @@ const config: CapacitorConfig = {
     SplashScreen: {
       launchShowDuration: 300,
     },
+    BluetoothLe: {
+      displayStrings: {
+        scanning: 'Searching for OBDLink MX+ adapter',
+        cancel: 'Cancel',
+        availableDevices: 'Nearby OBD adapters',
+        noDeviceFound: 'No supported adapter found',
+      },
+    },
   },
 };
 

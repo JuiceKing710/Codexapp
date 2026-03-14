@@ -19,50 +19,58 @@
     return global.Capacitor?.Plugins?.ObdBridge || null;
   }
 
+  async function callBridge(primaryName, fallbackName, ...args){
+    const p = plugin();
+    const fn = p?.[primaryName] || (fallbackName ? p?.[fallbackName] : null);
+    if(!fn){ return null; }
+    return fn.apply(p, args);
+  }
+
   const service = {
-    async connectToAdapter(){
-      const p = plugin();
-      if(!p?.connectToAdapter){ return unsupported('Live Bluetooth requires the mobile app'); }
-      return p.connectToAdapter();
+    async connectAdapter(){
+      const res = await callBridge('connectAdapter', 'connectToAdapter');
+      if(!res){ return unsupported('Live Bluetooth requires the mobile app'); }
+      return res;
     },
+    async connectToAdapter(){ return this.connectAdapter(); },
     async disconnectAdapter(){
-      const p = plugin();
-      if(!p?.disconnectAdapter){ return { status: 'disconnected' }; }
-      return p.disconnectAdapter();
+      const res = await callBridge('disconnectAdapter');
+      return res || { status: 'disconnected' };
     },
     async getConnectionState(){
-      const p = plugin();
-      if(!p?.getConnectionState){ return { status: 'disconnected' }; }
-      return p.getConnectionState();
+      const res = await callBridge('getConnectionState');
+      return res || { status: 'disconnected' };
     },
-    async readPid(pid){
+    async sendPIDCommand(command){
       const p = plugin();
-      if(!p?.readPid){ throw new Error('Live Bluetooth requires the mobile app'); }
-      return p.readPid({ pid });
+      const fn = p?.sendPIDCommand || (p?.readPid ? (cmd) => p.readPid({ pid: cmd }) : null);
+      if(!fn){ throw new Error('Live Bluetooth requires the mobile app'); }
+      return fn.call(p, command);
+    },
+    async readPid(pid){ return this.sendPIDCommand(pid); },
+    async receivePIDResponse(){
+      const res = await callBridge('receivePIDResponse');
+      return res || { raw_response: null };
     },
     async readVin(){
-      const p = plugin();
-      if(!p?.readVin){ return { vin: null, raw_response: null }; }
-      return p.readVin();
+      const res = await callBridge('readVin');
+      return res || { vin: null, raw_response: null };
     },
     async reconnectIfNeeded(){
-      const p = plugin();
-      if(!p?.reconnectIfNeeded){ return { status: 'failed', reconnected: false }; }
-      return p.reconnectIfNeeded();
+      const res = await callBridge('reconnectIfNeeded');
+      return res || { status: 'failed', reconnected: false };
     },
     async startPolling(config){
-      const p = plugin();
-      if(!p?.startPolling){ return { started: false }; }
-      return p.startPolling(config || { intervalMs: 500, pids: [] });
+      const res = await callBridge('startPolling', null, config || { intervalMs: 500, pids: [] });
+      return res || { started: false };
     },
     async stopPolling(){
-      const p = plugin();
-      if(!p?.stopPolling){ return { stopped: true }; }
-      return p.stopPolling();
+      const res = await callBridge('stopPolling');
+      return res || { stopped: true };
     },
     async getBridgeDiagnostics(){
-      const p = plugin();
-      if(!p?.getBridgeDiagnostics){
+      const res = await callBridge('getBridgeDiagnostics');
+      if(!res){
         return {
           platform,
           native_bridge_available: false,
@@ -74,7 +82,7 @@
           fallback_reason: 'Live Bluetooth requires the mobile app',
         };
       }
-      return p.getBridgeDiagnostics();
+      return res;
     },
   };
 
