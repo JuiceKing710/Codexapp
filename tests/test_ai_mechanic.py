@@ -271,3 +271,55 @@ def test_vehicle_visualization_highlight_and_explain_endpoints() -> None:
     explain = client.get("/vehicle-visualization/explain", params={"component": "thermostat"})
     assert explain.status_code == 200
     assert "coolant" in explain.json()["explanation"].lower()
+
+
+def test_settings_endpoints_support_runtime_preferences() -> None:
+    _reset_state()
+
+    get_response = client.get("/settings")
+    assert get_response.status_code == 200
+    settings = get_response.json()["settings"]
+    assert settings["polling_preferences"]["interval_ms"] == 500
+
+    update_response = client.post(
+        "/settings",
+        json={"theme": "light", "voice_options": {"speech_output": False}},
+    )
+    assert update_response.status_code == 200
+    updated = update_response.json()["settings"]
+    assert updated["theme"] == "light"
+    assert updated["voice_options"]["speech_output"] is False
+
+
+def test_vehicle_memory_includes_self_learning_profile_fields() -> None:
+    _reset_state()
+
+    response = client.get("/ai/memory/toyota_sienna_2006")
+    assert response.status_code == 200
+    memory = response.json()["memory"]
+
+    assert "supported_pids" in memory
+    assert "supported_commands" in memory
+    assert "baseline_sensor_ranges" in memory
+    assert "repair_history" in memory
+    assert "guided_test_history" in memory
+    assert "recurring_issues" in memory
+    assert "change_tracking" in memory
+
+
+def test_vehicle_intelligence_core_includes_required_modules() -> None:
+    _reset_state()
+    store.create_session(vehicle_id="toyota_sienna_2006")
+
+    response = client.get("/dashboard/state")
+    assert response.status_code == 200
+    core = response.json()["vehicle_intelligence_core"]
+
+    assert "vehicle_identity_manager" in core
+    assert "live_telemetry_engine" in core
+    assert "diagnostic_state_engine" in core
+    assert "ai_context_builder" in core
+    assert "command_learning_engine" in core
+    assert "timeline_engine" in core
+    assert "visualization_engine" in core
+    assert "reporting_engine" in core
