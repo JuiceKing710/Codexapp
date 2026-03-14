@@ -2812,7 +2812,7 @@ function logBridge(event, details={}){
 }
 function detectTransport(){
   const service = window.MobileBluetoothService || null;
-  const hasNativeBridge = Boolean(service && typeof service.connectToAdapter === 'function' && typeof service.readPid === 'function');
+  const hasNativeBridge = Boolean(service && (typeof service.connectAdapter === 'function' || typeof service.connectToAdapter === 'function') && (typeof service.sendPIDCommand === 'function' || typeof service.readPid === 'function'));
   const platform = /iphone|ipad|ipod/.test(navigator.userAgent.toLowerCase()) ? 'ios' : /android/.test(navigator.userAgent.toLowerCase()) ? 'android' : 'browser';
   const supported = hasNativeBridge;
   const reason = supported ? null : 'unsupported-environment-native-bridge-missing';
@@ -2940,9 +2940,11 @@ function setButtonState(buttonId, tone, stateText, active=false, pulse=false, ar
 }
 async function readNativePid(sensor){
   const service = getMobileBluetoothService();
-  if(!service || typeof service.readPid !== 'function'){ return null; }
+  if(!service || (typeof service.sendPIDCommand !== 'function' && typeof service.readPid !== 'function')){ return null; }
   try {
-    const nativeRead = await service.readPid(SENSOR_TO_PID[sensor]);
+    const nativeRead = typeof service.sendPIDCommand === 'function'
+      ? await service.sendPIDCommand(SENSOR_TO_PID[sensor])
+      : await service.readPid(SENSOR_TO_PID[sensor]);
     if(!nativeRead){ return null; }
     const rawResponse = nativeRead.raw_response || nativeRead.rawResponse || null;
     if(!rawResponse){ return null; }
@@ -3169,10 +3171,10 @@ function renderBluetoothCard(){
   document.getElementById('btError').textContent = phoneBridge.failure_message || phoneBridge.last_error || 'No Bluetooth errors';
   const detailRows = [
     { label: 'Connection method', value: bridgeDebug.selected_transport === 'PHONE-LIVE' ? 'Native phone bridge' : 'Unavailable in this browser' },
-    { label: 'Native bridge available', value: bridgeDebug.native_bridge_available ? 'Yes' : 'No' },
+    { label: 'Native bridge detected', value: bridgeDebug.native_bridge_available ? 'Yes' : 'No' },
     { label: 'Bluetooth link', value: phoneBridge.bluetooth_connected ? 'Connected' : 'Idle' },
-    { label: 'Polling state', value: `${phoneBridge.polling_active ? 'Active' : 'Inactive'} (${phoneBridge.polling_state || 'inactive'})` },
-    { label: 'First live read', value: phoneBridge.first_live_read_received ? 'Received' : 'Pending' },
+    { label: 'Polling active', value: `${phoneBridge.polling_active ? 'Yes' : 'No'} (${phoneBridge.polling_state || 'inactive'})` },
+    { label: 'First PID read success', value: phoneBridge.first_live_read_received ? 'Yes' : 'Pending' },
     { label: 'Source mode', value: phoneBridge.current_source_mode || phoneBridge.source_mode || 'unknown' },
     { label: 'Last PID command', value: phoneBridge.last_live_pid_command || 'None' },
     { label: 'Last PID response', value: phoneBridge.last_live_pid_response || 'None' },
@@ -3252,10 +3254,29 @@ async function pollLiveSensorsOnce(){
     await fetchState();
   }
 }
-function startLivePolling(){ if(livePollingHandle){return;} logBridge('polling-armed',{interval:500}); pollLiveSensorsOnce(); livePollingHandle=setInterval(()=>{pollLiveSensorsOnce();},500); }
-function stopLivePolling(){ if(livePollingHandle){ clearInterval(livePollingHandle); livePollingHandle=null; } }
+async function startLivePolling(){
+  if(livePollingHandle){return;}
+  const service = getMobileBluetoothService();
+  if(service?.startPolling){
+    try {
+      await service.startPolling({ intervalMs: 500, pids: LIVE_SENSOR_ORDER.map(sensor => SENSOR_TO_PID[sensor]).filter(Boolean) });
+    } catch (error) {
+      bridgeDebug.last_error = error?.message || 'native-start-polling-failed';
+    }
+  }
+  logBridge('polling-armed',{interval:500});
+  pollLiveSensorsOnce();
+  livePollingHandle=setInterval(()=>{pollLiveSensorsOnce();},500);
+}
+async function stopLivePolling(){
+  if(livePollingHandle){ clearInterval(livePollingHandle); livePollingHandle=null; }
+  const service = getMobileBluetoothService();
+  if(service?.stopPolling){
+    try { await service.stopPolling(); } catch (_error) { }
+  }
+}
 function syncLivePolling(){ if((phoneBridge.status||'disconnected')==='connected' && phoneBridge.transport_supported && state?.active_session && (phoneBridge.polling_state||'inactive')!=='inactive'){ startLivePolling(); return; } stopLivePolling(); }
-async function stopSession(){ stopLivePolling(); await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
+async function stopSession(){ await stopLivePolling(); await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
 async function startCapture(){
   if(!isConnectedForActions()){ alert('Start Capture is locked until connection is confirmed with live telemetry.'); return; }
   await ensureSession();
@@ -3292,7 +3313,8 @@ async function connectVehicle(){
   } else {
     try {
       logBridge('connection-attempt-started',{ platform: transport.platform });
-      connectPayload = normalizeConnectPayload(await transport.service.connectToAdapter(), transport);
+      const connectFn = transport.service.connectAdapter || transport.service.connectToAdapter;
+      connectPayload = normalizeConnectPayload(await connectFn.call(transport.service), transport);
       logBridge(connectPayload.status === 'connected' ? 'connection-success' : 'connection-failure', connectPayload);
     } catch (error) {
       connectPayload = normalizeConnectPayload({status:'failed',fallback_reason:error?.message || 'native-connect-failed'}, transport);
@@ -3304,7 +3326,7 @@ async function connectVehicle(){
     alert('Connection request failed. Please retry.');
   }
   await fetchState();
-  if(connectPayload.status==='connected'){ startLivePolling(); }
+  if(connectPayload.status==='connected'){ await startLivePolling(); }
 }
 async function syncHighlight(action,component,system,source='user'){ await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,component,system,source})}); }
 async function explainSelected(){ const comp=document.getElementById('componentExplainBtn').dataset.component; if(!comp){return;} const res=await fetch(`/vehicle-visualization/explain?component=${encodeURIComponent(comp)}`); const data=await res.json(); alert(`${data.component.replace(/_/g,' ')}: ${data.explanation}`); }
@@ -3347,7 +3369,7 @@ function gaugeSvg(g,read){const raw=read?.value??null;const n=Number(raw);const 
 function render(){document.getElementById('gaugeGrid').innerHTML=gauges.map(g=>gaugeSvg(g,latest(g.key))).join('');document.getElementById('statusText').textContent=`Transport status: ${(phoneBridge.status||'disconnected')} · ${(phoneBridge.polling_state||'inactive')}`;}
 async function fetchState(){const res=await fetch('/dashboard/state');state=await res.json();phoneBridge={...phoneBridge,...state.phone_bridge};render();syncPolling();}
 async function ensureSession(){if(state?.active_session)return state.active_session;await fetch('/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vehicle_id:'toyota_sienna_2006'})});await fetchState();return state.active_session;}
-async function readPid(g){const svc=getService();if(!svc||typeof svc.readPid!=='function')return null;try{const n=await svc.readPid(g.pid);if(!n)return null;const raw=n.raw_response||n.rawResponse||null;if(!raw)return null;return {command:g.pid,pid_key:g.key,source_mode:n.source_mode||'PHONE-LIVE',source_hint:n.source_hint||'iso9141_2',raw_response:raw,value:n.value??null,unit:n.unit??g.unit,latency_ms:n.latency_ms??null,polling:true};}catch{return null;}}
+async function readPid(g){const svc=getService();if(!svc||(typeof svc.sendPIDCommand!=='function'&&typeof svc.readPid!=='function'))return null;try{const n=typeof svc.sendPIDCommand==='function'?await svc.sendPIDCommand(g.pid):await svc.readPid(g.pid);if(!n)return null;const raw=n.raw_response||n.rawResponse||null;if(!raw)return null;return {command:g.pid,pid_key:g.key,source_mode:n.source_mode||'PHONE-LIVE',source_hint:n.source_hint||'iso9141_2',raw_response:raw,value:n.value??null,unit:n.unit??g.unit,latency_ms:n.latency_ms??null,polling:true};}catch{return null;}}
 async function pollOnce(){if(pollingInFlight)return;if((phoneBridge.status||'disconnected')!=='connected')return;const svc=getService();if(!svc||typeof svc.readPid!=='function')return;const sess=await ensureSession();pollingInFlight=true;try{const vals=await Promise.allSettled(gauges.map(readPid));const jobs=vals.filter(v=>v.status==='fulfilled'&&v.value).map(v=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sess.session_id,vehicle_id:sess.vehicle_id,...v.value})}));if(jobs.length)await Promise.allSettled(jobs);}finally{pollingInFlight=false;await fetchState();}}
 function syncPolling(){if((phoneBridge.status||'disconnected')==='connected'&&(phoneBridge.polling_state||'inactive')!=='inactive'){if(!polling){polling=setInterval(pollOnce,500);pollOnce();}}else if(polling){clearInterval(polling);polling=null;}}
 document.getElementById('backBtn').onclick=()=>window.location.href='/dashboard';document.getElementById('loadPresetBtn').onclick=()=>{gauges=[...DEFAULT_GAUGES];render();};fetchState();
@@ -5525,7 +5547,7 @@ function logBridge(event, details={}){
 }
 function detectTransport(){
   const service = window.MobileBluetoothService || null;
-  const hasNativeBridge = Boolean(service && typeof service.connectToAdapter === 'function' && typeof service.readPid === 'function');
+  const hasNativeBridge = Boolean(service && (typeof service.connectAdapter === 'function' || typeof service.connectToAdapter === 'function') && (typeof service.sendPIDCommand === 'function' || typeof service.readPid === 'function'));
   const platform = /iphone|ipad|ipod/.test(navigator.userAgent.toLowerCase()) ? 'ios' : /android/.test(navigator.userAgent.toLowerCase()) ? 'android' : 'browser';
   const supported = hasNativeBridge;
   const reason = supported ? null : 'unsupported-environment-native-bridge-missing';
@@ -5653,9 +5675,11 @@ function setButtonState(buttonId, tone, stateText, active=false, pulse=false, ar
 }
 async function readNativePid(sensor){
   const service = getMobileBluetoothService();
-  if(!service || typeof service.readPid !== 'function'){ return null; }
+  if(!service || (typeof service.sendPIDCommand !== 'function' && typeof service.readPid !== 'function')){ return null; }
   try {
-    const nativeRead = await service.readPid(SENSOR_TO_PID[sensor]);
+    const nativeRead = typeof service.sendPIDCommand === 'function'
+      ? await service.sendPIDCommand(SENSOR_TO_PID[sensor])
+      : await service.readPid(SENSOR_TO_PID[sensor]);
     if(!nativeRead){ return null; }
     const rawResponse = nativeRead.raw_response || nativeRead.rawResponse || null;
     if(!rawResponse){ return null; }
@@ -5882,10 +5906,10 @@ function renderBluetoothCard(){
   document.getElementById('btError').textContent = phoneBridge.failure_message || phoneBridge.last_error || 'No Bluetooth errors';
   const detailRows = [
     { label: 'Connection method', value: bridgeDebug.selected_transport === 'PHONE-LIVE' ? 'Native phone bridge' : 'Unavailable in this browser' },
-    { label: 'Native bridge available', value: bridgeDebug.native_bridge_available ? 'Yes' : 'No' },
+    { label: 'Native bridge detected', value: bridgeDebug.native_bridge_available ? 'Yes' : 'No' },
     { label: 'Bluetooth link', value: phoneBridge.bluetooth_connected ? 'Connected' : 'Idle' },
-    { label: 'Polling state', value: `${phoneBridge.polling_active ? 'Active' : 'Inactive'} (${phoneBridge.polling_state || 'inactive'})` },
-    { label: 'First live read', value: phoneBridge.first_live_read_received ? 'Received' : 'Pending' },
+    { label: 'Polling active', value: `${phoneBridge.polling_active ? 'Yes' : 'No'} (${phoneBridge.polling_state || 'inactive'})` },
+    { label: 'First PID read success', value: phoneBridge.first_live_read_received ? 'Yes' : 'Pending' },
     { label: 'Source mode', value: phoneBridge.current_source_mode || phoneBridge.source_mode || 'unknown' },
     { label: 'Last PID command', value: phoneBridge.last_live_pid_command || 'None' },
     { label: 'Last PID response', value: phoneBridge.last_live_pid_response || 'None' },
@@ -5965,10 +5989,29 @@ async function pollLiveSensorsOnce(){
     await fetchState();
   }
 }
-function startLivePolling(){ if(livePollingHandle){return;} logBridge('polling-armed',{interval:500}); pollLiveSensorsOnce(); livePollingHandle=setInterval(()=>{pollLiveSensorsOnce();},500); }
-function stopLivePolling(){ if(livePollingHandle){ clearInterval(livePollingHandle); livePollingHandle=null; } }
+async function startLivePolling(){
+  if(livePollingHandle){return;}
+  const service = getMobileBluetoothService();
+  if(service?.startPolling){
+    try {
+      await service.startPolling({ intervalMs: 500, pids: LIVE_SENSOR_ORDER.map(sensor => SENSOR_TO_PID[sensor]).filter(Boolean) });
+    } catch (error) {
+      bridgeDebug.last_error = error?.message || 'native-start-polling-failed';
+    }
+  }
+  logBridge('polling-armed',{interval:500});
+  pollLiveSensorsOnce();
+  livePollingHandle=setInterval(()=>{pollLiveSensorsOnce();},500);
+}
+async function stopLivePolling(){
+  if(livePollingHandle){ clearInterval(livePollingHandle); livePollingHandle=null; }
+  const service = getMobileBluetoothService();
+  if(service?.stopPolling){
+    try { await service.stopPolling(); } catch (_error) { }
+  }
+}
 function syncLivePolling(){ if((phoneBridge.status||'disconnected')==='connected' && phoneBridge.transport_supported && state?.active_session && (phoneBridge.polling_state||'inactive')!=='inactive'){ startLivePolling(); return; } stopLivePolling(); }
-async function stopSession(){ stopLivePolling(); await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
+async function stopSession(){ await stopLivePolling(); await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
 async function startCapture(){
   if(!isConnectedForActions()){ alert('Start Capture is locked until connection is confirmed with live telemetry.'); return; }
   await ensureSession();
@@ -6005,7 +6048,8 @@ async function connectVehicle(){
   } else {
     try {
       logBridge('connection-attempt-started',{ platform: transport.platform });
-      connectPayload = normalizeConnectPayload(await transport.service.connectToAdapter(), transport);
+      const connectFn = transport.service.connectAdapter || transport.service.connectToAdapter;
+      connectPayload = normalizeConnectPayload(await connectFn.call(transport.service), transport);
       logBridge(connectPayload.status === 'connected' ? 'connection-success' : 'connection-failure', connectPayload);
     } catch (error) {
       connectPayload = normalizeConnectPayload({status:'failed',fallback_reason:error?.message || 'native-connect-failed'}, transport);
@@ -6017,7 +6061,7 @@ async function connectVehicle(){
     alert('Connection request failed. Please retry.');
   }
   await fetchState();
-  if(connectPayload.status==='connected'){ startLivePolling(); }
+  if(connectPayload.status==='connected'){ await startLivePolling(); }
 }
 async function syncHighlight(action,component,system,source='user'){ await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,component,system,source})}); }
 async function explainSelected(){ const comp=document.getElementById('componentExplainBtn').dataset.component; if(!comp){return;} const res=await fetch(`/vehicle-visualization/explain?component=${encodeURIComponent(comp)}`); const data=await res.json(); alert(`${data.component.replace(/_/g,' ')}: ${data.explanation}`); }

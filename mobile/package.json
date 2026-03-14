@@ -9,12 +9,15 @@
     "open:ios": "npx cap open ios",
     "open:android": "npx cap open android",
     "run:ios": "npx cap run ios",
-    "run:android": "npx cap run android"
+    "run:android": "npx cap run android",
+    "build:ios": "npm run sync && npx cap build ios",
+    "build:android": "npm run sync && npx cap build android"
   },
   "dependencies": {
     "@capacitor/android": "^6.2.0",
     "@capacitor/cli": "^6.2.0",
     "@capacitor/core": "^6.2.0",
-    "@capacitor/ios": "^6.2.0"
+    "@capacitor/ios": "^6.2.0",
+    "@capacitor-community/bluetooth-le": "^7.1.0"
   }
 }

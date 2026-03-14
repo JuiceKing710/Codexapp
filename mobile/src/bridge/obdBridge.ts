@@ -33,15 +33,20 @@ export interface BridgeDiagnostics {
 }
 
 export interface ObdBridgePlugin {
-  connectToAdapter(): Promise<{ status: ConnectionState; adapter_name?: string }>;
+  connectAdapter(): Promise<{ status: ConnectionState; adapter_name?: string }>;
   disconnectAdapter(): Promise<{ status: ConnectionState }>;
   getConnectionState(): Promise<{ status: ConnectionState }>;
-  readPid(options: { pid: string }): Promise<OBDReadResult>;
-  readVin(): Promise<{ vin: string | null; raw_response?: string | null }>;
-  reconnectIfNeeded(): Promise<{ status: ConnectionState; reconnected: boolean }>;
+  sendPIDCommand(options: { command: string }): Promise<OBDReadResult>;
+  receivePIDResponse(): Promise<{ raw_response?: string | null }>;
   startPolling(options: PollingConfig): Promise<{ started: boolean }>;
   stopPolling(): Promise<{ stopped: boolean }>;
   getBridgeDiagnostics(): Promise<BridgeDiagnostics>;
+
+  // Backward-compatible bridge calls used by existing dashboard scripts.
+  connectToAdapter?(): Promise<{ status: ConnectionState; adapter_name?: string }>;
+  readPid?(options: { pid: string }): Promise<OBDReadResult>;
+  readVin?(): Promise<{ vin: string | null; raw_response?: string | null }>;
+  reconnectIfNeeded?(): Promise<{ status: ConnectionState; reconnected: boolean }>;
 }
 
 export const ObdBridge = registerPlugin<ObdBridgePlugin>('ObdBridge');
