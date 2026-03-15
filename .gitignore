@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+node_modules/
+ios/App/build/
+ios/App/App.xcodeproj/project.xcworkspace/xcuserdata/
+ios/App/App.xcodeproj/xcuserdata/

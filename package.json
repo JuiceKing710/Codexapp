@@ -1,0 +1,15 @@
+{
+  "name": "zebs-obd-ai-mobile-shell",
+  "private": true,
+  "scripts": {
+    "cap:add:ios": "npx cap add ios --packagemanager SPM",
+    "cap:copy:ios": "npx cap copy ios",
+    "cap:sync:ios": "npx cap sync ios",
+    "cap:open:ios": "npx cap open ios"
+  },
+  "dependencies": {
+    "@capacitor/cli": "^8.2.0",
+    "@capacitor/core": "^8.2.0",
+    "@capacitor/ios": "^8.2.0"
+  }
+}
