@@ -143,12 +143,14 @@ Key rules:
 
 - Browser `navigator.bluetooth` is no longer the production connection path.
 - Dashboard UI now calls a platform abstraction (`MobileBluetoothService`) with:
+  - `requestBluetoothPermission()`
   - `connectToAdapter()`
   - `disconnectAdapter()`
+  - `getConnectionState()`
   - `readPid(pid)`
   - `readVin()`
-  - `getConnectionState()`
-  - `reconnectIfNeeded()`
+  - `startPolling()`
+  - `stopPolling()`
 - Backend phone bridge endpoints only ingest phone-submitted reads/state and never attempt direct production Bluetooth access.
 - Source mode badges now support:
   - `MOCK`
@@ -164,13 +166,32 @@ VIN handling:
 
 ### iPhone/iPad production test steps
 
-1. Run backend and open `/dashboard` inside the mobile app webview/native shell.
-2. Tap **Connect Vehicle**.
-3. Confirm debug panel shows `platform=ios` or `platform=ipad`, and Bluetooth state `connected`.
-4. Confirm VIN read is attempted automatically (`last_vin_command=0902`).
-5. Tap **Read RPM** and verify latest read includes PID `010C` with source `PHONE-LIVE`.
-6. Tap **Read Coolant Temp** and verify latest read includes PID `0105` with source `PHONE-LIVE`.
-7. Confirm gauge page updates from latest session reads.
+1. Install Node dependencies once:
+   `npm install`
+2. Add the iOS shell if it is not already present:
+   `npm run cap:add:ios`
+3. Copy the current Capacitor web assets:
+   `npm run cap:copy:ios`
+4. Open [ios/App/App.xcodeproj](/Users/JuiceKing/Desktop/Codexapp/ios/App/App.xcodeproj) in Xcode.
+5. In the app target `Info`, set `ZebDashboardURL` to a reachable FastAPI dashboard URL.
+   - Local dev example: `http://<your-mac-lan-ip>:8000/dashboard`
+   - Hosted example: `https://<your-render-host>/dashboard`
+6. Let Xcode resolve the Swift package dependency for Capacitor, select a real iPhone, and run the app.
+7. On first launch, allow Bluetooth access when iOS prompts.
+8. Power the OBDLink MX+ adapter and tap **Connect Vehicle**.
+9. Confirm the dashboard debug panel shows:
+   - `native_bridge_available=true`
+   - `bluetooth_permission_status=granted`
+   - `adapter_discovery_started=true`
+   - `adapter_found=true`
+   - `adapter_connected=true`
+10. Confirm the first live command path completes:
+   - `first_pid_command_sent=true`
+   - `first_pid_response_received=true`
+   - `backend_ingest_success=true`
+   - `mode_switched_to_phone_live=true`
+11. Confirm the current mode is `PHONE-LIVE` and the last connection error remains `None`.
+12. Open **Live Gauges** and verify the dedicated gauge page updates from session reads without falling back to `BROWSER-DEV`.
 
 ### Android production test steps
 
@@ -204,6 +225,14 @@ uvicorn sienna_diag.api.main:app --reload --host 127.0.0.1 --port 8000
 ```
 6. Open dashboard.
 - [http://127.0.0.1:8000/dashboard](http://127.0.0.1:8000/dashboard)
+7. For real iPhone testing on the same LAN, bind FastAPI to your Mac's network interface instead:
+```bash
+uvicorn sienna_diag.api.main:app --reload --host 0.0.0.0 --port 8000
+```
+8. For the real iPhone shell, sync Capacitor changes after editing the app packaging:
+```bash
+npm run cap:sync:ios
+```
 
 ## Quick API examples
 

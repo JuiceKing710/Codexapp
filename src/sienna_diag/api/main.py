@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import secrets
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -33,13 +35,17 @@ from sienna_diag.models import (
     ReviewRequest,
     SessionCreateRequest,
     VehicleVisualizationHighlightRequest,
+    UserSignInRequest,
+    UserSignUpRequest,
+    UserProfileUpdateRequest,
+    VehicleProfile,
 )
 from sienna_diag.obd.adapter import OBDLinkAdapter
 from sienna_diag.preprocessing.pipeline import run_preprocessing
 from sienna_diag.review.lmstudio import local_llama_review
 from sienna_diag.review.openai_review import openai_second_opinion
 from sienna_diag.safety_policy import SafetyPolicy
-from sienna_diag.session_store import store
+from sienna_diag.session_store import set_active_user_context, store
 from sienna_diag.vehicle_image_library import vehicle_image_library
 
 
@@ -90,7 +96,8 @@ def _new_phone_bridge_state() -> dict:
         "platform": "unknown",
         "permission_state": "unknown",
         "source_mode": "PHONE-LIVE",
-        "supports_native_bluetooth": True,
+        "supports_native_bluetooth": False,
+        "phone_live_requested": False,
         "fallback_reason": None,
         "last_error": None,
         "last_command": None,
@@ -105,6 +112,7 @@ def _new_phone_bridge_state() -> dict:
         "vin_parse_status": "not-run",
         "vin": None,
         "updated_at": None,
+        "connection_sequence_started_at": None,
         "polling_state": "inactive",
         "polling_interval_ms": 500,
         "configured_gauge_pids": DEFAULT_LIVE_GAUGE_PIDS.copy(),
@@ -115,7 +123,49 @@ def _new_phone_bridge_state() -> dict:
     }
 
 
-phone_bridge_state = _new_phone_bridge_state()
+class UserScopedDict:
+    def __init__(self, factory):
+        self._factory = factory
+        self._data: dict[str, dict] = {}
+
+    def _bucket(self) -> dict:
+        user_id = store._default_user_id(None)
+        if user_id not in self._data:
+            self._data[user_id] = self._factory()
+        return self._data[user_id]
+
+    def get(self, key, default=None):
+        return self._bucket().get(key, default)
+
+    def __getitem__(self, key):
+        return self._bucket()[key]
+
+    def __setitem__(self, key, value):
+        self._bucket()[key] = value
+
+    def update(self, payload: dict):
+        self._bucket().update(payload)
+
+    def __iter__(self):
+        return iter(self._bucket())
+
+    def __len__(self):
+        return len(self._bucket())
+
+    def keys(self):
+        return self._bucket().keys()
+
+    def items(self):
+        return self._bucket().items()
+
+    def copy(self):
+        return dict(self._bucket())
+
+    def clear(self):
+        self._bucket().clear()
+
+
+phone_bridge_state = UserScopedDict(_new_phone_bridge_state)
 
 SAFE_EVENT_TAGS = [
     "engine start",
@@ -154,13 +204,36 @@ capture_thread: threading.Thread | None = None
 capture_status = "idle"
 capture_preset = "cold_start_capture"
 
-vehicle_visualization_state = {
+vehicle_visualization_state = UserScopedDict(lambda: {
     "action": None,
     "component": None,
     "system": None,
     "source": "system",
     "updated_at": None,
-}
+})
+
+
+
+auth_tokens: dict[str, str] = {}
+
+
+def _hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def _resolve_user_id(token: str | None) -> str:
+    if not token:
+        return "demo"
+    return auth_tokens.get(token, "demo")
+
+
+@app.middleware("http")
+async def bind_user_context(request: Request, call_next):
+    token = request.headers.get("x-session-token")
+    set_active_user_context(_resolve_user_id(token))
+    response = await call_next(request)
+    return response
+
 
 COMPONENT_EXPLANATIONS = {
     "thermostat": "Regulates coolant flow so the engine reaches and maintains normal operating temperature.",
@@ -251,10 +324,46 @@ def _mark_ingest_failure(status: str, error: str) -> None:
     _touch_phone_bridge(error=error)
 
 
+def _coerce_utc_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _reset_phone_connection_progress(*, anchor_now: bool) -> None:
+    phone_bridge_state["connection_sequence_started_at"] = (
+        datetime.now(timezone.utc).isoformat() if anchor_now else None
+    )
+    phone_bridge_state["last_command"] = None
+    phone_bridge_state["last_response"] = None
+    phone_bridge_state["last_latency_ms"] = None
+    phone_bridge_state["last_backend_acceptance_status"] = "idle"
+    phone_bridge_state["last_ingest_status"] = "idle"
+    phone_bridge_state["last_ingest_error"] = None
+    phone_bridge_state["backend_status"] = "idle"
+    phone_bridge_state["polling_state"] = "inactive"
+    phone_bridge_state["live_monitoring_state"] = "inactive"
+
+
 def _latest_phone_live_read(reads: list[dict]) -> dict | None:
+    connection_started_at = _coerce_utc_datetime(phone_bridge_state.get("connection_sequence_started_at"))
     for item in reversed(reads):
-        if item.get("source_mode") in PHONE_LIVE_SOURCE_MODES:
-            return item
+        if item.get("source_mode") not in PHONE_LIVE_SOURCE_MODES:
+            continue
+        if connection_started_at is not None:
+            read_ts = _coerce_utc_datetime(item.get("ts"))
+            if read_ts is None or read_ts < connection_started_at:
+                continue
+        return item
     return None
 
 
@@ -263,14 +372,23 @@ def _mock_mode_reason() -> str:
 
 
 def _derive_current_mode(reads: list[dict]) -> tuple[str, str | None]:
+    bridge_status = phone_bridge_state.get("status")
+    requested_mode = phone_bridge_state.get("source_mode")
     latest_live = _latest_phone_live_read(reads)
+    if bridge_status == "connected" and latest_live:
+        return "PHONE-LIVE", "Derived from the latest accepted phone-live read in the current connection sequence."
+    if bridge_status == "connected":
+        return "CONNECTED_WAITING_FOR_FIRST_READ", "Bluetooth is connected and polling has started, but the first live PID read has not been accepted yet."
+    if bridge_status == "connecting":
+        return "CONNECTING", f"Bluetooth transport is still connecting through {requested_mode or 'the selected bridge'}."
+    if bridge_status == "failed":
+        return "ERROR", phone_bridge_state.get("fallback_reason") or "Bluetooth transport did not connect."
+    if bridge_status == "disconnected" and (
+        phone_bridge_state.get("phone_live_requested") or requested_mode in PHONE_LIVE_SOURCE_MODES
+    ):
+        return "DISCONNECTED", "Bluetooth transport is not connected."
     if latest_live:
         return str(latest_live["source_mode"]), "Derived from the latest accepted phone-live read."
-    if phone_bridge_state.get("status") == "connected":
-        return "CONNECTED_WAITING_LIVE_READ", "Bluetooth is connected and polling has started, but the first live PID read has not been accepted yet."
-    requested_mode = phone_bridge_state.get("source_mode")
-    if requested_mode in PHONE_LIVE_SOURCE_MODES:
-        return str(requested_mode), f"Phone-live transport is selected while Bluetooth is {phone_bridge_state.get('status', 'disconnected')}."
     adapter_mode = adapter.mode_status()
     if adapter_mode == "MOCK":
         return "MOCK", _mock_mode_reason()
@@ -279,6 +397,23 @@ def _derive_current_mode(reads: list[dict]) -> tuple[str, str | None]:
 
 def _timeline_event_exists(session_id: str, event_type: str) -> bool:
     return any(item.event_type == event_type for item in store.get_timeline_events(session_id))
+
+
+def _build_connection_diagnostics(latest_live_read: dict | None, current_mode: str) -> dict:
+    status = phone_bridge_state.get("status")
+    permission_state = phone_bridge_state.get("permission_state") or "unknown"
+    return {
+        "native_bridge_available": bool(phone_bridge_state.get("supports_native_bluetooth")),
+        "bluetooth_permission_status": permission_state,
+        "adapter_discovery_started": status in {"connecting", "connected", "failed"},
+        "adapter_found": status == "connected",
+        "adapter_connection_attempted": status in {"connecting", "connected", "failed"},
+        "adapter_connected": status == "connected",
+        "first_pid_command_sent": bool(phone_bridge_state.get("last_command")),
+        "first_pid_response_received": latest_live_read is not None,
+        "backend_ingest_success": phone_bridge_state.get("last_backend_acceptance_status") == "accepted",
+        "mode_switched_to_phone_live": current_mode == "PHONE-LIVE",
+    }
 
 
 def _build_phone_bridge_snapshot(active: dict | None = None, reads: list[dict] | None = None) -> dict:
@@ -300,7 +435,7 @@ def _build_phone_bridge_snapshot(active: dict | None = None, reads: list[dict] |
         and latest_live_read is not None
     )
 
-    snapshot = dict(phone_bridge_state)
+    snapshot = phone_bridge_state.copy()
     snapshot.update({
         "bluetooth_connected": phone_bridge_state.get("status") == "connected",
         "polling_active": polling_active,
@@ -314,6 +449,7 @@ def _build_phone_bridge_snapshot(active: dict | None = None, reads: list[dict] |
         "mock_reason": _mock_mode_reason() if current_mode == "MOCK" else None,
         "last_successful_live_read": latest_live_read,
         "ai_monitoring_active": ai_monitoring_active,
+        "connection_diagnostics": _build_connection_diagnostics(latest_live_read, current_mode),
     })
     return snapshot
 
@@ -502,6 +638,71 @@ def stop_capture() -> dict:
         return {"status": capture_status}
 
 
+
+
+@app.post("/auth/signup")
+def auth_signup(payload: UserSignUpRequest) -> dict:
+    try:
+        user = store.register_user(email=payload.email, password_hash=_hash_password(payload.password), display_name=payload.display_name)
+    except ValueError:
+        raise HTTPException(status_code=409, detail="Email already exists")
+    token = secrets.token_urlsafe(24)
+    auth_tokens[token] = user.user_id
+    profile = store.get_user_profile(user.user_id)
+    return {"session_token": token, "user": user.model_dump(), "profile": profile.model_dump()}
+
+
+@app.post("/auth/signin")
+def auth_signin(payload: UserSignInRequest) -> dict:
+    user = store.authenticate_user(email=payload.email, password_hash=_hash_password(payload.password))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = secrets.token_urlsafe(24)
+    auth_tokens[token] = user.user_id
+    profile = store.get_user_profile(user.user_id)
+    return {"session_token": token, "user": user.model_dump(), "profile": profile.model_dump()}
+
+
+@app.post("/auth/signout")
+def auth_signout(x_session_token: str | None = Header(default=None)) -> dict:
+    if x_session_token:
+        auth_tokens.pop(x_session_token, None)
+    return {"status": "signed_out"}
+
+
+@app.get("/auth/me")
+def auth_me(x_session_token: str | None = Header(default=None)) -> dict:
+    user_id = _resolve_user_id(x_session_token)
+    user = store.get_user(user_id)
+    profile = store.get_user_profile(user_id)
+    return {"authenticated": user_id != "demo", "user": user.model_dump(), "profile": profile.model_dump()}
+
+
+@app.patch("/profile")
+def update_profile(payload: UserProfileUpdateRequest, x_session_token: str | None = Header(default=None)) -> dict:
+    user_id = _resolve_user_id(x_session_token)
+    if user_id == "demo":
+        raise HTTPException(status_code=401, detail="Authentication required")
+    user, profile = store.update_user_profile(user_id, payload.model_dump(exclude_none=True))
+    return {"user": user.model_dump(), "profile": profile.model_dump()}
+
+
+@app.post("/vehicles")
+def add_vehicle(payload: dict, x_session_token: str | None = Header(default=None)) -> dict:
+    user_id = _resolve_user_id(x_session_token)
+    if user_id == "demo":
+        raise HTTPException(status_code=401, detail="Authentication required")
+    vehicle = VehicleProfile(
+        vehicle_id=payload.get("vehicle_id") or secrets.token_hex(6),
+        user_id=user_id,
+        label=payload.get("nickname") or payload.get("label") or "Custom Vehicle",
+        protocol_hint=payload.get("protocol") or payload.get("protocol_hint") or "ISO_9141_2",
+        notes=payload.get("notes"),
+    )
+    saved = store.create_vehicle(user_id=user_id, vehicle=vehicle)
+    return saved.model_dump()
+
+
 @app.get("/health")
 def health() -> dict:
     bridge_snapshot = _build_phone_bridge_snapshot()
@@ -654,28 +855,28 @@ def phone_bridge_state_get() -> dict:
 def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
     previous_status = phone_bridge_state.get("status")
     previous_polling_state = phone_bridge_state.get("polling_state")
-    reads: list[dict] = []
-    if store.active_session_id:
-        reads = [item.model_dump() for item in store.get_reads(store.active_session_id)]
-    has_live_read = _latest_phone_live_read(reads) is not None
+    if payload.status in {"connecting", "failed"} or (payload.status == "connected" and previous_status != "connecting"):
+        _reset_phone_connection_progress(anchor_now=True)
 
     _touch_phone_bridge(status=payload.status, error=payload.fallback_reason if payload.status == "failed" else None)
     phone_bridge_state["platform"] = payload.platform
     phone_bridge_state["adapter_name"] = payload.adapter_name
     phone_bridge_state["permission_state"] = payload.permission_state or "unknown"
     phone_bridge_state["source_mode"] = payload.source_mode
+    phone_bridge_state["phone_live_requested"] = payload.source_mode == "PHONE-LIVE"
     phone_bridge_state["supports_native_bluetooth"] = payload.supports_native_bluetooth
     phone_bridge_state["fallback_reason"] = payload.fallback_reason
     phone_bridge_state["backend_status"] = (
         "connection-failed"
         if payload.status == "failed"
-        else ("awaiting-live-read" if payload.status == "connected" and not has_live_read else "phone-managed")
+        else ("awaiting-adapter" if payload.status == "connecting" else ("awaiting-live-read" if payload.status == "connected" else "disconnected"))
     )
     phone_bridge_state["polling_state"] = "starting" if payload.status == "connected" else "inactive"
-    phone_bridge_state["last_backend_acceptance_status"] = "pending" if payload.status == "connected" and not has_live_read else phone_bridge_state.get("last_backend_acceptance_status")
-    phone_bridge_state["last_ingest_status"] = "idle" if payload.status == "connected" else phone_bridge_state.get("last_ingest_status")
-    phone_bridge_state["last_ingest_error"] = None if payload.status == "connected" else phone_bridge_state.get("last_ingest_error")
-    phone_bridge_state["live_monitoring_state"] = "active" if payload.status == "connected" and has_live_read else ("waiting_for_first_live_read" if payload.status == "connected" else "inactive")
+    if payload.status == "connected":
+        phone_bridge_state["last_backend_acceptance_status"] = "pending"
+        phone_bridge_state["last_ingest_status"] = "idle"
+        phone_bridge_state["last_ingest_error"] = None
+    phone_bridge_state["live_monitoring_state"] = "waiting_for_first_live_read" if payload.status == "connected" else "inactive"
     phone_bridge_state["command_learning_status"] = "active" if payload.status == "connected" else "idle"
     if store.active_session_id and payload.status == "connected":
         if previous_status != "connected":
@@ -698,12 +899,14 @@ def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
 
 @app.post("/phone/bridge/disconnect")
 def phone_bridge_disconnect() -> dict:
+    previous_status = phone_bridge_state.get("status")
+    _reset_phone_connection_progress(anchor_now=True)
     _touch_phone_bridge(status="disconnected", error=None)
     phone_bridge_state["backend_status"] = "disconnected"
     phone_bridge_state["polling_state"] = "inactive"
     phone_bridge_state["live_monitoring_state"] = "inactive"
     phone_bridge_state["command_learning_status"] = "idle"
-    if store.active_session_id:
+    if store.active_session_id and previous_status == "connected":
         store.add_timeline_event(DiagnosticTimelineEvent(
             session_id=store.active_session_id,
             event_type="vehicle_disconnected",
@@ -1075,7 +1278,7 @@ def _vehicle_intelligence_core_snapshot(
 def vehicle_visualization_state_view() -> dict:
     return {
         "component_groups": VEHICLE_COMPONENT_GROUPS,
-        "highlight": vehicle_visualization_state,
+        "highlight": vehicle_visualization_state.copy(),
     }
 
 
@@ -1099,7 +1302,7 @@ def vehicle_visualization_highlight(payload: VehicleVisualizationHighlightReques
         "source": payload.source,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     })
-    return {"status": "ok", "highlight": vehicle_visualization_state}
+    return {"status": "ok", "highlight": vehicle_visualization_state.copy()}
 
 
 @app.get("/vehicle-visualization/explain")
@@ -1133,9 +1336,13 @@ def dashboard_state() -> dict:
     ai_monitoring = _build_ai_monitoring_snapshot(bridge_snapshot, alerts)
     core_snapshot = _vehicle_intelligence_core_snapshot(active, reads, events, alerts, bridge_snapshot, ai_monitoring)
 
+    current_user = store.get_user(store._default_user_id(None))
+    current_profile = store.get_user_profile(current_user.user_id)
     return {
         "app_id": settings.app_id,
         "display_name": settings.app_display_name,
+        "current_user": current_user.model_dump(),
+        "current_profile": current_profile.model_dump(),
         "vehicles": [item.model_dump() for item in store.list_vehicles()],
         "active_session": active,
         "adapter_mode": adapter.mode_status(),
@@ -1157,7 +1364,7 @@ def dashboard_state() -> dict:
         "learning_library": store.command_library,
         "vehicle_image": _resolve_vehicle_image(active.get("vehicle_id") if active else None),
         "ai_monitoring": ai_monitoring,
-        "vehicle_visualization": {"component_groups": VEHICLE_COMPONENT_GROUPS, "highlight": vehicle_visualization_state},
+        "vehicle_visualization": {"component_groups": VEHICLE_COMPONENT_GROUPS, "highlight": vehicle_visualization_state.copy()},
         "ai_alerts": [item.model_dump() for item in store.get_ai_alerts(active["session_id"])] if active else [],
         "diagnostic_timeline": [item.model_dump() for item in store.get_timeline_events(active["session_id"])] if active else [],
         "ai_response_history": [item.model_dump() for item in store.get_ai_responses(active["session_id"])] if active else [],
@@ -2310,6 +2517,7 @@ def dashboard() -> str:
             <span class="badge" id="sessionBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="sessionBadgeText">Vehicle Check Idle</span></span>
             <span class="badge" id="captureBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="captureBadgeText">Capture Idle</span></span>
             <span class="badge" id="modeBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="modeBadgeText">Standby</span></span>
+            <span class="badge" id="userBadge" data-tone="accent"><span class="badge-dot" aria-hidden="true"></span><span id="userBadgeText">Signed in: Demo Tester</span></span>
           </div>
         </aside>
       </div>
@@ -2624,18 +2832,511 @@ const SENSOR_TO_PID = { rpm:'010C', coolant_temp:'0105', control_module_voltage:
 const LIVE_SENSOR_ORDER = ['rpm', 'coolant_temp', 'control_module_voltage', 'vehicle_speed'];
 const LIVE_TELEMETRY_KEYS = ['rpm', 'coolant_temp', 'control_module_voltage', 'vehicle_speed', 'throttle_position'];
 const TOYOTA_PREMIUM_NAME = '2006 Toyota Sienna FWD V6 3.3L';
-function getMobileBluetoothService(){ return window.MobileBluetoothService || null; }
-function normalizeConnectPayload(payload){
-  const serviceAvailable = Boolean(getMobileBluetoothService());
+const IOS_NATIVE_APP_MESSAGE = 'Bluetooth live connection requires the native app on iPhone. Web Bluetooth is not available in this environment.';
+const MOBILE_NATIVE_APP_MESSAGE = 'Bluetooth live connection on phones must use the native Bluetooth bridge. Direct browser Bluetooth is disabled on mobile runtimes.';
+const GENERIC_UNSUPPORTED_MESSAGE = 'Bluetooth live connection is not available in this environment.';
+const REQUIRED_NATIVE_BRIDGE_METHODS = ['connectToAdapter', 'disconnectAdapter', 'getConnectionState', 'requestBluetoothPermission', 'readPid', 'readVin', 'startPolling', 'stopPolling'];
+const SAFE_BROWSER_ADAPTER_COMMANDS = ['ATZ', 'ATE0', 'ATL0', 'ATS0', 'ATH0', 'ATSP3'];
+const OBDLINK_BLE_UART_SERVICE_UUID = '0000fff0-0000-1000-8000-00805f9b34fb';
+const OBDLINK_BLE_UART_NOTIFY_UUID = '0000fff1-0000-1000-8000-00805f9b34fb';
+const OBDLINK_BLE_UART_WRITE_UUID = '0000fff2-0000-1000-8000-00805f9b34fb';
+const PID_RESPONSE_PREFIXES = {
+  '0105': '41 05',
+  '010C': '41 0C',
+  '010D': '41 0D',
+  '010F': '41 0F',
+  '0111': '41 11',
+  '012F': '41 2F',
+  '0142': '41 42',
+  '0902': '49 02 01',
+};
+let transportContext = {
+  selected_transport: 'unsupported',
+  runtime_platform: 'unknown',
+  native_bridge_detected: false,
+  navigator_bluetooth_available: false,
+  status_label: 'Unsupported environment',
+  message: GENERIC_UNSUPPORTED_MESSAGE,
+  last_connection_error: null,
+  first_pid_read_logged: false,
+};
+function emptyLocalConnectionDiagnostics(permissionStatus = 'unknown', nativeBridgeAvailable = false){
   return {
-    platform: payload?.platform || 'unknown',
-    adapter_name: payload?.adapter_name || payload?.adapterName || 'OBDLink MX+',
-    status: payload?.status || (serviceAvailable ? 'connected' : 'failed'),
-    permission_state: payload?.permission_state || payload?.permissionState || null,
-    source_mode: payload?.source_mode || payload?.sourceMode || 'PHONE-LIVE',
-    supports_native_bluetooth: payload?.supports_native_bluetooth ?? payload?.supportsNativeBluetooth ?? serviceAvailable,
-      fallback_reason: payload?.fallback_reason || payload?.fallbackReason || (serviceAvailable ? null : 'native-service-unavailable'),
+    native_bridge_available: nativeBridgeAvailable,
+    bluetooth_permission_status: permissionStatus,
+    adapter_discovery_started: false,
+    adapter_found: false,
+    adapter_connection_attempted: false,
+    adapter_connected: false,
+    first_pid_command_sent: false,
+    first_pid_response_received: false,
+    backend_ingest_success: false,
+    mode_switched_to_phone_live: false,
   };
+}
+let localConnectionDiagnostics = emptyLocalConnectionDiagnostics();
+let lastLoggedTransportSelection = '';
+function getMobileBluetoothService(){
+  const service = window.MobileBluetoothService || null;
+  if(!service){ return null; }
+  return REQUIRED_NATIVE_BRIDGE_METHODS.every((method) => typeof service[method] === 'function') ? service : null;
+}
+function webBluetoothAvailable(){
+  return Boolean(navigator.bluetooth && typeof navigator.bluetooth.requestDevice === 'function');
+}
+function inferRuntimePlatform(payload = null){
+  const declaredPlatform = String(payload?.platform || '').trim().toLowerCase();
+  if(['ios', 'ipad', 'android', 'browser'].includes(declaredPlatform)){
+    return declaredPlatform;
+  }
+  const userAgent = navigator.userAgent || '';
+  const touchMac = /Macintosh/.test(userAgent) && (navigator.maxTouchPoints || 0) > 1;
+  if(/iPad/.test(userAgent) || touchMac){ return 'ipad'; }
+  if(/iPhone|iPod/.test(userAgent)){ return 'ios'; }
+  if(/Android/.test(userAgent)){ return 'android'; }
+  return webBluetoothAvailable() ? 'browser' : 'unknown';
+}
+function isMobileRuntimePlatform(platform = inferRuntimePlatform()){
+  return ['ios', 'ipad', 'android'].includes(platform);
+}
+function nativeBridgeRequiredMessage(platform){
+  if(platform === 'ios' || platform === 'ipad'){
+    return IOS_NATIVE_APP_MESSAGE;
+  }
+  if(platform === 'android'){
+    return MOBILE_NATIVE_APP_MESSAGE;
+  }
+  return GENERIC_UNSUPPORTED_MESSAGE;
+}
+function isAppleTouchWebEnvironment(){
+  return typeof window.webkit === 'object' && (navigator.maxTouchPoints || 0) > 1;
+}
+function transportLog(event, extra = {}){
+  console.debug('[transport]', {
+    event,
+    selected_transport: transportContext.selected_transport,
+    runtime_platform: transportContext.runtime_platform,
+    native_bridge_detected: transportContext.native_bridge_detected,
+    navigator_bluetooth_available: transportContext.navigator_bluetooth_available,
+    last_connection_error: transportContext.last_connection_error,
+    ...extra,
+  });
+}
+function setLastConnectionError(error){
+  const nextError = error || null;
+  if(transportContext.last_connection_error === nextError){ return; }
+  transportContext = { ...transportContext, last_connection_error: nextError };
+  if(nextError){ transportLog('last connection error', { error: nextError }); }
+}
+function normalizeNativeDisconnectPayload(payload = {}){
+  const fallbackReason = payload?.fallback_reason || payload?.fallbackReason || payload?.last_error || payload?.lastError || 'adapter-disconnected';
+  return {
+    platform: payload?.platform || phoneBridge.platform || inferRuntimePlatform(),
+    adapter_name: payload?.adapter_name || payload?.adapterName || phoneBridge.adapter_name || 'OBDLink MX+',
+    status: 'disconnected',
+    permission_state: payload?.permission_state || payload?.permissionState || localConnectionDiagnostics.bluetooth_permission_status || 'unknown',
+    source_mode: payload?.source_mode || payload?.sourceMode || phoneBridge.source_mode || 'PHONE-LIVE',
+    supports_native_bluetooth: payload?.supports_native_bluetooth ?? payload?.supportsNativeBluetooth ?? true,
+    fallback_reason: fallbackReason,
+    last_error: fallbackReason,
+  };
+}
+function normalizePermissionStatus(value){
+  if(value === true){ return 'granted'; }
+  if(value === false){ return 'denied'; }
+  const normalized = String(value || 'unknown').trim().toLowerCase();
+  if(!normalized){ return 'unknown'; }
+  if(['authorized', 'allowed', 'granted'].includes(normalized)){ return 'granted'; }
+  if(['denied', 'blocked', 'restricted'].includes(normalized)){ return normalized; }
+  if(['prompt', 'prompt-with-rationale', 'not-determined', 'undetermined'].includes(normalized)){ return 'prompt'; }
+  return normalized;
+}
+function setLocalConnectionDiagnostics(updates = {}){
+  localConnectionDiagnostics = { ...localConnectionDiagnostics, ...updates };
+}
+function resetLocalConnectionDiagnostics({ permissionStatus, nativeBridgeAvailable } = {}){
+  const nextPermission = permissionStatus ?? localConnectionDiagnostics.bluetooth_permission_status ?? 'unknown';
+  const nextNativeBridge = nativeBridgeAvailable ?? localConnectionDiagnostics.native_bridge_available ?? false;
+  localConnectionDiagnostics = emptyLocalConnectionDiagnostics(nextPermission, nextNativeBridge);
+}
+function resolvedConnectionDiagnostics(){
+  const backend = phoneBridge.connection_diagnostics || {};
+  const backendPermission = normalizePermissionStatus(backend.bluetooth_permission_status || phoneBridge.permission_state);
+  const localPermission = normalizePermissionStatus(localConnectionDiagnostics.bluetooth_permission_status);
+  return {
+    native_bridge_available: Boolean(localConnectionDiagnostics.native_bridge_available || backend.native_bridge_available || transportContext.native_bridge_detected),
+    bluetooth_permission_status: localPermission !== 'unknown' ? localPermission : backendPermission,
+    adapter_discovery_started: Boolean(localConnectionDiagnostics.adapter_discovery_started || backend.adapter_discovery_started),
+    adapter_found: Boolean(localConnectionDiagnostics.adapter_found || backend.adapter_found),
+    adapter_connection_attempted: Boolean(localConnectionDiagnostics.adapter_connection_attempted || backend.adapter_connection_attempted),
+    adapter_connected: Boolean(localConnectionDiagnostics.adapter_connected || backend.adapter_connected || transportServiceReady()),
+    first_pid_command_sent: Boolean(localConnectionDiagnostics.first_pid_command_sent || backend.first_pid_command_sent),
+    first_pid_response_received: Boolean(localConnectionDiagnostics.first_pid_response_received || backend.first_pid_response_received || phoneBridge.first_live_read_received),
+    backend_ingest_success: Boolean(localConnectionDiagnostics.backend_ingest_success || backend.backend_ingest_success),
+    mode_switched_to_phone_live: Boolean(localConnectionDiagnostics.mode_switched_to_phone_live || backend.mode_switched_to_phone_live || state?.current_mode === 'PHONE-LIVE'),
+  };
+}
+function formatDiagnosticValue(value){
+  if(typeof value === 'boolean'){ return value ? 'true' : 'false'; }
+  return String(value ?? 'unknown');
+}
+function detectTransport(){
+  const nativeService = getMobileBluetoothService();
+  const nativeBridgeDetected = Boolean(nativeService);
+  const runtimePlatform = inferRuntimePlatform();
+  const mobileRuntime = isMobileRuntimePlatform(runtimePlatform);
+  const bluetoothAvailable = webBluetoothAvailable();
+  const nativeBridgeRequired = !nativeBridgeDetected && mobileRuntime;
+  let nextContext;
+  if(nativeBridgeDetected){
+    nextContext = {
+      selected_transport: 'native-phone-bridge',
+      runtime_platform: runtimePlatform,
+      native_bridge_detected: true,
+      navigator_bluetooth_available: bluetoothAvailable,
+      status_label: 'Native bridge ready',
+      message: 'Native phone bridge detected and callable.',
+    };
+  } else if(bluetoothAvailable && !mobileRuntime){
+    nextContext = {
+      selected_transport: 'web-bluetooth',
+      runtime_platform: runtimePlatform,
+      native_bridge_detected: false,
+      navigator_bluetooth_available: true,
+      status_label: 'Web Bluetooth available',
+      message: 'Desktop Chrome or Edge can use Web Bluetooth for live reads.',
+    };
+  } else if(nativeBridgeRequired || isAppleTouchWebEnvironment()){
+    nextContext = {
+      selected_transport: 'unsupported',
+      runtime_platform: runtimePlatform,
+      native_bridge_detected: false,
+      navigator_bluetooth_available: bluetoothAvailable,
+      status_label: bluetoothAvailable ? 'Native bridge required' : 'Native bridge missing',
+      message: nativeBridgeRequiredMessage(runtimePlatform),
+    };
+  } else {
+    nextContext = {
+      selected_transport: 'unsupported',
+      runtime_platform: runtimePlatform,
+      native_bridge_detected: false,
+      navigator_bluetooth_available: false,
+      status_label: 'Unsupported environment',
+      message: GENERIC_UNSUPPORTED_MESSAGE,
+    };
+  }
+  const nextSelection = JSON.stringify(nextContext);
+  transportContext = { ...transportContext, ...nextContext };
+  setLocalConnectionDiagnostics({ native_bridge_available: nativeBridgeDetected });
+  if(lastLoggedTransportSelection !== nextSelection){
+    lastLoggedTransportSelection = nextSelection;
+    transportLog('selected transport', {
+      status_label: transportContext.status_label,
+      message: transportContext.message,
+    });
+  }
+  return transportContext;
+}
+function normalizeConnectPayload(payload, detection = detectTransport()){
+  return {
+    platform: payload?.platform || detection.runtime_platform || (detection.selected_transport === 'web-bluetooth' ? 'browser' : 'unknown'),
+    adapter_name: payload?.adapter_name || payload?.adapterName || 'OBDLink MX+',
+    status: payload?.status || 'failed',
+    permission_state: payload?.permission_state || payload?.permissionState || null,
+    source_mode: payload?.source_mode || payload?.sourceMode || (detection.selected_transport === 'web-bluetooth' ? 'BROWSER-DEV' : 'PHONE-LIVE'),
+    supports_native_bluetooth: payload?.supports_native_bluetooth ?? payload?.supportsNativeBluetooth ?? detection.native_bridge_detected,
+    fallback_reason: payload?.fallback_reason || payload?.fallbackReason || null,
+  };
+}
+function getBrowserBluetoothTransport(){
+  if(window.__siennaBrowserBluetoothTransport){ return window.__siennaBrowserBluetoothTransport; }
+
+  class BrowserBluetoothTransport {
+    constructor(){
+      this.device = null;
+      this.server = null;
+      this.notifyCharacteristic = null;
+      this.writeCharacteristic = null;
+      this.pendingResponse = null;
+      this.responseBuffer = '';
+      this.commandQueue = Promise.resolve();
+      this.decoder = new TextDecoder();
+      this.encoder = new TextEncoder();
+      this.handleNotification = this.handleNotification.bind(this);
+      this.handleDisconnect = this.handleDisconnect.bind(this);
+    }
+
+    isConnected(){
+      return Boolean(this.device?.gatt?.connected && this.writeCharacteristic && this.notifyCharacteristic);
+    }
+
+    async connectToAdapter(){
+      if(!webBluetoothAvailable()){
+        throw new Error('web-bluetooth-unavailable');
+      }
+      if(this.isConnected()){
+        return this.connectionPayload('connected');
+      }
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: 'OBDLink' }],
+        optionalServices: [OBDLINK_BLE_UART_SERVICE_UUID],
+      });
+      await this.attachDevice(device);
+      await this.initializeAdapter();
+      return this.connectionPayload('connected');
+    }
+
+    async reconnectIfNeeded(){
+      if(this.isConnected()){
+        return this.connectionPayload('connected');
+      }
+      if(!navigator.bluetooth || typeof navigator.bluetooth.getDevices !== 'function'){
+        throw new Error('web-bluetooth-reconnect-unavailable');
+      }
+      const devices = await navigator.bluetooth.getDevices();
+      const device = devices.find((candidate) => candidate.name && candidate.name.startsWith('OBDLink'));
+      if(!device){
+        throw new Error('web-bluetooth-device-not-granted');
+      }
+      await this.attachDevice(device);
+      await this.initializeAdapter();
+      return this.connectionPayload('connected');
+    }
+
+    async attachDevice(device){
+      this.reset('replace-device');
+      this.device = device;
+      this.device.addEventListener('gattserverdisconnected', this.handleDisconnect);
+      this.server = await this.device.gatt.connect();
+      const service = await this.server.getPrimaryService(OBDLINK_BLE_UART_SERVICE_UUID);
+      this.notifyCharacteristic = await service.getCharacteristic(OBDLINK_BLE_UART_NOTIFY_UUID);
+      this.writeCharacteristic = await service.getCharacteristic(OBDLINK_BLE_UART_WRITE_UUID);
+      await this.notifyCharacteristic.startNotifications();
+      this.notifyCharacteristic.addEventListener('characteristicvaluechanged', this.handleNotification);
+    }
+
+    async initializeAdapter(){
+      for(const command of SAFE_BROWSER_ADAPTER_COMMANDS){
+        await this.sendCommand(command, command === 'ATZ' ? 5000 : 2500);
+      }
+    }
+
+    async disconnectAdapter(){
+      this.reset('manual-disconnect');
+      return this.connectionPayload('failed', 'web-bluetooth-disconnected');
+    }
+
+    async readPid(pid){
+      const command = String(pid || '').toUpperCase();
+      const rawResponse = await this.sendCommand(command, 3500);
+      const cleaned = cleanAdapterResponse(rawResponse);
+      return {
+        command,
+        pid_key: Object.keys(SENSOR_TO_PID).find((sensor) => SENSOR_TO_PID[sensor] === command) || null,
+        source_mode: 'BROWSER-DEV',
+        source_hint: 'iso9141_2',
+        raw_response: cleaned,
+        value: parsePidValue(command, cleaned),
+        unit: pidUnit(command),
+        backend_status: 'accepted',
+        ts: new Date().toISOString(),
+      };
+    }
+
+    async readVin(){
+      return this.readPid('0902');
+    }
+
+    connectionPayload(status, fallbackReason = null){
+      return {
+        platform: 'browser',
+        adapter_name: this.device?.name || 'OBDLink MX+',
+        status,
+        permission_state: this.device ? 'granted' : 'prompt',
+        source_mode: 'BROWSER-DEV',
+        supports_native_bluetooth: false,
+        fallback_reason: fallbackReason,
+      };
+    }
+
+    async sendCommand(command, timeoutMs){
+      const queued = this.commandQueue.then(() => this.sendCommandOnce(command, timeoutMs));
+      this.commandQueue = queued.catch(() => undefined);
+      return queued;
+    }
+
+    async sendCommandOnce(command, timeoutMs){
+      if(!this.writeCharacteristic){
+        throw new Error('web-bluetooth-not-connected');
+      }
+      this.responseBuffer = '';
+      const payload = this.encoder.encode(`${command}\\r`);
+      const responsePromise = new Promise((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          if(this.pendingResponse){
+            this.pendingResponse = null;
+            reject(new Error(`timeout:${command}`));
+          }
+        }, timeoutMs);
+        this.pendingResponse = { resolve, reject, timer };
+      });
+      const writeWithoutResponse = this.writeCharacteristic.writeValueWithoutResponse;
+      if(typeof writeWithoutResponse === 'function'){
+        await writeWithoutResponse.call(this.writeCharacteristic, payload);
+      } else {
+        await this.writeCharacteristic.writeValue(payload);
+      }
+      return responsePromise;
+    }
+
+    handleNotification(event){
+      this.responseBuffer += this.decoder.decode(event.target.value);
+      if(!this.pendingResponse || !this.responseBuffer.includes('>')){ return; }
+      const { resolve, timer } = this.pendingResponse;
+      window.clearTimeout(timer);
+      this.pendingResponse = null;
+      const rawResponse = this.responseBuffer;
+      this.responseBuffer = '';
+      resolve(rawResponse);
+    }
+
+    async handleDisconnect(){
+      const disconnectReason = 'web-bluetooth-disconnected';
+      setLastConnectionError(disconnectReason);
+      resetLocalConnectionDiagnostics({
+        permissionStatus: localConnectionDiagnostics.bluetooth_permission_status,
+        nativeBridgeAvailable: transportContext.native_bridge_detected,
+      });
+      phoneBridge = { ...phoneBridge, status: 'disconnected', last_error: disconnectReason };
+      transportLog('connect failure', { reason: disconnectReason });
+      this.reset(disconnectReason);
+      try {
+        await fetch('/phone/bridge/disconnect', { method: 'POST' });
+      } catch (error) {
+        console.debug('[transport]', { event: 'disconnect sync failed', error: error?.message || String(error) });
+      }
+      await fetchState();
+    }
+
+    reset(reason){
+      if(this.pendingResponse){
+        window.clearTimeout(this.pendingResponse.timer);
+        this.pendingResponse.reject(new Error(reason));
+        this.pendingResponse = null;
+      }
+      if(this.notifyCharacteristic){
+        this.notifyCharacteristic.removeEventListener('characteristicvaluechanged', this.handleNotification);
+      }
+      if(this.device){
+        this.device.removeEventListener('gattserverdisconnected', this.handleDisconnect);
+      }
+      if(this.device?.gatt?.connected){
+        this.device.gatt.disconnect();
+      }
+      this.server = null;
+      this.notifyCharacteristic = null;
+      this.writeCharacteristic = null;
+      this.responseBuffer = '';
+    }
+  }
+
+  window.__siennaBrowserBluetoothTransport = new BrowserBluetoothTransport();
+  return window.__siennaBrowserBluetoothTransport;
+}
+function cleanAdapterResponse(rawResponse){
+  return String(rawResponse || '')
+    .replace(/\\u0000/g, '')
+    .replace(/[\\r\\n>]+/g, ' ')
+    .replace(/\\s+/g, ' ')
+    .trim();
+}
+function extractResponseBytes(command, rawResponse){
+  const prefix = PID_RESPONSE_PREFIXES[command];
+  if(!prefix){ return []; }
+  const tokens = cleanAdapterResponse(rawResponse).toUpperCase().split(' ').filter((token) => /^[0-9A-F]{2}$/.test(token));
+  const prefixTokens = prefix.split(' ');
+  const startIndex = tokens.findIndex((token, index) => prefixTokens.every((part, offset) => tokens[index + offset] === part));
+  return startIndex === -1 ? [] : tokens.slice(startIndex + prefixTokens.length);
+}
+function parsePidValue(command, rawResponse){
+  const bytes = extractResponseBytes(command, rawResponse).map((token) => Number.parseInt(token, 16));
+  if(command === '010C' && bytes.length >= 2){ return ((bytes[0] * 256) + bytes[1]) / 4; }
+  if(command === '0105' && bytes.length >= 1){ return bytes[0] - 40; }
+  if(command === '010D' && bytes.length >= 1){ return bytes[0]; }
+  if(command === '010F' && bytes.length >= 1){ return bytes[0] - 40; }
+  if(command === '0111' && bytes.length >= 1){ return Number(((bytes[0] * 100) / 255).toFixed(1)); }
+  if(command === '012F' && bytes.length >= 1){ return Number(((bytes[0] * 100) / 255).toFixed(1)); }
+  if(command === '0142' && bytes.length >= 2){ return Number((((bytes[0] * 256) + bytes[1]) / 1000).toFixed(3)); }
+  return null;
+}
+function pidUnit(command){
+  if(command === '010C'){ return 'rpm'; }
+  if(command === '0105' || command === '010F'){ return '°C'; }
+  if(command === '010D'){ return 'km/h'; }
+  if(command === '0111' || command === '012F'){ return '%'; }
+  if(command === '0142'){ return 'V'; }
+  return null;
+}
+function getTransportService(detection = detectTransport()){
+  if(detection.selected_transport === 'native-phone-bridge'){
+    return getMobileBluetoothService();
+  }
+  if(detection.selected_transport === 'web-bluetooth'){
+    return getBrowserBluetoothTransport();
+  }
+  return null;
+}
+async function publishBridgeConnection(payload){
+  await fetch('/phone/bridge/connect', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload),
+  });
+}
+async function publishBridgeDisconnect(){
+  await fetch('/phone/bridge/disconnect', { method: 'POST' });
+}
+async function getNativeBridgeState(service){
+  if(!service || typeof service.getConnectionState !== 'function'){ return null; }
+  try {
+    return await service.getConnectionState();
+  } catch (error) {
+    console.debug('[transport]', { event: 'getConnectionState failed', error: error?.message || String(error) });
+    return null;
+  }
+}
+async function ensureBluetoothPermissionForConnection(service, detection){
+  if(detection.selected_transport !== 'native-phone-bridge'){ return null; }
+  let permissionStatus = normalizePermissionStatus(phoneBridge.permission_state);
+  const bridgeState = await getNativeBridgeState(service);
+  if(bridgeState){
+    permissionStatus = normalizePermissionStatus(bridgeState.permission_state || bridgeState.permissionState || permissionStatus);
+  }
+  if(['unknown', 'prompt'].includes(permissionStatus) && typeof service.requestBluetoothPermission === 'function'){
+    const permissionResult = await service.requestBluetoothPermission();
+    permissionStatus = normalizePermissionStatus(permissionResult?.permission_state || permissionResult?.permissionState || permissionResult?.status || permissionStatus);
+  }
+  setLocalConnectionDiagnostics({ bluetooth_permission_status: permissionStatus });
+  return permissionStatus;
+}
+async function resetRealConnectionSequence(service){
+  stopLivePolling();
+  resetLocalConnectionDiagnostics({
+    permissionStatus: localConnectionDiagnostics.bluetooth_permission_status,
+    nativeBridgeAvailable: transportContext.native_bridge_detected,
+  });
+  try {
+    if(service && typeof service.disconnectAdapter === 'function'){
+      await service.disconnectAdapter();
+    }
+  } catch (error) {
+    console.debug('[transport]', { event: 'disconnect before reconnect failed', error: error?.message || String(error) });
+  }
+  try {
+    await publishBridgeDisconnect();
+  } catch (error) {
+    console.debug('[transport]', { event: 'disconnect state sync failed', error: error?.message || String(error) });
+  }
 }
 function escapeHtml(value){
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
@@ -2728,39 +3429,100 @@ function updateBadge(rootId, textId, tone, value, pulse=false){
   const text = document.getElementById(textId);
   if(text){ text.textContent = value; }
 }
-function setButtonState(buttonId, tone, stateText, active=false, pulse=false, ariaPressed=false){
+function setButtonState(buttonId, tone, stateText, active=false, pulse=false, ariaPressed=false, disabled=false){
   const button = document.getElementById(buttonId);
   if(!button){ return; }
   button.dataset.tone = tone;
   button.dataset.active = active ? 'true' : 'false';
   button.dataset.pulse = pulse ? 'true' : 'false';
   button.setAttribute('aria-pressed', ariaPressed ? 'true' : 'false');
+  button.disabled = disabled;
   const stateEl = button.querySelector('.tile-state');
   if(stateEl){ stateEl.textContent = stateText; }
 }
-async function readNativePid(sensor){
-  const service = getMobileBluetoothService();
+function hasUsablePidRead(read){
+  return Boolean(read && read.raw_response && !read.error);
+}
+function markFirstPidRead(read){
+  if(!read || transportContext.first_pid_read_logged){ return; }
+  transportContext = { ...transportContext, first_pid_read_logged: true };
+  transportLog('first PID read', { pid: read.command, source_mode: read.source_mode });
+}
+function handleNativePollEvent(event){
+  const nativeRead = event?.detail || null;
+  if(!nativeRead || !hasUsablePidRead(nativeRead)){ return; }
+  setLocalConnectionDiagnostics({
+    first_pid_command_sent: true,
+    first_pid_response_received: true,
+  });
+  markFirstPidRead(nativeRead);
+}
+async function handleNativeDisconnectEvent(event){
+  const detail = normalizeNativeDisconnectPayload(event?.detail || {});
+  const reason = detail.last_error || detail.fallback_reason || 'adapter-disconnected';
+  setLastConnectionError(reason);
+  setLocalConnectionDiagnostics({ adapter_connected: false });
+  phoneBridge = {
+    ...phoneBridge,
+    ...detail,
+    status: 'disconnected',
+    last_error: reason,
+    fallback_reason: reason,
+  };
+  stopLivePolling();
+  renderDashboardState();
+  renderBluetoothCard();
+  try {
+    await publishBridgeDisconnect();
+  } catch (error) {
+    console.debug('[transport]', { event: 'native disconnect sync failed', error: error?.message || String(error) });
+  }
+  await fetchState();
+}
+function transportServiceReady(){
+  const detection = detectTransport();
+  if((phoneBridge.status || 'disconnected') !== 'connected'){ return false; }
+  if(detection.selected_transport === 'native-phone-bridge'){
+    return Boolean(getMobileBluetoothService());
+  }
+  if(detection.selected_transport === 'web-bluetooth'){
+    return getBrowserBluetoothTransport().isConnected();
+  }
+  return false;
+}
+async function readTransportPid(sensor){
+  const detection = detectTransport();
+  const service = getTransportService(detection);
   if(!service || typeof service.readPid !== 'function'){ return null; }
   try {
-    const nativeRead = await service.readPid(SENSOR_TO_PID[sensor]);
-    if(!nativeRead){ return null; }
-    const rawResponse = nativeRead.raw_response || nativeRead.rawResponse || null;
+    setLocalConnectionDiagnostics({ first_pid_command_sent: true });
+    renderBluetoothCard();
+    const liveRead = await service.readPid(SENSOR_TO_PID[sensor]);
+    if(!liveRead){ return null; }
+    const rawResponse = liveRead.raw_response || liveRead.rawResponse || null;
     if(!rawResponse){ return null; }
-    return {
+    const normalizedRead = {
       command: SENSOR_TO_PID[sensor],
       pid_key: sensor,
-      source_mode: nativeRead.source_mode || nativeRead.sourceMode || 'PHONE-LIVE',
-      source_hint: nativeRead.source_hint || nativeRead.sourceHint || 'iso9141_2',
+      source_mode: liveRead.source_mode || liveRead.sourceMode || (detection.selected_transport === 'web-bluetooth' ? 'BROWSER-DEV' : 'PHONE-LIVE'),
+      source_hint: liveRead.source_hint || liveRead.sourceHint || 'iso9141_2',
       raw_response: rawResponse,
-      value: nativeRead.value ?? null,
-      unit: nativeRead.unit ?? null,
-      latency_ms: nativeRead.latency_ms ?? nativeRead.latencyMs ?? null,
-      error: nativeRead.error ?? null,
-      backend_status: nativeRead.backend_status || nativeRead.backendStatus || undefined,
-      ts: nativeRead.ts || nativeRead.timestamp || undefined,
+      value: liveRead.value ?? null,
+      unit: liveRead.unit ?? null,
+      latency_ms: liveRead.latency_ms ?? liveRead.latencyMs ?? null,
+      error: liveRead.error ?? null,
+      backend_status: liveRead.backend_status || liveRead.backendStatus || undefined,
+      ts: liveRead.ts || liveRead.timestamp || undefined,
     };
+    if(hasUsablePidRead(normalizedRead)){
+      setLocalConnectionDiagnostics({ first_pid_response_received: true });
+      markFirstPidRead(normalizedRead);
+    }
+    return normalizedRead;
   } catch (error) {
-    phoneBridge = { ...phoneBridge, last_error: error?.message || 'native-read-failed' };
+    const reason = error?.message || 'transport-read-failed';
+    setLastConnectionError(reason);
+    phoneBridge = { ...phoneBridge, last_error: reason };
     renderBluetoothCard();
     return null;
   }
@@ -2824,6 +3586,15 @@ async function fetchState(){
   const res = await fetch('/dashboard/state');
   state = await res.json();
   phoneBridge = { ...phoneBridge, ...state.phone_bridge };
+  const backendPermissionStatus = normalizePermissionStatus(state?.phone_bridge?.permission_state);
+  setLocalConnectionDiagnostics({
+    bluetooth_permission_status: backendPermissionStatus === 'unknown' ? localConnectionDiagnostics.bluetooth_permission_status : backendPermissionStatus,
+    mode_switched_to_phone_live: state?.current_mode === 'PHONE-LIVE',
+    backend_ingest_success: state?.phone_bridge?.backend_acceptance_status === 'accepted',
+    first_pid_response_received: Boolean(state?.phone_bridge?.first_live_read_received),
+    adapter_connected: state?.phone_bridge?.status === 'connected',
+  });
+  detectTransport();
   renderVehicles(); renderDashboardState(); renderBluetoothCard(); renderAiAlerts(); renderTimeline(); syncLivePolling();
   if(vehicleRenderer && state.vehicle_visualization?.highlight){ const h=state.vehicle_visualization.highlight; vehicleRenderer.applyHighlight(h.action,h.component,h.system); }
 }
@@ -2862,26 +3633,87 @@ function renderVehicles(){
     updateVehicleImage();
   }
 }
+function getTransportPresentation(){
+  const detection = detectTransport();
+  const connected = transportServiceReady();
+  const status = phoneBridge.status || 'disconnected';
+  const errorMessage = transportContext.last_connection_error || phoneBridge.last_error || phoneBridge.fallback_reason || detection.message;
+  if(connected){
+    return {
+      tone: 'success',
+      label: 'Connected',
+      detail: transportContext.first_pid_read_logged || phoneBridge.first_live_read_received
+        ? 'Bluetooth transport is connected and live PID reads are running.'
+        : 'Bluetooth transport is connected. Waiting for the first live PID read.',
+    };
+  }
+  if(status === 'connecting'){
+    return {
+      tone: 'warning',
+      label: 'Connecting',
+      detail: 'Negotiating Bluetooth link and waiting for transport startup.',
+    };
+  }
+  if(status === 'failed'){
+    return {
+      tone: 'danger',
+      label: 'Error',
+      detail: errorMessage,
+    };
+  }
+  if(detection.selected_transport === 'web-bluetooth'){
+    return {
+      tone: 'accent',
+      label: 'Web Bluetooth available',
+      detail: 'Desktop Chrome or Edge can use Web Bluetooth for live PID reads.',
+    };
+  }
+  if(['Native bridge missing', 'Native bridge required'].includes(detection.status_label)){
+    return {
+      tone: 'warning',
+      label: detection.status_label,
+      detail: detection.message,
+    };
+  }
+  if(detection.selected_transport === 'native-phone-bridge'){
+    return {
+      tone: 'accent',
+      label: 'Native bridge ready',
+      detail: 'Native phone bridge detected. Tap Connect Vehicle to start live reads.',
+    };
+  }
+  return {
+    tone: 'neutral',
+    label: 'Unsupported environment',
+    detail: detection.message,
+  };
+}
 function renderDashboardState(){
   const active = state?.active_session;
   const profile = getVehicleProfileById(active?.vehicle_id || selectedVehicleId);
-  const connected = (phoneBridge.status || 'disconnected') === 'connected';
-  const captureRecording = state?.capture_status === 'recording';
+  const transportStatus = getTransportPresentation();
+  const connected = transportServiceReady();
+  const hasSession = Boolean(active);
+  const vehicleCheckActive = Boolean(active && connected);
+  const captureRecording = connected && state?.capture_status === 'recording';
   const waitingForLiveRead = connected && !phoneBridge.first_live_read_received;
-  const liveReadActive = captureRecording || phoneBridge.ai_monitoring_active || (state?.recent_reads || []).some((read) => LIVE_TELEMETRY_KEYS.includes(read.pid_key) && isFreshRead(read));
-  const aiReady = Boolean(active);
-  const bluetoothTone = connected ? 'success' : phoneBridge.status === 'failed' ? 'danger' : phoneBridge.status === 'connecting' ? 'warning' : 'neutral';
-  const bluetoothLabel = connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Retry Required' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Not Connected';
+  const aiMonitoringActive = connected && Boolean(state?.ai_monitoring?.active);
+  const liveReadActive = connected && (captureRecording || phoneBridge.ai_monitoring_active || (state?.recent_reads || []).some((read) => LIVE_TELEMETRY_KEYS.includes(read.pid_key) && isFreshRead(read)));
+  const aiReady = hasSession;
+  const bluetoothTone = transportStatus.tone;
+  const bluetoothLabel = transportStatus.label;
   const streamTone = liveReadActive ? 'accent' : waitingForLiveRead ? 'warning' : 'neutral';
   const streamLabel = liveReadActive ? 'Streaming' : waitingForLiveRead ? 'Priming' : 'Idle';
-  const aiTone = aiReady ? (state?.ai_monitoring?.active ? 'accent' : 'success') : 'neutral';
-  const aiLabel = aiReady ? (state?.ai_monitoring?.active ? 'Monitoring' : 'Ready') : 'Offline';
+  const aiTone = aiReady ? (aiMonitoringActive ? 'accent' : 'success') : 'neutral';
+  const aiLabel = aiReady ? (aiMonitoringActive ? 'Monitoring' : 'Ready') : 'Offline';
   const protocolLabel = formatMode(active?.protocol || profile?.protocol_hint || 'protocol pending');
   const profileNote = profile?.notes || 'Safe read-only diagnostic workflow enabled.';
 
   document.getElementById('headerVehicleName').textContent = getVehicleDisplayName();
-  document.getElementById('headerVehicleDetail').textContent = active
+  document.getElementById('headerVehicleDetail').textContent = vehicleCheckActive
     ? `${protocolLabel} workflow armed. ${profileNote} Vehicle check ${shortId(active.session_id)} is active and ready for live context.`
+    : hasSession
+      ? `${protocolLabel} workflow armed. ${profileNote} Vehicle check ${shortId(active.session_id)} is prepared and waiting for a supported Bluetooth transport.`
     : `${protocolLabel} workflow armed. ${profileNote} Start a vehicle check to unlock capture, reports, and full AI context.`;
   document.getElementById('vehicleProfileNote').textContent = profileNote;
 
@@ -2889,34 +3721,41 @@ function renderDashboardState(){
   updateIndicator('statusStreaming', 'statusStreamingValue', streamTone, streamLabel);
   updateIndicator('statusAiAssist', 'statusAiAssistValue', aiTone, aiLabel);
 
-  updateBadge('sessionBadge', 'sessionBadgeText', active ? 'success' : 'neutral', active ? 'Vehicle Check Active' : 'Vehicle Check Idle');
+  updateBadge('sessionBadge', 'sessionBadgeText', vehicleCheckActive ? 'success' : 'neutral', vehicleCheckActive ? 'Vehicle Check Active' : 'Vehicle Check Idle');
   updateBadge('captureBadge', 'captureBadgeText', captureRecording ? 'danger' : state?.capture_status === 'stopped' ? 'warning' : 'neutral', captureRecording ? 'Capture Recording' : state?.capture_status === 'stopped' ? 'Capture Stopped' : 'Capture Idle', captureRecording);
   updateBadge('modeBadge', 'modeBadgeText', connected ? 'accent' : 'neutral', formatMode(state?.current_mode || phoneBridge.current_mode || 'standby'));
-  updateBadge('diagnosticStateBadge', 'diagnosticStateText', captureRecording ? 'danger' : active ? 'success' : connected ? 'accent' : 'warning', captureRecording ? 'Recording live capture' : active ? 'Vehicle check active' : connected ? 'Connected and ready' : 'Awaiting connection', captureRecording);
-  updateBadge('aiPanelBadge', 'aiPanelBadgeText', state?.ai_monitoring?.active ? 'accent' : aiReady ? 'success' : 'neutral', state?.ai_monitoring?.active ? 'Live monitoring active' : aiReady ? 'AI ready for diagnostics' : 'Awaiting vehicle check');
+  const who = state?.current_user?.display_name || 'Demo Tester';
+  document.getElementById('userBadgeText').textContent = `Signed in: ${who}`;
+  updateBadge('diagnosticStateBadge', 'diagnosticStateText', captureRecording ? 'danger' : vehicleCheckActive ? 'success' : connected ? 'accent' : transportStatus.tone, captureRecording ? 'Recording live capture' : vehicleCheckActive ? 'Vehicle check active' : connected ? 'Connected and ready' : transportStatus.label, captureRecording);
+  updateBadge('aiPanelBadge', 'aiPanelBadgeText', aiMonitoringActive ? 'accent' : aiReady ? 'success' : 'neutral', aiMonitoringActive ? 'Live monitoring active' : aiReady ? 'AI ready for diagnostics' : 'Awaiting vehicle check');
 
   renderTelemetry();
 
   const connectMeta = connected
     ? `OBDLink bridge active. ${liveReadActive ? 'Live telemetry is streaming.' : 'Waiting for live PID traffic.'}`
-    : phoneBridge.status === 'failed'
-      ? `Connection did not complete. ${phoneBridge.fallback_reason || 'Retry the Bluetooth handshake.'}`
-      : phoneBridge.status === 'connecting'
-        ? 'Negotiating Bluetooth link and preparing live polling.'
-        : 'Pair with OBDLink MX+ and arm live read-only telemetry.';
+    : transportStatus.detail;
   document.getElementById('connectVehicleMeta').textContent = connectMeta;
-  setButtonState('connectVehicleBtn', connected ? 'success' : phoneBridge.status === 'failed' ? 'danger' : phoneBridge.status === 'connecting' ? 'warning' : 'accent', connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Retry' : phoneBridge.status === 'connecting' ? 'Connecting' : 'Standby', connected, phoneBridge.status === 'connecting', connected);
+  setButtonState(
+    'connectVehicleBtn',
+    connected ? 'success' : transportStatus.tone,
+    connected ? 'Connected' : phoneBridge.status === 'failed' ? 'Retry' : phoneBridge.status === 'connecting' ? 'Connecting' : transportContext.selected_transport === 'unsupported' ? 'Unavailable' : 'Connect',
+    connected,
+    phoneBridge.status === 'connecting',
+    connected,
+    transportContext.selected_transport === 'unsupported' || phoneBridge.status === 'connecting',
+  );
 
-  setButtonState('startSessionBtn', active ? 'success' : 'accent', active ? 'Active' : 'Ready', Boolean(active), false, Boolean(active));
-  setButtonState('stopSessionBtn', active ? 'danger' : 'warning', active ? 'Available' : 'Idle', Boolean(active), false, false);
+  setButtonState('startSessionBtn', vehicleCheckActive ? 'success' : 'accent', vehicleCheckActive ? 'Active' : 'Ready', vehicleCheckActive, false, vehicleCheckActive);
+  setButtonState('stopSessionBtn', hasSession ? 'danger' : 'warning', hasSession ? 'Available' : 'Idle', hasSession, false, false);
   setButtonState('startCaptureBtn', captureRecording ? 'success' : 'accent', captureRecording ? 'Recording' : 'Ready', captureRecording, captureRecording, captureRecording);
   setButtonState('stopCaptureBtn', captureRecording ? 'danger' : 'warning', captureRecording ? 'Armed' : 'Idle', captureRecording, captureRecording, false);
-  setButtonState('tagEventBtn', active ? 'warning' : 'neutral', captureRecording ? 'Live Tagging' : active ? 'Ready' : 'Session Needed', Boolean(active), captureRecording, false);
-  setButtonState('reportsBtn', 'neutral', active ? 'Review' : 'Available', Boolean(active), false, false);
-  setButtonState('liveGaugesBtn', connected ? 'accent' : 'neutral', liveReadActive ? 'Live' : connected ? 'Ready' : 'Standby', connected, liveReadActive, connected);
-  setButtonState('askAiBtn', state?.ai_monitoring?.active ? 'accent' : aiReady ? 'success' : 'accent', state?.ai_monitoring?.active ? 'Monitoring' : aiReady ? 'Ready' : 'Standby', Boolean(state?.ai_monitoring?.active || aiReady), false, false);
+  setButtonState('tagEventBtn', hasSession ? 'warning' : 'neutral', captureRecording ? 'Live Tagging' : hasSession ? 'Ready' : 'Session Needed', hasSession, captureRecording, false);
+  setButtonState('reportsBtn', 'neutral', hasSession ? 'Review' : 'Available', hasSession, false, false);
+  setButtonState('liveGaugesBtn', connected ? 'accent' : 'neutral', liveReadActive ? 'Live' : connected ? 'Ready' : 'Standby', connected, liveReadActive, connected, !connected);
+  setButtonState('askAiBtn', aiMonitoringActive ? 'accent' : aiReady ? 'success' : 'accent', aiMonitoringActive ? 'Monitoring' : aiReady ? 'Ready' : 'Standby', Boolean(aiMonitoringActive || aiReady), false, false);
 }
 function renderTelemetry(){
+  const transportRunning = transportServiceReady();
   const metrics = [
     { cardId:'metricCardRpm', valueId:'metricRpmValue', metaId:'metricRpmMeta', read:getLatestRead('rpm'), unit:'rpm', precision:0 },
     { cardId:'metricCardVoltage', valueId:'metricVoltageValue', metaId:'metricVoltageMeta', read:getLatestRead('control_module_voltage'), unit:'V', precision:1 },
@@ -2927,7 +3766,7 @@ function renderTelemetry(){
     const summary = formatMetricValue(metric.read, metric.unit, metric.precision);
     document.getElementById(metric.valueId).textContent = summary.value;
     document.getElementById(metric.metaId).textContent = summary.meta;
-    document.getElementById(metric.cardId).dataset.live = summary.live ? 'true' : 'false';
+    document.getElementById(metric.cardId).dataset.live = summary.live && transportRunning ? 'true' : 'false';
   });
 }
 async function updateVehicleImage(){
@@ -2957,20 +3796,28 @@ async function updateVehicleImage(){
   }
 }
 function renderBluetoothCard(){
-  const status = phoneBridge.status || 'disconnected';
-  const tone = status === 'connected' ? 'success' : status === 'failed' ? 'danger' : status === 'connecting' ? 'warning' : 'neutral';
-  updateBadge('btStatusBadge', 'btStatusText', tone, formatMode(status));
-  document.getElementById('btError').textContent = phoneBridge.last_error || 'No Bluetooth errors';
+  const transportStatus = getTransportPresentation();
+  const connectionDiagnostics = resolvedConnectionDiagnostics();
+  updateBadge('btStatusBadge', 'btStatusText', transportStatus.tone, transportStatus.label);
+  document.getElementById('btError').textContent = phoneBridge.last_error || transportContext.last_connection_error || transportStatus.detail || 'No Bluetooth errors';
   const detailRows = [
-    { label: 'Bluetooth link', value: phoneBridge.bluetooth_connected ? 'Connected' : 'Idle' },
-    { label: 'Polling state', value: `${phoneBridge.polling_active ? 'Active' : 'Inactive'} (${phoneBridge.polling_state || 'inactive'})` },
+    { label: 'Runtime platform', value: phoneBridge.platform || transportContext.runtime_platform || 'unknown' },
+    { label: 'Selected transport', value: transportContext.selected_transport },
+    { label: 'Native bridge detected', value: transportContext.native_bridge_detected ? 'true' : 'false' },
+    { label: 'Web Bluetooth available', value: transportContext.navigator_bluetooth_available ? 'true' : 'false' },
+    { label: 'Bluetooth link', value: transportServiceReady() ? 'Connected' : 'Idle' },
+    { label: 'Polling state', value: `${transportServiceReady() && phoneBridge.polling_active ? 'Active' : 'Inactive'} (${phoneBridge.polling_state || 'inactive'})` },
     { label: 'First live read', value: phoneBridge.first_live_read_received ? 'Received' : 'Pending' },
-    { label: 'Source mode', value: phoneBridge.current_source_mode || phoneBridge.source_mode || 'unknown' },
+    { label: 'Source mode', value: transportServiceReady() ? (phoneBridge.current_source_mode || phoneBridge.source_mode || 'unknown') : 'standby' },
     { label: 'Last PID command', value: phoneBridge.last_live_pid_command || 'None' },
     { label: 'Last PID response', value: phoneBridge.last_live_pid_response || 'None' },
     { label: 'Ingest status', value: phoneBridge.last_ingest_status || 'idle' },
     { label: 'Backend acceptance', value: phoneBridge.backend_acceptance_status || 'idle' },
+    { label: 'Last connection error', value: transportContext.last_connection_error || phoneBridge.last_error || 'None' },
   ];
+  Object.entries(connectionDiagnostics).forEach(([label, value]) => {
+    detailRows.push({ label, value: formatDiagnosticValue(value) });
+  });
   if(phoneBridge.fallback_reason){ detailRows.push({ label: 'Fallback reason', value: phoneBridge.fallback_reason }); }
   if((state.current_mode || phoneBridge.current_mode) === 'MOCK'){ detailRows.push({ label: 'Mock mode reason', value: phoneBridge.mock_reason || state.current_mode_reason || 'Unknown' }); }
   document.getElementById('btDebug').innerHTML = detailRows.map((row) => `<div class="detail-row"><span class="detail-label">${escapeHtml(row.label)}</span><span class="detail-value">${escapeHtml(row.value)}</span></div>`).join('');
@@ -2983,9 +3830,10 @@ function alertTone(confidence){
 function renderAiAlerts(){
   const alerts = state.ai_alerts || [];
   const monitoring = state.ai_monitoring || { active:false, message:'Waiting for live monitoring.' };
+  const transportRunning = transportServiceReady();
   document.getElementById('aiAlertSummary').textContent = alerts.length
     ? `${alerts.length} proactive alert(s) linked to this vehicle check.`
-    : (monitoring.active ? 'Live monitoring active.' : 'No active alerts.');
+    : (transportRunning && monitoring.active ? 'Live monitoring active.' : 'No active alerts.');
   document.getElementById('aiAlertList').innerHTML = alerts.slice(-5).reverse().map((alert) => `
     <div class="alert-item">
       <div class="alert-head">
@@ -2995,7 +3843,7 @@ function renderAiAlerts(){
       <div class="tiny">${escapeHtml(alert.explanation)}</div>
       <div class="tiny"><span class="detail-label">Next</span> ${escapeHtml(alert.suggested_next_step)}</div>
     </div>
-  `).join('') || `<div class="empty-state">${escapeHtml(monitoring.message)}</div>`;
+  `).join('') || `<div class="empty-state">${escapeHtml(transportRunning ? monitoring.message : 'Waiting for live monitoring.')}</div>`;
 }
 function renderTimeline(){
   const timeline = state.diagnostic_timeline || [];
@@ -3014,15 +3862,160 @@ function renderTimeline(){
 }
 async function ensureSession(){ if (state && state.active_session) return state.active_session; await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})}); await fetchState(); return state.active_session; }
 async function createSession(){ await ensureSession(); }
-async function pollLiveSensorsOnce(){ if(livePollingInFlight){return;} if((phoneBridge.status||'disconnected')!=='connected'){stopLivePolling();return;} const service=getMobileBluetoothService(); if(!service || typeof service.readPid !== 'function'){ await fetchState(); return; } const active=await ensureSession(); livePollingInFlight=true; try { const nativeReads=await Promise.allSettled(LIVE_SENSOR_ORDER.map(sensor=>readNativePid(sensor))); const ingestJobs=nativeReads.filter(result=>result.status==='fulfilled'&&result.value).map(result=>fetch('/phone/bridge/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:active.session_id,vehicle_id:active.vehicle_id,...result.value,polling:true})})); if(ingestJobs.length){ await Promise.allSettled(ingestJobs); } } finally { livePollingInFlight=false; await fetchState(); } }
-function startLivePolling(){ if(livePollingHandle){return;} pollLiveSensorsOnce(); livePollingHandle=setInterval(()=>{pollLiveSensorsOnce();},500); }
+async function ensureTransportForPolling(){
+  const detection = detectTransport();
+  const service = getTransportService(detection);
+  if(!service){ return null; }
+  if(detection.selected_transport === 'web-bluetooth' && typeof service.reconnectIfNeeded === 'function' && !service.isConnected()){
+    try {
+      await service.reconnectIfNeeded();
+      transportLog('connect success', { reconnected: true, source_mode: 'BROWSER-DEV' });
+    } catch (error) {
+      const reason = error?.message || 'web-bluetooth-reconnect-failed';
+      setLastConnectionError(reason);
+      phoneBridge = { ...phoneBridge, status: 'failed', last_error: reason, fallback_reason: reason };
+      transportLog('connect failure', { reason });
+      return null;
+    }
+  }
+  return service;
+}
+async function pollLiveSensorsOnce(){
+  if(livePollingInFlight){ return; }
+  if(!transportServiceReady()){
+    stopLivePolling();
+    return;
+  }
+  const service = await ensureTransportForPolling();
+  if(!service || typeof service.readPid !== 'function'){
+    await fetchState();
+    return;
+  }
+  const active = await ensureSession();
+  livePollingInFlight = true;
+  try {
+    const nativeReads = await Promise.allSettled(LIVE_SENSOR_ORDER.map((sensor) => readTransportPid(sensor)));
+    const ingestJobs = nativeReads
+      .filter((result) => result.status === 'fulfilled' && hasUsablePidRead(result.value))
+      .map(async (result) => {
+        const response = await fetch('/phone/bridge/read', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({session_id: active.session_id, vehicle_id: active.vehicle_id, ...result.value, polling: true}),
+        });
+        if(response.ok){
+          setLocalConnectionDiagnostics({ backend_ingest_success: true });
+        }
+        return response;
+      });
+    if(ingestJobs.length){ await Promise.allSettled(ingestJobs); }
+  } finally {
+    livePollingInFlight = false;
+    await fetchState();
+  }
+}
+function startLivePolling(){
+  if(livePollingHandle || !transportServiceReady()){ return; }
+  transportLog('polling start', { polling_interval_ms: 500 });
+  pollLiveSensorsOnce();
+  livePollingHandle = setInterval(() => { pollLiveSensorsOnce(); }, 500);
+}
 function stopLivePolling(){ if(livePollingHandle){ clearInterval(livePollingHandle); livePollingHandle=null; } }
-function syncLivePolling(){ if((phoneBridge.status||'disconnected')==='connected' && state?.active_session && (phoneBridge.polling_state||'inactive')!=='inactive'){ startLivePolling(); return; } stopLivePolling(); }
+function syncLivePolling(){ if(transportServiceReady() && state?.active_session && (phoneBridge.polling_state||'inactive')!=='inactive'){ startLivePolling(); return; } stopLivePolling(); }
 async function stopSession(){ stopLivePolling(); await fetch('/sessions/active/stop',{method:'POST'}); await fetchState(); }
 async function startCapture(){ await ensureSession(); await fetch('/capture/start',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId,preset:'cold_start_capture'})}); await fetchState(); }
 async function stopCapture(){ await fetch('/capture/stop',{method:'POST'}); await fetchState(); }
 async function tagEvent(){ if (!state.active_session) { alert('Vehicle Check missing: start Vehicle Check first.'); return; } await fetch('/capture/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:'idle'})}); await fetchState(); }
-async function connectVehicle(){ const service=getMobileBluetoothService(); let connectPayload; try { connectPayload = normalizeConnectPayload(service && typeof service.connectToAdapter==='function' ? await service.connectToAdapter() : null); } catch (error) { connectPayload = normalizeConnectPayload({status:'failed',fallback_reason:error?.message || 'native-connect-failed'}); } await ensureSession(); await fetch('/phone/bridge/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(connectPayload) }); await fetchState(); if(connectPayload.status==='connected'){ startLivePolling(); } }
+async function connectVehicle(){
+  const detection = detectTransport();
+  transportContext = { ...transportContext, first_pid_read_logged: false };
+  transportLog('connect attempt start', { requested_transport: detection.selected_transport });
+  resetLocalConnectionDiagnostics({
+    permissionStatus: localConnectionDiagnostics.bluetooth_permission_status,
+    nativeBridgeAvailable: detection.native_bridge_detected,
+  });
+  if(detection.selected_transport === 'unsupported'){
+    const reason = detection.message;
+    const failedPayload = normalizeConnectPayload({
+      platform: detection.runtime_platform,
+      status: 'failed',
+      source_mode: 'PHONE-LIVE',
+      supports_native_bluetooth: detection.native_bridge_detected,
+      fallback_reason: reason,
+    }, detection);
+    setLastConnectionError(reason);
+    phoneBridge = { ...phoneBridge, platform: failedPayload.platform, status: 'failed', source_mode: failedPayload.source_mode, last_error: reason, fallback_reason: reason };
+    renderDashboardState();
+    renderBluetoothCard();
+    await publishBridgeConnection(failedPayload);
+    await fetchState();
+    return;
+  }
+
+  const service = getTransportService(detection);
+  await resetRealConnectionSequence(service);
+  phoneBridge = {
+    ...phoneBridge,
+    platform: detection.runtime_platform,
+    status: 'connecting',
+    source_mode: detection.selected_transport === 'web-bluetooth' ? 'BROWSER-DEV' : 'PHONE-LIVE',
+    last_error: null,
+    fallback_reason: null,
+  };
+  setLocalConnectionDiagnostics({
+    adapter_discovery_started: true,
+    adapter_connection_attempted: true,
+  });
+  setLastConnectionError(null);
+  renderDashboardState();
+  renderBluetoothCard();
+
+  try {
+    const permissionStatus = await ensureBluetoothPermissionForConnection(service, detection);
+    if(['denied', 'blocked', 'restricted'].includes(permissionStatus)){
+      throw new Error(`bluetooth-permission-${permissionStatus}`);
+    }
+    await publishBridgeConnection(normalizeConnectPayload({
+      platform: detection.runtime_platform,
+      status: 'connecting',
+      permission_state: permissionStatus || phoneBridge.permission_state || 'unknown',
+      source_mode: detection.selected_transport === 'web-bluetooth' ? 'BROWSER-DEV' : 'PHONE-LIVE',
+      supports_native_bluetooth: detection.native_bridge_detected,
+    }, detection));
+    const rawConnectPayload = await service.connectToAdapter();
+    const connectPayload = normalizeConnectPayload(rawConnectPayload, detection);
+    if(connectPayload.status !== 'connected'){
+      throw new Error(connectPayload.fallback_reason || 'transport-connect-failed');
+    }
+    setLocalConnectionDiagnostics({
+      bluetooth_permission_status: normalizePermissionStatus(connectPayload.permission_state || localConnectionDiagnostics.bluetooth_permission_status),
+      adapter_found: true,
+      adapter_connected: true,
+    });
+    await ensureSession();
+    await publishBridgeConnection(connectPayload);
+    phoneBridge = { ...phoneBridge, platform: connectPayload.platform || detection.runtime_platform, status: 'connected', source_mode: connectPayload.source_mode, last_error: null, fallback_reason: null };
+    transportLog('connect success', { source_mode: connectPayload.source_mode, adapter_name: connectPayload.adapter_name });
+    await fetchState();
+    if(transportServiceReady()){ startLivePolling(); }
+  } catch (error) {
+    const reason = error?.message || 'transport-connect-failed';
+    const failedPayload = normalizeConnectPayload({ status:'failed', fallback_reason: reason }, detection);
+    setLastConnectionError(reason);
+    setLocalConnectionDiagnostics({ adapter_connected: false });
+    phoneBridge = { ...phoneBridge, platform: failedPayload.platform, status: 'failed', source_mode: failedPayload.source_mode, last_error: reason, fallback_reason: reason };
+    transportLog('connect failure', { reason });
+    try {
+      if(service && typeof service.disconnectAdapter === 'function'){
+        await service.disconnectAdapter();
+      }
+    } catch (disconnectError) {
+      console.debug('[transport]', { event: 'disconnect cleanup failed', error: disconnectError?.message || String(disconnectError) });
+    }
+    await publishBridgeConnection(failedPayload);
+    await fetchState();
+  }
+}
 async function syncHighlight(action,component,system,source='user'){ await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,component,system,source})}); }
 async function explainSelected(){ const comp=document.getElementById('componentExplainBtn').dataset.component; if(!comp){return;} const res=await fetch(`/vehicle-visualization/explain?component=${encodeURIComponent(comp)}`); const data=await res.json(); alert(`${data.component.replace(/_/g,' ')}: ${data.explanation}`); }
 function openAiWithPrompt(prompt){ window.location.href = `/dashboard/ai?prompt=${encodeURIComponent(prompt || '')}`; }
@@ -3037,6 +4030,8 @@ document.getElementById('reportsBtn').onclick = () => alert('Reports view is ava
 document.getElementById('liveGaugesBtn').onclick = () => window.location.href = '/dashboard/gauges';
 document.getElementById('askAiBtn').onclick = () => openAiWithPrompt('');
 document.getElementById('componentExplainBtn').onclick = explainSelected;
+window.addEventListener('zeb-native-poll', handleNativePollEvent);
+window.addEventListener('zeb-native-disconnected', (event) => { void handleNativeDisconnectEvent(event); });
 setInterval(fetchState, 1500);
 fetchState();
 </script>
@@ -3059,8 +4054,9 @@ body{margin:0;font-family:Segoe UI,system-ui,sans-serif;background:#edf2f7;color
 let state=null; let pollingHandle=null; let pollingInFlight=false; let phoneBridge={status:'disconnected'};
 const SENSOR_TO_PID={rpm:'010C',coolant_temp:'0105',control_module_voltage:'0142',intake_air_temp:'010F',vehicle_speed:'010D',throttle_position:'0111'};
 const GAUGE_SENSORS=['rpm','coolant_temp','control_module_voltage','vehicle_speed','throttle_position','intake_air_temp'];
+const REQUIRED_NATIVE_GAUGE_BRIDGE_METHODS=['connectToAdapter','disconnectAdapter','getConnectionState','readPid','readVin','startPolling','stopPolling'];
 let gauges=[0,1,2,3].map(i=>({slot:i+1,sensor:GAUGE_SENSORS[i]||'rpm',label:`Gauge ${i+1}`,min:0,max:8000,unit:'',warn:4500,critical:6000}));
-function getMobileBluetoothService(){ return window.MobileBluetoothService || null; }
+function getMobileBluetoothService(){ const service=window.MobileBluetoothService || null; if(!service){ return null; } return REQUIRED_NATIVE_GAUGE_BRIDGE_METHODS.every((method)=>typeof service[method]==='function') ? service : null; }
 async function readNativePid(sensor){
   const service = getMobileBluetoothService();
   if(!service || typeof service.readPid !== 'function'){ return null; }
@@ -3108,6 +4104,7 @@ function startGaugePolling(){if(pollingHandle)return;pollAllGaugesOnce();polling
 function syncGaugePolling(){if((phoneBridge.status||'disconnected')==='connected'&&state?.active_session&&(phoneBridge.polling_state||'inactive')!=='inactive'){startGaugePolling();return;}stopGaugePolling();}
 function savePreset(){const name=document.getElementById('presetName').value||'Default';localStorage.setItem(`gaugePreset:${name}`,JSON.stringify(gauges));}
 function loadPreset(){const name=document.getElementById('presetName').value||'Default';const raw=localStorage.getItem(`gaugePreset:${name}`);if(raw){gauges=JSON.parse(raw);renderGauges();}}
+window.addEventListener('zeb-native-disconnected', async (event)=>{const detail=event?.detail||{};const reason=detail.last_error||detail.fallback_reason||'adapter-disconnected';phoneBridge={...phoneBridge,...detail,status:'disconnected',last_error:reason,fallback_reason:reason};stopGaugePolling();try{await fetch('/phone/bridge/disconnect',{method:'POST'});}catch(error){console.debug('[transport]',{event:'gauge native disconnect sync failed',error:error?.message||String(error)});}await fetchState();});
 document.getElementById('startPollingBtn').onclick=startGaugePolling; document.getElementById('stopPollingBtn').onclick=stopGaugePolling; document.getElementById('savePresetBtn').onclick=savePreset; document.getElementById('loadPresetBtn').onclick=loadPreset; document.getElementById('backBtn').onclick=()=>window.location.href='/dashboard';
 setInterval(fetchState,1200); fetchState();
 </script></body></html>
