@@ -12,6 +12,7 @@ SourceMode = Literal["MOCK", "PHONE-LIVE", "LOCAL-HARDWARE", "BROWSER-DEV"]
 
 class Session(BaseModel):
     session_id: str = Field(default_factory=lambda: str(uuid4()))
+    user_id: str | None = None
     vehicle_id: str = "toyota_sienna_2006"
     vehicle: str = "2006 Toyota Sienna"
     protocol: str = "ISO_9141_2"
@@ -27,6 +28,7 @@ class SessionCreateRequest(BaseModel):
 
 class VehicleProfile(BaseModel):
     vehicle_id: str
+    user_id: str | None = None
     label: str
     protocol_hint: str
     notes: str | None = None
@@ -34,6 +36,7 @@ class VehicleProfile(BaseModel):
 
 class EventTag(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid4()))
+    user_id: str | None = None
     session_id: str
     ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     tag: str
@@ -55,6 +58,7 @@ class OBDReadResponse(BaseModel):
 
 class ReadHistoryItem(BaseModel):
     read_id: str = Field(default_factory=lambda: str(uuid4()))
+    user_id: str | None = None
     session_id: str
     vehicle: str
     command: str
@@ -130,6 +134,7 @@ CommandSourceType = Literal["can_passive", "obd_request_response", "replay"]
 
 class CommandLearningRecord(BaseModel):
     record_id: str = Field(default_factory=lambda: str(uuid4()))
+    user_id: str | None = None
     session_id: str
     vehicle_id: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -220,6 +225,7 @@ TimelineEventType = Literal[
 
 class DiagnosticTimelineEvent(BaseModel):
     timeline_event_id: str = Field(default_factory=lambda: str(uuid4()))
+    user_id: str | None = None
     session_id: str
     event_type: TimelineEventType
     title: str
@@ -235,6 +241,7 @@ class DiagnosticTimelineEvent(BaseModel):
 
 class AIAlertRecord(BaseModel):
     alert_id: str = Field(default_factory=lambda: str(uuid4()))
+    user_id: str | None = None
     session_id: str
     vehicle_id: str
     title: str
@@ -250,6 +257,7 @@ class AIAlertRecord(BaseModel):
 
 class AIResponseRecord(BaseModel):
     response_id: str = Field(default_factory=lambda: str(uuid4()))
+    user_id: str | None = None
     session_id: str
     vehicle_id: str
     question: str
@@ -277,3 +285,38 @@ class GuidedDiagnosisResultSubmitRequest(BaseModel):
     step_id: str
     observed_result: str
     notes: str | None = None
+
+
+class User(BaseModel):
+    user_id: str = Field(default_factory=lambda: str(uuid4()))
+    email: str
+    display_name: str
+    beta_tester: bool = True
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class UserSignUpRequest(BaseModel):
+    email: str
+    password: str = Field(min_length=8)
+    display_name: str = Field(min_length=2)
+
+
+class UserSignInRequest(BaseModel):
+    email: str
+    password: str
+
+
+class UserProfile(BaseModel):
+    user_id: str
+    profile_image: str | None = None
+    preferred_theme: str = "futuristic-dark"
+    preferred_unit_system: Literal["metric", "imperial"] = "metric"
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class UserProfileUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, min_length=2)
+    profile_image: str | None = None
+    preferred_theme: str | None = None
+    preferred_unit_system: Literal["metric", "imperial"] | None = None
