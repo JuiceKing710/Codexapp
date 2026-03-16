@@ -55,7 +55,7 @@ class ZebBridgeViewController: CAPBridgeViewController, WKScriptMessageHandler {
     private let bridgeMessageHandlerName = "zebBluetoothBridge"
     private lazy var bluetoothBridge = OBDLinkMXNativeBridge(eventSink: self)
 
-    override func webViewConfiguration(for instanceConfiguration: InstanceConfiguration) -> WKWebViewConfiguration {
+    public override func webViewConfiguration(for instanceConfiguration: InstanceConfiguration) -> WKWebViewConfiguration {
         let configuration = super.webViewConfiguration(for: instanceConfiguration)
         configuration.userContentController.add(self, name: bridgeMessageHandlerName)
         configuration.userContentController.addUserScript(
@@ -78,7 +78,7 @@ class ZebBridgeViewController: CAPBridgeViewController, WKScriptMessageHandler {
         bluetoothBridge.stop()
     }
 
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+    public func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard message.name == bridgeMessageHandlerName,
               let body = message.body as? [String: Any],
               let requestID = body["id"] as? String,
@@ -141,13 +141,22 @@ class ZebBridgeViewController: CAPBridgeViewController, WKScriptMessageHandler {
     }
 
     private func configuredDashboardURL() -> URL? {
-        guard let rawURL = Bundle.main.object(forInfoDictionaryKey: "ZebDashboardURL") as? String else {
-            return nil
+        // If provided via Info.plist, prefer that; otherwise fall back to default
+        let defaultBase = "https://codexapp-j7jw.onrender.com"
+
+        let rawURL = (Bundle.main.object(forInfoDictionaryKey: "ZebDashboardURL") as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // No value in Info.plist: use default base + /dashboard
+        if rawURL == nil || rawURL!.isEmpty {
+            guard let base = URL(string: defaultBase) else { return nil }
+            if base.path.isEmpty || base.path == "/" {
+                return base.appendingPathComponent("dashboard")
+            }
+            return base
         }
-        let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let url = URL(string: trimmed) else {
-            return nil
-        }
+
+        // Value provided in Info.plist
+        guard let url = URL(string: rawURL!) else { return nil }
         if url.path.isEmpty || url.path == "/" {
             return url.appendingPathComponent("dashboard")
         }
@@ -274,11 +283,11 @@ extension ZebBridgeViewController: OBDLinkMXNativeBridgeEventSink {
     }
 }
 
-private protocol OBDLinkMXNativeBridgeEventSink: AnyObject {
+protocol OBDLinkMXNativeBridgeEventSink: AnyObject {
     func nativeBridgeDidDispatchEvent(name: String, payload: [String: Any])
 }
 
-private struct NativeBridgeError: Error {
+struct NativeBridgeError: Error {
     let code: String
     let message: String
     let permissionState: String?
@@ -295,7 +304,7 @@ private struct NativeBridgeError: Error {
     }
 }
 
-private final class OBDLinkMXNativeBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+final class OBDLinkMXNativeBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private struct CommandReply {
         let raw: String
         let latencyMs: Int
@@ -318,7 +327,7 @@ private final class OBDLinkMXNativeBridge: NSObject, CBCentralManagerDelegate, C
         static let poll = "zeb-native-poll"
     }
 
-    private typealias BridgeCompletion = (Result<[String: Any], NativeBridgeError>) -> Void
+    typealias BridgeCompletion = (Result<[String: Any], NativeBridgeError>) -> Void
 
     private static let serviceUUID = CBUUID(string: "FFF0")
     private static let notifyUUID = CBUUID(string: "FFF1")
@@ -547,7 +556,7 @@ private final class OBDLinkMXNativeBridge: NSObject, CBCentralManagerDelegate, C
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         failConnectWaiters(
-            error(
+            self.error(
                 code: "adapter-connect-failed",
                 message: error?.localizedDescription ?? "Unable to connect to OBDLink MX+."
             )
@@ -555,7 +564,7 @@ private final class OBDLinkMXNativeBridge: NSObject, CBCentralManagerDelegate, C
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        let reasonCode = error.map { "adapter-disconnected-\($0.localizedDescription)" } ?? "adapter-disconnected"
+        let reasonCode = (error?.localizedDescription).map { "adapter-disconnected-\($0)" } ?? "adapter-disconnected"
         let shouldEmitEvent = !suppressDisconnectEvent
         suppressDisconnectEvent = false
 
@@ -1019,6 +1028,8 @@ private final class OBDLinkMXNativeBridge: NSObject, CBCentralManagerDelegate, C
             return error(code: "bluetooth-resetting", message: "Bluetooth is resetting. Try again in a moment.")
         case .unknown:
             return error(code: "bluetooth-permission-pending", message: "Bluetooth permission is still being determined.")
+        case .poweredOn:
+            return error(code: "bluetooth-powered-on", message: "Bluetooth is available.")
         @unknown default:
             return error(code: "bluetooth-unknown", message: "Bluetooth is unavailable.")
         }
@@ -1099,3 +1110,4 @@ private final class OBDLinkMXNativeBridge: NSObject, CBCentralManagerDelegate, C
         centralManager.stopScan()
     }
 }
+

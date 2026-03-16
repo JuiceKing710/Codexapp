@@ -1,0 +1,21 @@
+/* Bundle display name */
+"CFBundleDisplayName" = "Zeb's OBD AI";
+
+/* Get Info string */
+"CFBundleGetInfoString" = "";
+
+/* Bundle name */
+"CFBundleName" = "App";
+
+/* Privacy - Bluetooth Always Usage Description */
+"NSBluetoothAlwaysUsageDescription" = "Zeb's OBD AI uses Bluetooth to discover and connect to your OBDLink MX+ adapter for read-only live diagnostics.";
+
+/* Privacy - Bluetooth Peripheral Usage Description */
+"NSBluetoothPeripheralUsageDescription" = "Zeb's OBD AI uses Bluetooth to read vehicle data from your OBDLink MX+ adapter.";
+
+/* Copyright (human-readable) */
+"NSHumanReadableCopyright" = "";
+
+/* Privacy - Local Network Usage Description */
+"NSLocalNetworkUsageDescription" = "Zeb's OBD AI can load your shared FastAPI dashboard from a local development server while testing on iPhone.";
+
