@@ -881,7 +881,7 @@ def phone_bridge_state_get() -> dict:
 def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
     previous_status = phone_bridge_state.get("status")
     previous_polling_state = phone_bridge_state.get("polling_state")
-<<<<<<< HEAD
+
     effective_status = payload.status
     effective_fallback_reason = payload.fallback_reason
     if payload.source_mode == "PHONE-LIVE" and not payload.supports_native_bluetooth:
@@ -891,10 +891,9 @@ def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
     if store.active_session_id:
         reads = [item.model_dump() for item in store.get_reads(store.active_session_id)]
     has_live_read = _latest_phone_live_read(reads) is not None
-=======
+
     if payload.status in {"connecting", "failed"} or (payload.status == "connected" and previous_status != "connecting"):
-        _reset_phone_connection_progress(anchor_now=True)
->>>>>>> ccb5c74 (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
+        _reset_phone_connection_progress(anchor_now=True)                                                       (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
 
     _touch_phone_bridge(status=effective_status, error=effective_fallback_reason if effective_status == "failed" else None)
     phone_bridge_state["platform"] = payload.platform
@@ -906,7 +905,7 @@ def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
     phone_bridge_state["fallback_reason"] = effective_fallback_reason
     phone_bridge_state["backend_status"] = (
         "connection-failed"
-<<<<<<< HEAD
+
         if effective_status == "failed"
         else ("awaiting-live-read" if effective_status == "connected" and not has_live_read else "phone-managed")
     )
@@ -917,7 +916,7 @@ def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
     phone_bridge_state["live_monitoring_state"] = "active" if effective_status == "connected" and has_live_read else ("waiting_for_first_live_read" if effective_status == "connected" else "inactive")
     phone_bridge_state["command_learning_status"] = "active" if effective_status == "connected" else "idle"
     if store.active_session_id and effective_status == "connected":
-=======
+
         if payload.status == "failed"
         else ("awaiting-adapter" if payload.status == "connecting" else ("awaiting-live-read" if payload.status == "connected" else "disconnected"))
     )
@@ -929,7 +928,7 @@ def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
     phone_bridge_state["live_monitoring_state"] = "waiting_for_first_live_read" if payload.status == "connected" else "inactive"
     phone_bridge_state["command_learning_status"] = "active" if payload.status == "connected" else "idle"
     if store.active_session_id and payload.status == "connected":
->>>>>>> ccb5c74 (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
+ (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
         if previous_status != "connected":
             store.add_timeline_event(DiagnosticTimelineEvent(
                 session_id=store.active_session_id,
@@ -1417,10 +1416,10 @@ def dashboard_state() -> dict:
         "display_name": settings.app_display_name,
         "current_user": current_user.model_dump(),
         "current_profile": current_profile.model_dump(),
-<<<<<<< HEAD
+
         "app_settings": store.get_app_settings(),
-=======
->>>>>>> ccb5c74 (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
+
+ (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
         "vehicles": [item.model_dump() for item in store.list_vehicles()],
         "active_session": active,
         "adapter_mode": adapter.mode_status(),
@@ -2932,7 +2931,7 @@ const SENSOR_TO_PID = { rpm:'010C', coolant_temp:'0105', control_module_voltage:
 const LIVE_SENSOR_ORDER = ['rpm', 'coolant_temp', 'control_module_voltage', 'vehicle_speed'];
 const LIVE_TELEMETRY_KEYS = ['rpm', 'coolant_temp', 'control_module_voltage', 'vehicle_speed', 'throttle_position'];
 const TOYOTA_PREMIUM_NAME = '2006 Toyota Sienna FWD V6 3.3L';
-<<<<<<< HEAD
+
 function logBridge(event, details={}){
   console.info(`[bridge] ${event}`, details);
 }
@@ -6144,7 +6143,7 @@ function emptyLocalConnectionDiagnostics(permissionStatus = 'unknown', nativeBri
     first_pid_response_received: false,
     backend_ingest_success: false,
     mode_switched_to_phone_live: false,
->>>>>>> ccb5c74 (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
+ (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
   };
 }
 let localConnectionDiagnostics = emptyLocalConnectionDiagnostics();
@@ -6713,7 +6712,7 @@ function setButtonState(buttonId, tone, stateText, active=false, pulse=false, ar
   const stateEl = button.querySelector('.tile-state');
   if(stateEl){ stateEl.textContent = stateText; }
 }
-<<<<<<< HEAD
+
 async function readNativePid(sensor){
   const service = getMobileBluetoothService();
   if(!service || (typeof service.sendPIDCommand !== 'function' && typeof service.readPid !== 'function')){ return null; }
@@ -6723,7 +6722,7 @@ async function readNativePid(sensor){
       : await service.readPid(SENSOR_TO_PID[sensor]);
     if(!nativeRead){ return null; }
     const rawResponse = nativeRead.raw_response || nativeRead.rawResponse || null;
-=======
+
 function hasUsablePidRead(read){
   return Boolean(read && read.raw_response && !read.error);
 }
@@ -6784,7 +6783,7 @@ async function readTransportPid(sensor){
     const liveRead = await service.readPid(SENSOR_TO_PID[sensor]);
     if(!liveRead){ return null; }
     const rawResponse = liveRead.raw_response || liveRead.rawResponse || null;
->>>>>>> ccb5c74 (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
+ (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
     if(!rawResponse){ return null; }
     const normalizedRead = {
       command: SENSOR_TO_PID[sensor],
@@ -6976,7 +6975,7 @@ function getTransportPresentation(){
 function renderDashboardState(){
   const active = state?.active_session;
   const profile = getVehicleProfileById(active?.vehicle_id || selectedVehicleId);
-<<<<<<< HEAD
+
   const connected = (phoneBridge.status || 'disconnected') === 'connected';
   const captureRecording = state?.capture_status === 'recording' && connected;
   const waitingForLiveRead = connected && !phoneBridge.first_live_read_received;
@@ -6990,7 +6989,7 @@ function renderDashboardState(){
   const streamLabel = liveReadActive ? 'Streaming' : waitingForLiveRead ? 'Waiting first PID' : 'Idle';
   const aiTone = aiReady ? (state?.ai_monitoring?.active ? 'accent' : 'success') : 'neutral';
   const aiLabel = aiReady ? (state?.ai_monitoring?.active ? 'Monitoring' : 'Ready') : 'Offline';
-=======
+
   const transportStatus = getTransportPresentation();
   const connected = transportServiceReady();
   const hasSession = Boolean(active);
@@ -7006,7 +7005,7 @@ function renderDashboardState(){
   const streamLabel = liveReadActive ? 'Streaming' : waitingForLiveRead ? 'Priming' : 'Idle';
   const aiTone = aiReady ? (aiMonitoringActive ? 'accent' : 'success') : 'neutral';
   const aiLabel = aiReady ? (aiMonitoringActive ? 'Monitoring' : 'Ready') : 'Offline';
->>>>>>> ccb5c74 (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
+ (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
   const protocolLabel = formatMode(active?.protocol || profile?.protocol_hint || 'protocol pending');
   const profileNote = profile?.notes || 'Safe read-only diagnostic workflow enabled.';
 
@@ -7022,28 +7021,28 @@ function renderDashboardState(){
   updateIndicator('statusStreaming', 'statusStreamingValue', streamTone, streamLabel);
   updateIndicator('statusAiAssist', 'statusAiAssistValue', aiTone, aiLabel);
 
-<<<<<<< HEAD
+
   const sessionActuallyActive = Boolean(active && connected);
   updateBadge('sessionBadge', 'sessionBadgeText', sessionActuallyActive ? 'success' : 'neutral', sessionActuallyActive ? 'Vehicle Check Active' : 'Vehicle Check Idle');
-=======
+
   updateBadge('sessionBadge', 'sessionBadgeText', vehicleCheckActive ? 'success' : 'neutral', vehicleCheckActive ? 'Vehicle Check Active' : 'Vehicle Check Idle');
->>>>>>> ccb5c74 (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
+ (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
   updateBadge('captureBadge', 'captureBadgeText', captureRecording ? 'danger' : state?.capture_status === 'stopped' ? 'warning' : 'neutral', captureRecording ? 'Capture Recording' : state?.capture_status === 'stopped' ? 'Capture Stopped' : 'Capture Idle', captureRecording);
   updateBadge('modeBadge', 'modeBadgeText', connected ? 'accent' : 'neutral', formatMode(state?.current_mode || phoneBridge.current_mode || 'standby'));
   const who = state?.current_user?.display_name || 'Demo Tester';
   document.getElementById('userBadgeText').textContent = `Signed in: ${who}`;
-<<<<<<< HEAD
+
   updateBadge('diagnosticStateBadge', 'diagnosticStateText', captureRecording ? 'danger' : sessionActuallyActive ? 'success' : connected ? 'accent' : 'warning', captureRecording ? 'Recording live capture' : sessionActuallyActive ? 'Vehicle check active' : connected ? 'Connected and ready' : 'Awaiting connection', captureRecording);
   updateBadge('aiPanelBadge', 'aiPanelBadgeText', state?.ai_monitoring?.active ? 'accent' : aiReady ? 'success' : 'neutral', state?.ai_monitoring?.active ? 'Live monitoring active' : aiReady ? 'AI ready for diagnostics' : 'Awaiting vehicle check');
-=======
+
   updateBadge('diagnosticStateBadge', 'diagnosticStateText', captureRecording ? 'danger' : vehicleCheckActive ? 'success' : connected ? 'accent' : transportStatus.tone, captureRecording ? 'Recording live capture' : vehicleCheckActive ? 'Vehicle check active' : connected ? 'Connected and ready' : transportStatus.label, captureRecording);
   updateBadge('aiPanelBadge', 'aiPanelBadgeText', aiMonitoringActive ? 'accent' : aiReady ? 'success' : 'neutral', aiMonitoringActive ? 'Live monitoring active' : aiReady ? 'AI ready for diagnostics' : 'Awaiting vehicle check');
->>>>>>> ccb5c74 (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
+ (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
 
   renderTelemetry();
 
   const connectMeta = connected
-<<<<<<< HEAD
+
     ? `OBDLink bridge active. ${liveReadActive ? 'Live telemetry is streaming.' : 'Connected, waiting for first successful PID.'}`
     : phoneBridge.status === 'failed'
       ? (phoneBridge.failure_message || `Connection did not complete. ${phoneBridge.fallback_reason || 'Retry the Bluetooth handshake.'}`)
@@ -7061,7 +7060,7 @@ function renderDashboardState(){
   setButtonState('reportsBtn', 'neutral', active ? 'Review' : 'Available', Boolean(active), false, false);
   setButtonState('liveGaugesBtn', connected ? 'accent' : 'neutral', liveReadActive ? 'Live' : connected ? 'Ready' : 'Standby', connected, liveReadActive, connected);
   setButtonState('askAiBtn', state?.ai_monitoring?.active ? 'accent' : aiReady ? 'success' : 'accent', state?.ai_monitoring?.active ? 'Monitoring' : aiReady ? 'Ready' : 'Standby', Boolean(state?.ai_monitoring?.active || aiReady), false, false);
-=======
+
     ? `OBDLink bridge active. ${liveReadActive ? 'Live telemetry is streaming.' : 'Waiting for live PID traffic.'}`
     : transportStatus.detail;
   document.getElementById('connectVehicleMeta').textContent = connectMeta;
@@ -7083,7 +7082,7 @@ function renderDashboardState(){
   setButtonState('reportsBtn', 'neutral', hasSession ? 'Review' : 'Available', hasSession, false, false);
   setButtonState('liveGaugesBtn', connected ? 'accent' : 'neutral', liveReadActive ? 'Live' : connected ? 'Ready' : 'Standby', connected, liveReadActive, connected, !connected);
   setButtonState('askAiBtn', aiMonitoringActive ? 'accent' : aiReady ? 'success' : 'accent', aiMonitoringActive ? 'Monitoring' : aiReady ? 'Ready' : 'Standby', Boolean(aiMonitoringActive || aiReady), false, false);
->>>>>>> ccb5c74 (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
+ (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
 }
 function renderTelemetry(){
   const transportRunning = transportServiceReady();
@@ -7127,7 +7126,7 @@ async function updateVehicleImage(){
   }
 }
 function renderBluetoothCard(){
-<<<<<<< HEAD
+
   const status = phoneBridge.status || 'disconnected';
   const tone = status === 'connected' ? 'success' : status === 'failed' ? 'danger' : status === 'connecting' ? 'warning' : 'neutral';
   const statusLabel = status === 'failed' ? 'Unavailable' : formatMode(status);
@@ -7140,7 +7139,7 @@ function renderBluetoothCard(){
     { label: 'Polling active', value: `${phoneBridge.polling_active ? 'Yes' : 'No'} (${phoneBridge.polling_state || 'inactive'})` },
     { label: 'First PID read success', value: phoneBridge.first_live_read_received ? 'Yes' : 'Pending' },
     { label: 'Source mode', value: phoneBridge.current_source_mode || phoneBridge.source_mode || 'unknown' },
-=======
+
   const transportStatus = getTransportPresentation();
   const connectionDiagnostics = resolvedConnectionDiagnostics();
   updateBadge('btStatusBadge', 'btStatusText', transportStatus.tone, transportStatus.label);
@@ -7154,7 +7153,7 @@ function renderBluetoothCard(){
     { label: 'Polling state', value: `${transportServiceReady() && phoneBridge.polling_active ? 'Active' : 'Inactive'} (${phoneBridge.polling_state || 'inactive'})` },
     { label: 'First live read', value: phoneBridge.first_live_read_received ? 'Received' : 'Pending' },
     { label: 'Source mode', value: transportServiceReady() ? (phoneBridge.current_source_mode || phoneBridge.source_mode || 'unknown') : 'standby' },
->>>>>>> ccb5c74 (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
+ (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
     { label: 'Last PID command', value: phoneBridge.last_live_pid_command || 'None' },
     { label: 'Last PID response', value: phoneBridge.last_live_pid_response || 'None' },
     { label: 'Ingest status', value: phoneBridge.last_ingest_status || 'idle' },
@@ -7208,7 +7207,7 @@ function renderTimeline(){
   `).join('') || '<div class="empty-state">No timeline events yet.</div>';
 }
 async function ensureSession(){ if (state && state.active_session) return state.active_session; await fetch('/sessions', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vehicle_id:selectedVehicleId})}); await fetchState(); return state.active_session; }
-<<<<<<< HEAD
+
 async function createSession(){
   if(!isConnectedForActions()){ alert('Connect Vehicle first and wait for live telemetry.'); return; }
   await ensureSession();
@@ -7312,7 +7311,7 @@ async function connectVehicle(){
   }
   await fetchState();
   if(connectPayload.status==='connected'){ await startLivePolling(); }
-=======
+
 async function createSession(){ await ensureSession(); }
 async function ensureTransportForPolling(){
   const detection = detectTransport();
@@ -7467,7 +7466,7 @@ async function connectVehicle(){
     await publishBridgeConnection(failedPayload);
     await fetchState();
   }
->>>>>>> ccb5c74 (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
+ (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
 }
 async function syncHighlight(action,component,system,source='user'){ await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,component,system,source})}); }
 async function explainSelected(){ const comp=document.getElementById('componentExplainBtn').dataset.component; if(!comp){return;} const res=await fetch(`/vehicle-visualization/explain?component=${encodeURIComponent(comp)}`); const data=await res.json(); alert(`${data.component.replace(/_/g,' ')}: ${data.explanation}`); }
@@ -7495,11 +7494,11 @@ fetchState();
     """
 
 
-<<<<<<< HEAD
+
 @app.get("/dashboard/reports", response_class=HTMLResponse)
 def dashboard_reports() -> str:
     return """<!doctype html><html><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width, initial-scale=1'/><title>Reports</title><style>body{margin:0;background:#0b0f14;color:#eef3fb;font-family:Inter,Segoe UI,sans-serif} .wrap{max-width:900px;margin:0 auto;padding:16px;display:grid;gap:12px}.card{background:#121a25;border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:14px}.tiny{color:#9fb0c2;font-size:.92rem}</style></head><body><div class='wrap'><div class='card'><h1 style='margin:0 0 8px'>Reports</h1><div class='tiny'>Review export tiers for the current vehicle check. This page never uses localhost-only links.</div></div><div class='card'><a href='/dashboard'>← Back to Dashboard</a></div></div></body></html>"""
-=======
+
 @app.get('/dashboard/gauges', response_class=HTMLResponse)
 def gauge_dashboard() -> str:
     return """
@@ -7660,4 +7659,4 @@ const qp=new URLSearchParams(window.location.search).get('prompt'); if(qp){setPr
 </body>
 </html>
     """
->>>>>>> ccb5c74 (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
+ (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
