@@ -2590,7 +2590,7 @@ def dashboard() -> str:
             <span class="badge" id="sessionBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="sessionBadgeText">Vehicle Check Idle</span></span>
             <span class="badge" id="captureBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="captureBadgeText">Capture Idle</span></span>
             <span class="badge" id="modeBadge" data-tone="neutral"><span class="badge-dot" aria-hidden="true"></span><span id="modeBadgeText">Standby</span></span>
-            <span class="badge" id="userBadge" data-tone="accent"><span class="badge-dot" aria-hidden="true"></span><span id="userBadgeText">Signed in: Demo Tester</span></span>
+            <span class="badge" id="userBadge" data-tone="warning" style="cursor:pointer" onclick="openAuthModal()"><span class="badge-dot" aria-hidden="true"></span><span id="userBadgeText">Sign In</span></span>
           </div>
         </aside>
       </div>
@@ -2932,6 +2932,22 @@ function detectTransport(){
   return { service, hasNativeBridge, supported, platform, reason };
 }
 function getMobileBluetoothService(){ return detectTransport().service; }
+// Wait up to 3s for the native iOS bridge to be injected, then re-render.
+function waitForNativeBridge(timeoutMs, intervalMs) {
+  timeoutMs = timeoutMs || 3000;
+  intervalMs = intervalMs || 100;
+  const deadline = Date.now() + timeoutMs;
+  const poll = setInterval(function() {
+    const result = detectTransport();
+    if (result.hasNativeBridge || Date.now() >= deadline) {
+      clearInterval(poll);
+      if (result.hasNativeBridge) {
+        renderBluetoothCard();
+        renderDashboardState();
+      }
+    }
+  }, intervalMs);
+}
 function normalizeConnectPayload(payload, transport){
   const resolved = transport || detectTransport();
   const serviceAvailable = resolved.hasNativeBridge;
@@ -3431,7 +3447,7 @@ function buildGenericVehicleViewer(){
 function showFallbackImage(reason){ const img=document.getElementById('vehicleImageAsset'); img.style.display='block'; const source=document.getElementById('vehicleImageSource'); source.textContent=reason; const host=document.getElementById('vehicleCanvas'); if(host){host.innerHTML='';} }
 
 async function fetchState(){
-  const res = await fetch('/dashboard/state');
+  const res = await apiFetch('/dashboard/state');
   state = await res.json();
   phoneBridge = { ...phoneBridge, ...state.phone_bridge };
   const backendPermissionStatus = normalizePermissionStatus(state?.phone_bridge?.permission_state);
@@ -3445,6 +3461,10 @@ async function fetchState(){
   detectTransport();
   renderVehicles(); renderDashboardState(); renderBluetoothCard(); renderAiAlerts(); renderTimeline(); syncLivePolling();
   if(vehicleRenderer && state.vehicle_visualization?.highlight){ const h=state.vehicle_visualization.highlight; vehicleRenderer.applyHighlight(h.action,h.component,h.system); }
+  const who = state?.current_user?.display_name || 'Demo Tester';
+  const isReal = state?.current_user?.user_id && state.current_user.user_id !== 'demo';
+  document.getElementById('userBadgeText').textContent = isReal ? `Signed in: ${who}` : 'Sign In';
+  document.getElementById('userBadge').setAttribute('data-tone', isReal ? 'success' : 'warning');
 }
 function renderVehicles(){
   const select = document.getElementById('vehicleSelect');
@@ -3937,36 +3957,14 @@ async function submitSignOut() {
   await fetchState();
 }
 
-// Override fetchState to attach auth token and update user badge
-const _baseFetchState = fetchState;
-fetchState = async function() {
-  const res = await apiFetch('/dashboard/state');
-  state = await res.json();
-  phoneBridge = { ...phoneBridge, ...state.phone_bridge };
-  const backendPermissionStatus = normalizePermissionStatus(state?.phone_bridge?.permission_state);
-  setLocalConnectionDiagnostics({
-    bluetooth_permission_status: backendPermissionStatus === 'unknown' ? localConnectionDiagnostics.bluetooth_permission_status : backendPermissionStatus,
-    mode_switched_to_phone_live: state?.current_mode === 'PHONE-LIVE',
-    backend_ingest_success: state?.phone_bridge?.backend_acceptance_status === 'accepted',
-    first_pid_response_received: Boolean(state?.phone_bridge?.first_live_read_received),
-    adapter_connected: state?.phone_bridge?.status === 'connected',
-  });
-  detectTransport();
-  renderVehicles(); renderDashboardState(); renderBluetoothCard(); renderAiAlerts(); renderTimeline(); syncLivePolling();
-  if (vehicleRenderer && state.vehicle_visualization?.highlight) {
-    const h = state.vehicle_visualization.highlight;
-    vehicleRenderer.applyHighlight(h.action, h.component, h.system);
-  }
-  const who = state?.current_user?.display_name || 'Demo Tester';
-  const isReal = state?.current_user?.user_id && state.current_user.user_id !== 'demo';
-  document.getElementById('userBadgeText').textContent = isReal ? `Signed in: ${who}` : 'Sign In';
-  document.getElementById('userBadge').setAttribute('data-tone', isReal ? 'success' : 'warning');
-};
 
-verifyStoredToken().then(() => {
+async function initDashboard() {
+  await verifyStoredToken();
+  await fetchState();
+  waitForNativeBridge();
   setInterval(fetchState, 1500);
-  fetchState();
-});
+}
+initDashboard();
 </script>
 
 <div id="authModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9999;align-items:center;justify-content:center;padding:1rem">

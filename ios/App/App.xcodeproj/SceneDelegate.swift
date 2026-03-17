@@ -10,8 +10,6 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         window.rootViewController = DashboardViewController()
         self.window = window
         window.makeKeyAndVisible()
-
-        // window.rootViewController = ViewController() // This line is commented out as per instructions
     }
 
     func sceneDidDisconnect(_ scene: UIScene) {
