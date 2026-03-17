@@ -893,7 +893,7 @@ def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
     has_live_read = _latest_phone_live_read(reads) is not None
 
     if payload.status in {"connecting", "failed"} or (payload.status == "connected" and previous_status != "connecting"):
-        _reset_phone_connection_progress(anchor_now=True)                                                       (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
+        _reset_phone_connection_progress(anchor_now=True)
 
     _touch_phone_bridge(status=effective_status, error=effective_fallback_reason if effective_status == "failed" else None)
     phone_bridge_state["platform"] = payload.platform
@@ -916,19 +916,6 @@ def phone_bridge_connect(payload: PhoneBridgeConnectPayload) -> dict:
     phone_bridge_state["live_monitoring_state"] = "active" if effective_status == "connected" and has_live_read else ("waiting_for_first_live_read" if effective_status == "connected" else "inactive")
     phone_bridge_state["command_learning_status"] = "active" if effective_status == "connected" else "idle"
     if store.active_session_id and effective_status == "connected":
-
-        if payload.status == "failed"
-        else ("awaiting-adapter" if payload.status == "connecting" else ("awaiting-live-read" if payload.status == "connected" else "disconnected"))
-    )
-    phone_bridge_state["polling_state"] = "starting" if payload.status == "connected" else "inactive"
-    if payload.status == "connected":
-        phone_bridge_state["last_backend_acceptance_status"] = "pending"
-        phone_bridge_state["last_ingest_status"] = "idle"
-        phone_bridge_state["last_ingest_error"] = None
-    phone_bridge_state["live_monitoring_state"] = "waiting_for_first_live_read" if payload.status == "connected" else "inactive"
-    phone_bridge_state["command_learning_status"] = "active" if payload.status == "connected" else "idle"
-    if store.active_session_id and payload.status == "connected":
- (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
         if previous_status != "connected":
             store.add_timeline_event(DiagnosticTimelineEvent(
                 session_id=store.active_session_id,
@@ -1418,8 +1405,6 @@ def dashboard_state() -> dict:
         "current_profile": current_profile.model_dump(),
 
         "app_settings": store.get_app_settings(),
-
- (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
         "vehicles": [item.model_dump() for item in store.list_vehicles()],
         "active_session": active,
         "adapter_mode": adapter.mode_status(),
@@ -3841,9 +3826,176 @@ document.getElementById('askAiBtn').onclick = () => openAiWithPrompt('');
 document.getElementById('componentExplainBtn').onclick = explainSelected;
 window.addEventListener('zeb-native-poll', handleNativePollEvent);
 window.addEventListener('zeb-native-disconnected', (event) => { void handleNativeDisconnectEvent(event); });
-setInterval(fetchState, 1500);
-fetchState();
+
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+let _sessionToken = localStorage.getItem('zeb_session_token') || null;
+
+function authHeaders() {
+  return _sessionToken ? { 'x-session-token': _sessionToken } : {};
+}
+
+function apiFetch(url, opts = {}) {
+  const mergedHeaders = { ...(opts.headers || {}), ...authHeaders() };
+  return fetch(url, { ...opts, headers: mergedHeaders });
+}
+
+async function verifyStoredToken() {
+  if (!_sessionToken) return;
+  try {
+    const res = await fetch('/auth/me', { headers: authHeaders() });
+    const data = await res.json();
+    if (!data.authenticated) {
+      _sessionToken = null;
+      localStorage.removeItem('zeb_session_token');
+    }
+  } catch (_) {
+    _sessionToken = null;
+    localStorage.removeItem('zeb_session_token');
+  }
+}
+
+function openAuthModal() {
+  const isLoggedIn = Boolean(_sessionToken);
+  document.getElementById('authModalTitle').textContent = isLoggedIn ? 'Account' : 'Sign In';
+  document.getElementById('authSignedInPanel').style.display = isLoggedIn ? '' : 'none';
+  document.getElementById('authSignInPanel').style.display = isLoggedIn ? 'none' : '';
+  document.getElementById('authSignUpPanel').style.display = 'none';
+  document.getElementById('authErrorMsg').textContent = '';
+  if (isLoggedIn && state?.current_user) {
+    document.getElementById('authSignedInName').textContent = state.current_user.display_name || '';
+    document.getElementById('authSignedInEmail').textContent = state.current_user.email || '';
+  }
+  document.getElementById('authModal').style.display = 'flex';
+}
+
+function closeAuthModal() {
+  document.getElementById('authModal').style.display = 'none';
+}
+
+function showAuthPanel(panel) {
+  document.getElementById('authSignInPanel').style.display = panel === 'signin' ? '' : 'none';
+  document.getElementById('authSignUpPanel').style.display = panel === 'signup' ? '' : 'none';
+  document.getElementById('authErrorMsg').textContent = '';
+}
+
+async function submitSignIn() {
+  const email = document.getElementById('authEmail').value.trim();
+  const password = document.getElementById('authPassword').value;
+  document.getElementById('authErrorMsg').textContent = '';
+  try {
+    const res = await fetch('/auth/signin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      document.getElementById('authErrorMsg').textContent = err.detail || 'Sign in failed.';
+      return;
+    }
+    const data = await res.json();
+    _sessionToken = data.session_token;
+    localStorage.setItem('zeb_session_token', _sessionToken);
+    closeAuthModal();
+    await fetchState();
+  } catch (e) {
+    document.getElementById('authErrorMsg').textContent = 'Network error. Please try again.';
+  }
+}
+
+async function submitSignUp() {
+  const email = document.getElementById('authSignUpEmail').value.trim();
+  const password = document.getElementById('authSignUpPassword').value;
+  const display_name = document.getElementById('authSignUpName').value.trim();
+  document.getElementById('authErrorMsg').textContent = '';
+  try {
+    const res = await fetch('/auth/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, display_name })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      document.getElementById('authErrorMsg').textContent = err.detail || 'Sign up failed.';
+      return;
+    }
+    const data = await res.json();
+    _sessionToken = data.session_token;
+    localStorage.setItem('zeb_session_token', _sessionToken);
+    closeAuthModal();
+    await fetchState();
+  } catch (e) {
+    document.getElementById('authErrorMsg').textContent = 'Network error. Please try again.';
+  }
+}
+
+async function submitSignOut() {
+  try { await apiFetch('/auth/signout', { method: 'POST' }); } catch (_) {}
+  _sessionToken = null;
+  localStorage.removeItem('zeb_session_token');
+  closeAuthModal();
+  await fetchState();
+}
+
+// Override fetchState to attach auth token and update user badge
+const _baseFetchState = fetchState;
+fetchState = async function() {
+  const res = await apiFetch('/dashboard/state');
+  state = await res.json();
+  phoneBridge = { ...phoneBridge, ...state.phone_bridge };
+  const backendPermissionStatus = normalizePermissionStatus(state?.phone_bridge?.permission_state);
+  setLocalConnectionDiagnostics({
+    bluetooth_permission_status: backendPermissionStatus === 'unknown' ? localConnectionDiagnostics.bluetooth_permission_status : backendPermissionStatus,
+    mode_switched_to_phone_live: state?.current_mode === 'PHONE-LIVE',
+    backend_ingest_success: state?.phone_bridge?.backend_acceptance_status === 'accepted',
+    first_pid_response_received: Boolean(state?.phone_bridge?.first_live_read_received),
+    adapter_connected: state?.phone_bridge?.status === 'connected',
+  });
+  detectTransport();
+  renderVehicles(); renderDashboardState(); renderBluetoothCard(); renderAiAlerts(); renderTimeline(); syncLivePolling();
+  if (vehicleRenderer && state.vehicle_visualization?.highlight) {
+    const h = state.vehicle_visualization.highlight;
+    vehicleRenderer.applyHighlight(h.action, h.component, h.system);
+  }
+  const who = state?.current_user?.display_name || 'Demo Tester';
+  const isReal = state?.current_user?.user_id && state.current_user.user_id !== 'demo';
+  document.getElementById('userBadgeText').textContent = isReal ? `Signed in: ${who}` : 'Sign In';
+  document.getElementById('userBadge').setAttribute('data-tone', isReal ? 'success' : 'warning');
+};
+
+verifyStoredToken().then(() => {
+  setInterval(fetchState, 1500);
+  fetchState();
+});
 </script>
+
+<div id="authModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9999;align-items:center;justify-content:center;padding:1rem">
+  <div style="background:#0f1f30;border:1px solid rgba(148,163,184,0.25);border-radius:1rem;padding:1.5rem;width:min(22rem,100%);box-shadow:0 24px 64px rgba(0,0,0,0.5)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.25rem">
+      <h2 id="authModalTitle" style="margin:0;font-size:1.15rem;color:#f1f5f9">Sign In</h2>
+      <button onclick="closeAuthModal()" style="background:none;border:none;color:#94a3b8;font-size:1.5rem;cursor:pointer;line-height:1">&times;</button>
+    </div>
+    <p id="authErrorMsg" style="color:#f87171;font-size:0.8rem;margin:0 0 0.75rem;min-height:1rem"></p>
+    <div id="authSignedInPanel" style="display:none">
+      <p style="margin:0 0 0.2rem;font-size:0.95rem;color:#f1f5f9;font-weight:600" id="authSignedInName"></p>
+      <p style="margin:0 0 1.25rem;font-size:0.8rem;color:#94a3b8" id="authSignedInEmail"></p>
+      <button onclick="submitSignOut()" style="width:100%;padding:0.6rem;background:#ef4444;color:#fff;border:none;border-radius:0.5rem;cursor:pointer;font-size:0.9rem;font-weight:600">Sign Out</button>
+    </div>
+    <div id="authSignInPanel">
+      <input id="authEmail" type="email" placeholder="Email" autocomplete="email" style="width:100%;box-sizing:border-box;padding:0.55rem 0.75rem;background:#1e3348;border:1px solid rgba(148,163,184,0.2);border-radius:0.5rem;color:#f1f5f9;font-size:0.9rem;margin-bottom:0.6rem">
+      <input id="authPassword" type="password" placeholder="Password" autocomplete="current-password" style="width:100%;box-sizing:border-box;padding:0.55rem 0.75rem;background:#1e3348;border:1px solid rgba(148,163,184,0.2);border-radius:0.5rem;color:#f1f5f9;font-size:0.9rem;margin-bottom:1rem">
+      <button onclick="submitSignIn()" style="width:100%;padding:0.6rem;background:#3b82f6;color:#fff;border:none;border-radius:0.5rem;cursor:pointer;font-size:0.9rem;font-weight:600;margin-bottom:0.6rem">Sign In</button>
+      <button onclick="showAuthPanel('signup')" style="width:100%;padding:0.5rem;background:none;border:1px solid rgba(148,163,184,0.25);border-radius:0.5rem;color:#94a3b8;cursor:pointer;font-size:0.85rem">Create Account</button>
+    </div>
+    <div id="authSignUpPanel" style="display:none">
+      <input id="authSignUpName" type="text" placeholder="Display name" autocomplete="name" style="width:100%;box-sizing:border-box;padding:0.55rem 0.75rem;background:#1e3348;border:1px solid rgba(148,163,184,0.2);border-radius:0.5rem;color:#f1f5f9;font-size:0.9rem;margin-bottom:0.6rem">
+      <input id="authSignUpEmail" type="email" placeholder="Email" autocomplete="email" style="width:100%;box-sizing:border-box;padding:0.55rem 0.75rem;background:#1e3348;border:1px solid rgba(148,163,184,0.2);border-radius:0.5rem;color:#f1f5f9;font-size:0.9rem;margin-bottom:0.6rem">
+      <input id="authSignUpPassword" type="password" placeholder="Password (8+ chars)" autocomplete="new-password" style="width:100%;box-sizing:border-box;padding:0.55rem 0.75rem;background:#1e3348;border:1px solid rgba(148,163,184,0.2);border-radius:0.5rem;color:#f1f5f9;font-size:0.9rem;margin-bottom:1rem">
+      <button onclick="submitSignUp()" style="width:100%;padding:0.6rem;background:#3b82f6;color:#fff;border:none;border-radius:0.5rem;cursor:pointer;font-size:0.9rem;font-weight:600;margin-bottom:0.6rem">Create Account</button>
+      <button onclick="showAuthPanel('signin')" style="width:100%;padding:0.5rem;background:none;border:1px solid rgba(148,163,184,0.25);border-radius:0.5rem;color:#94a3b8;cursor:pointer;font-size:0.85rem">Back to Sign In</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>
     """
@@ -6143,7 +6295,6 @@ function emptyLocalConnectionDiagnostics(permissionStatus = 'unknown', nativeBri
     first_pid_response_received: false,
     backend_ingest_success: false,
     mode_switched_to_phone_live: false,
- (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
   };
 }
 let localConnectionDiagnostics = emptyLocalConnectionDiagnostics();
@@ -6783,7 +6934,6 @@ async function readTransportPid(sensor){
     const liveRead = await service.readPid(SENSOR_TO_PID[sensor]);
     if(!liveRead){ return null; }
     const rawResponse = liveRead.raw_response || liveRead.rawResponse || null;
- (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
     if(!rawResponse){ return null; }
     const normalizedRead = {
       command: SENSOR_TO_PID[sensor],
@@ -7005,7 +7155,6 @@ function renderDashboardState(){
   const streamLabel = liveReadActive ? 'Streaming' : waitingForLiveRead ? 'Priming' : 'Idle';
   const aiTone = aiReady ? (aiMonitoringActive ? 'accent' : 'success') : 'neutral';
   const aiLabel = aiReady ? (aiMonitoringActive ? 'Monitoring' : 'Ready') : 'Offline';
- (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
   const protocolLabel = formatMode(active?.protocol || profile?.protocol_hint || 'protocol pending');
   const profileNote = profile?.notes || 'Safe read-only diagnostic workflow enabled.';
 
@@ -7026,7 +7175,6 @@ function renderDashboardState(){
   updateBadge('sessionBadge', 'sessionBadgeText', sessionActuallyActive ? 'success' : 'neutral', sessionActuallyActive ? 'Vehicle Check Active' : 'Vehicle Check Idle');
 
   updateBadge('sessionBadge', 'sessionBadgeText', vehicleCheckActive ? 'success' : 'neutral', vehicleCheckActive ? 'Vehicle Check Active' : 'Vehicle Check Idle');
- (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
   updateBadge('captureBadge', 'captureBadgeText', captureRecording ? 'danger' : state?.capture_status === 'stopped' ? 'warning' : 'neutral', captureRecording ? 'Capture Recording' : state?.capture_status === 'stopped' ? 'Capture Stopped' : 'Capture Idle', captureRecording);
   updateBadge('modeBadge', 'modeBadgeText', connected ? 'accent' : 'neutral', formatMode(state?.current_mode || phoneBridge.current_mode || 'standby'));
   const who = state?.current_user?.display_name || 'Demo Tester';
@@ -7037,7 +7185,6 @@ function renderDashboardState(){
 
   updateBadge('diagnosticStateBadge', 'diagnosticStateText', captureRecording ? 'danger' : vehicleCheckActive ? 'success' : connected ? 'accent' : transportStatus.tone, captureRecording ? 'Recording live capture' : vehicleCheckActive ? 'Vehicle check active' : connected ? 'Connected and ready' : transportStatus.label, captureRecording);
   updateBadge('aiPanelBadge', 'aiPanelBadgeText', aiMonitoringActive ? 'accent' : aiReady ? 'success' : 'neutral', aiMonitoringActive ? 'Live monitoring active' : aiReady ? 'AI ready for diagnostics' : 'Awaiting vehicle check');
- (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
 
   renderTelemetry();
 
@@ -7082,7 +7229,6 @@ function renderDashboardState(){
   setButtonState('reportsBtn', 'neutral', hasSession ? 'Review' : 'Available', hasSession, false, false);
   setButtonState('liveGaugesBtn', connected ? 'accent' : 'neutral', liveReadActive ? 'Live' : connected ? 'Ready' : 'Standby', connected, liveReadActive, connected, !connected);
   setButtonState('askAiBtn', aiMonitoringActive ? 'accent' : aiReady ? 'success' : 'accent', aiMonitoringActive ? 'Monitoring' : aiReady ? 'Ready' : 'Standby', Boolean(aiMonitoringActive || aiReady), false, false);
- (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
 }
 function renderTelemetry(){
   const transportRunning = transportServiceReady();
@@ -7153,7 +7299,6 @@ function renderBluetoothCard(){
     { label: 'Polling state', value: `${transportServiceReady() && phoneBridge.polling_active ? 'Active' : 'Inactive'} (${phoneBridge.polling_state || 'inactive'})` },
     { label: 'First live read', value: phoneBridge.first_live_read_received ? 'Received' : 'Pending' },
     { label: 'Source mode', value: transportServiceReady() ? (phoneBridge.current_source_mode || phoneBridge.source_mode || 'unknown') : 'standby' },
- (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
     { label: 'Last PID command', value: phoneBridge.last_live_pid_command || 'None' },
     { label: 'Last PID response', value: phoneBridge.last_live_pid_response || 'None' },
     { label: 'Ingest status', value: phoneBridge.last_ingest_status || 'idle' },
@@ -7466,7 +7611,6 @@ async function connectVehicle(){
     await publishBridgeConnection(failedPayload);
     await fetchState();
   }
- (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)
 }
 async function syncHighlight(action,component,system,source='user'){ await fetch('/vehicle-visualization/highlight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,component,system,source})}); }
 async function explainSelected(){ const comp=document.getElementById('componentExplainBtn').dataset.component; if(!comp){return;} const res=await fetch(`/vehicle-visualization/explain?component=${encodeURIComponent(comp)}`); const data=await res.json(); alert(`${data.component.replace(/_/g,' ')}: ${data.explanation}`); }
@@ -7659,4 +7803,3 @@ const qp=new URLSearchParams(window.location.search).get('prompt'); if(qp){setPr
 </body>
 </html>
     """
- (Add Capacitor iOS shell and CoreBluetooth OBDLink bridge)

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Existing keys and values -->
+	<key>CFBundleIdentifier</key>
+	<string>com.example.myapp</string>
+	<key>CFBundleName</key>
+	<string>MyApp</string>
+
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>This app connects to vehicle diagnostic devices via Bluetooth to read OBD data.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Bluetooth is required to communicate with OBD adapters.</string>
+
+	<!-- Other existing keys and values -->
+</dict>
+</plist>
